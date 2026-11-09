@@ -479,13 +479,12 @@ def _reconcile_media_hydration_job(
     unresolved = message.media_kind in _FACT_HYDRATION_EMPTY_KINDS and message.media_payload == _EMPTY_MEDIA_PAYLOAD
     if unresolved and media_fact_hydration_eligible(conn, message.dialog_id, message.message_id):
         queue.enqueue(job)
-    elif unresolved and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds):
+        return
+    if existing_kinds is not None and MEDIA_METADATA_KIND not in existing_kinds:
+        return
+    if unresolved:
         queue.remove_active(job)
-    elif (
-        not unresolved
-        and message.media_kind != "todo"
-        and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds)
-    ):
+    elif message.media_kind != "todo":
         queue.remove(job)
 
 
@@ -576,22 +575,28 @@ def enqueue_todo_refresh(
         or bool(getattr(reply, "reply_to_scheduled", False))
     ):
         return
-    row = conn.execute(
-        "SELECT m.sent_at FROM messages m JOIN synced_dialogs d USING(dialog_id) "
-        "JOIN full_history_enrollment e USING(dialog_id) "
-        "WHERE m.dialog_id=? AND m.message_id=? AND m.is_deleted=0 AND m.media_kind='todo' "
-        "AND d.status IN ('syncing','synced') AND e.enabled=1",
-        (dialog_id, parent),
-    ).fetchone()
+    row = cast(
+        tuple[int] | None,
+        conn.execute(
+            "SELECT m.sent_at FROM messages m JOIN synced_dialogs d USING(dialog_id) "
+            "JOIN full_history_enrollment e USING(dialog_id) "
+            "WHERE m.dialog_id=? AND m.message_id=? AND m.is_deleted=0 AND m.media_kind='todo' "
+            "AND d.status IN ('syncing','synced') AND e.enabled=1",
+            (dialog_id, parent),
+        ).fetchone(),
+    )
     if row is None or not hydration_observation_current(conn, dialog_id, parent, None):
         return
-    advanced = conn.execute(
-        "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted,source_rank) "
-        "VALUES(?,?,?,0,0) ON CONFLICT(dialog_id,message_id) DO UPDATE SET "
-        "observation_order=excluded.observation_order "
-        "WHERE message_observations.observation_order < excluded.observation_order RETURNING observation_order",
-        (dialog_id, parent, observation_order),
-    ).fetchone()
+    advanced = cast(
+        tuple[int] | None,
+        conn.execute(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted,source_rank) "
+            "VALUES(?,?,?,0,0) ON CONFLICT(dialog_id,message_id) DO UPDATE SET "
+            "observation_order=excluded.observation_order "
+            "WHERE message_observations.observation_order < excluded.observation_order RETURNING observation_order",
+            (dialog_id, parent, observation_order),
+        ).fetchone(),
+    )
     if advanced is None:
         return
     conn.execute(

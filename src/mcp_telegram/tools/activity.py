@@ -19,7 +19,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
-from .structured import MEDIA_OUTPUT_SCHEMA, serialize_message_content
+from .structured import MEDIA_OUTPUT_SCHEMA, SerializedMessageContent, serialize_message_content
 
 GET_MY_RECENT_ACTIVITY_OUTPUT_SCHEMA = {
     "type": "object",
@@ -167,9 +167,7 @@ def _add_media_if_present(result: dict[str, object], media: object | None) -> No
         result["media"] = media
 
 
-def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
-    dialog_id = _comment_int(comment, "dialog_id")
-    message_id = _comment_int(comment, "message_id")
+def _comment_content(comment: Mapping[str, object]) -> SerializedMessageContent:
     raw_text = comment.get("text")
     raw_media_description = comment.get("media_description")
     text_value = raw_text if isinstance(raw_text, str) and raw_text else None
@@ -189,13 +187,19 @@ def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
     )
     media_kind_value = cast(str | None, comment.get("media_kind"))
     media_payload = comment.get("media_payload")
-    serialized = serialize_message_content(
+    return serialize_message_content(
         text_value,
         media_value,
         content_kind,
         media_kind_value,
         media_payload if isinstance(media_payload, dict) else None,
     )
+
+
+def _structured_comment(comment: Mapping[str, object]) -> dict[str, object]:
+    dialog_id = _comment_int(comment, "dialog_id")
+    message_id = _comment_int(comment, "message_id")
+    serialized = _comment_content(comment)
     serialized_content = serialized["content"]
     text = cast(str, (serialized_content or cast(dict[str, object], {})).get("text", ""))
     result: dict[str, object] = {

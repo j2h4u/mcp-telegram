@@ -174,6 +174,14 @@ def _draft_text(text: object, action: str) -> str | None:
 def _composition_arguments(
     request: Mapping[str, object], action: str
 ) -> tuple[str | None, BodyFormat | None, int | None, bool]:
+    text, body_format, drop_formatting = _body_arguments(request, action)
+    history_id = _positive_optional(request.get("history_id"), "history_id")
+    if (action == "restore") != (history_id is not None):
+        raise DraftCommandError("invalid_arguments", "history_id is required only for restore.")
+    return text, body_format, history_id, drop_formatting
+
+
+def _body_arguments(request: Mapping[str, object], action: str) -> tuple[str | None, BodyFormat | None, bool]:
     try:
         body = parse_authored_body(request)
     except ValueError as exc:
@@ -181,15 +189,16 @@ def _composition_arguments(
     if action not in {"create", "update"} and ("text" in request or "format" in request):
         raise DraftCommandError("invalid_arguments", "text and format are only accepted for create and update.")
     text = _draft_text(None if body is None else body.text, action)
-    history_id = _positive_optional(request.get("history_id"), "history_id")
-    if (action == "restore") != (history_id is not None):
-        raise DraftCommandError("invalid_arguments", "history_id is required only for restore.")
+    return text, None if body is None else body.format, _drop_formatting(request, action, body)
+
+
+def _drop_formatting(request: Mapping[str, object], action: str, body: AuthoredBody | None) -> bool:
     drop_formatting = request.get("drop_formatting", False)
     if type(drop_formatting) is not bool or (drop_formatting and action != "update"):
         raise DraftCommandError("invalid_arguments", "drop_formatting is a boolean for update only.")
     if body is not None and body.format != "plain" and drop_formatting:
         raise DraftCommandError("invalid_arguments", "drop_formatting cannot be used with rich text.")
-    return text, None if body is None else body.format, history_id, drop_formatting
+    return drop_formatting
 
 
 def _public_current(state: DraftState) -> dict[str, object]:
@@ -207,14 +216,66 @@ def _bound_observation(result: dict[str, object]) -> None:
     if len(encoded.encode()) <= MAX_DRAFT_RESULT_BYTES:
         return
     current = cast(dict[str, object], result["current"])
+    reference: dict[str, object] = {
+        key: current[key] for key in ("presence", "expected_version", "observed_at", "uncertain") if key in current
+    }
     result["current"] = {
-        **{key: current[key] for key in ("presence", "expected_version", "observed_at", "uncertain") if key in current},
+        **reference,
         "content_included": False,
         "content_omission_reason": "response_budget",
     }
     result["verification"] = {"status": "unverified", "basis": "none", "reason": "snapshot_too_large"}
     result["current_is_operation_confirmation"] = False
     result["next_action"] = "Read get_draft for the retained observation. Do not repeat the write."
+
+
+def _same_plain_body(command: _Command, current: DraftState) -> bool:
+    return (
+        command.body_format == "plain"
+        and command.action == "update"
+        and command.text == current.text
+        and not command.drop_formatting
+        and current_draft_output(current).get("rich_content_status") == "absent"
+    )
+
+
+def _body_request(command: _Command, current: DraftState, peer: object) -> SaveDraftRequest | None:
+    assert command.text is not None
+    if _same_plain_body(command, current):
+        return None
+    existing = current.restore_snapshot if command.action == "update" else None
+    if command.body_format != "plain":
+        assert command.body_format is not None
+        return build_rich_draft_request(
+            peer, command.scope, AuthoredBody(command.text, command.body_format), existing=existing
+        )
+    return build_text_draft_request(
+        peer, command.scope, command.text, existing=existing, drop_formatting=command.drop_formatting
+    )
+
+
+def _rich_verification(state: DraftState, current: Mapping[str, object], acknowledged: bool) -> str:
+    if acknowledged and current.get("rich_content_status") == "complete" and state.restore_snapshot is not None:
+        return "observed"
+    return "conflict" if current.get("rich_content_status") == "absent" else "unverified"
+
+
+def _verification_status(
+    command: _Command,
+    request: SaveDraftRequest,
+    state: DraftState,
+    result: Mapping[str, object],
+    *,
+    intended_absent: bool,
+) -> str:
+    if (state.presence == "absent") != intended_absent:
+        return "conflict"
+    if command.body_format not in {None, "plain"}:
+        return _rich_verification(
+            state, cast(Mapping[str, object], result["current"]), result.get("save_acknowledged") is True
+        )
+    match = compare_draft_request(request, command.scope, state.restore_snapshot, present=not intended_absent)
+    return "unverified" if match is None else "verified" if match else "conflict"
 
 
 class DraftCommandOwner:
@@ -385,30 +446,7 @@ class DraftCommandOwner:
             return None if current.presence == "absent" else build_clear_draft_request(peer, command.scope)
         if command.action == "restore":
             return self._restore_request(command, current, peer)
-        assert command.text is not None
-        if (
-            command.body_format == "plain"
-            and command.action == "update"
-            and command.text == current.text
-            and not command.drop_formatting
-            and current_draft_output(current).get("rich_content_status") == "absent"
-        ):
-            return None
-        if command.body_format != "plain":
-            assert command.body_format is not None
-            return build_rich_draft_request(
-                peer,
-                command.scope,
-                AuthoredBody(command.text, command.body_format),
-                existing=current.restore_snapshot if command.action == "update" else None,
-            )
-        return build_text_draft_request(
-            peer,
-            command.scope,
-            command.text,
-            existing=current.restore_snapshot if command.action == "update" else None,
-            drop_formatting=command.drop_formatting,
-        )
+        return _body_request(command, current, peer)
 
     def _restore_request(self, command: _Command, current: DraftState, peer: object) -> SaveDraftRequest | None:
         assert command.history_id is not None
@@ -551,27 +589,20 @@ class DraftCommandOwner:
         if state.uncertain or state.expected_version is None or state.presence == "unknown":
             result["verification"] = {"status": "unverified", "basis": "none", "reason": "state_uncertain"}
             return
-        if (state.presence == "absent") != intended_absent:
-            match: bool | None = False
-        elif command.body_format not in {None, "plain"}:
-            if (
-                result.get("save_acknowledged") is True
-                and current.get("rich_content_status") == "complete"
-                and state.restore_snapshot is not None
-            ):
-                result["verification"] = {"status": "observed", "basis": "post_write_snapshot"}
-                result["current_is_operation_confirmation"] = False
-                result["next_action"] = "Review the observed draft; it remains unsent."
-                return
-            match = False if current.get("rich_content_status") == "absent" else None
-        else:
-            match = compare_draft_request(request, command.scope, state.restore_snapshot, present=not intended_absent)
-        status = "unverified" if match is None else "verified" if match else "conflict"
+        status = _verification_status(
+            command,
+            request,
+            state,
+            result,
+            intended_absent=intended_absent,
+        )
         result["verification"] = {"status": status, "basis": "post_write_snapshot"}
         result["current_is_operation_confirmation"] = status == "verified"
         result["next_action"] = (
             "Draft verified; it remains unsent."
             if status == "verified"
+            else "Review the observed draft; it remains unsent."
+            if status == "observed"
             else "Review the observed draft before another command."
         )
 

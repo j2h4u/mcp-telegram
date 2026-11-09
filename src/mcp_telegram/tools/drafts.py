@@ -90,12 +90,16 @@ class ManageDraft(GetDraft):
         return self
 
     @model_validator(mode="after")
-    def validate_text(self) -> ManageDraft:
+    def validate_format(self) -> ManageDraft:
         body = parse_authored_body(self.model_dump(include={"text", "format"}, exclude_unset=True))
         if body is not None and body.format != "plain" and self.drop_formatting:
             raise ValueError("rich format cannot be combined with drop_formatting")
         if self.action in {"clear", "restore"} and "format" in self.model_fields_set:
             raise ValueError("clear/restore do not accept format")
+        return self
+
+    @model_validator(mode="after")
+    def validate_text(self) -> ManageDraft:
         if self.action in {"create", "update"} and (self.text is None or not self.text.strip()):
             raise ValueError("create/update require nonempty text; use clear to remove a draft")
         if self.action in {"clear", "restore"} and self.text is not None:

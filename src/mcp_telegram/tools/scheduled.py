@@ -70,12 +70,16 @@ class ManageScheduledMessage(ToolArgs):
     )
 
     @model_validator(mode="after")
-    def validate_request(self) -> ManageScheduledMessage:
+    def validate_format(self) -> ManageScheduledMessage:
         body = parse_authored_body(self.model_dump(include={"text", "format"}, exclude_unset=True))
         if body is not None and body.format != "plain" and self.drop_formatting:
             raise ValueError("rich format cannot be combined with drop_formatting")
         if self.action == "cancel" and "format" in self.model_fields_set:
             raise ValueError("cancel does not accept format")
+        return self
+
+    @model_validator(mode="after")
+    def validate_request(self) -> ManageScheduledMessage:
         try:
             required_dialog_selector(exact_id=self.exact_dialog_id, dialog=self.dialog)
         except DialogSelectorError as exc:

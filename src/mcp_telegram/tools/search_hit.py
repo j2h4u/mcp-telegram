@@ -12,7 +12,7 @@ from typing import cast
 
 from ..formatter import resolve_sender_label
 from ..models import ReadReactionEvent
-from ..topic_identity import TOPIC_IDENTITY_SCHEMA, project_topic
+from ..topic_identity import TOPIC_IDENTITY_SCHEMA, TopicIdentity, project_topic
 from .structured import MEDIA_OUTPUT_SCHEMA, serialize_message_content
 
 _SNIPPET_MAX_LEN = 150
@@ -143,14 +143,18 @@ def _reaction_event_payload(event: object) -> dict[str, object]:
     }
 
 
-def _optional_search_facts(row: dict[str, object], snippet: str) -> dict[str, object]:
-    facts: dict[str, object] = {}
+def _search_topic(row: dict[str, object]) -> TopicIdentity | None:
     topic_id = row.get("forum_topic_id")
     title = row.get("topic_title")
-    topic = project_topic(
+    return project_topic(
         topic_id=topic_id if isinstance(topic_id, int) and not isinstance(topic_id, bool) else None,
         title=title if isinstance(title, str) else None,
     )
+
+
+def _optional_search_facts(row: dict[str, object], snippet: str) -> dict[str, object]:
+    facts: dict[str, object] = {}
+    topic = _search_topic(row)
     media_description = row.get("media_description")
     media_kind = row.get("media_kind")
     media_payload = row.get("media_payload")

@@ -435,46 +435,48 @@ def _attach_trace_content_metadata(data: dict) -> None:
         for item in evidence_items:
             if not isinstance(item, dict):
                 continue
-            text = item.get("text") if isinstance(item.get("text"), str) else None
-            media_description = (
-                item.get("media_description") if isinstance(item.get("media_description"), str) else None
+            _attach_trace_item_content(item)
+
+
+def _attach_trace_item_content(item: dict) -> None:
+    text = item.get("text") if isinstance(item.get("text"), str) else None
+    media_description = item.get("media_description") if isinstance(item.get("media_description"), str) else None
+    content_kind = cast(
+        ContentKind,
+        {
+            (False, False): "none",
+            (False, True): "media_description",
+            (True, False): "message_text",
+            (True, True): "message_text",
+        }[(bool(text), bool(media_description))],
+    )
+    payload = item.pop("media_payload", None)
+    serialized = serialize_message_content(
+        text,
+        media_description,
+        content_kind,
+        item.get("media_kind"),
+        payload if isinstance(payload, dict) else None,
+    )
+    # These assignments intentionally overwrite daemon-provided
+    # wrappers.  The daemon owns projection; this tool owns only the
+    # canonical delivery envelope and must not re-project text.
+    item.pop("content", None)
+    item.pop("media_content", None)
+    item.pop("media_description", None)
+    item.pop("media_kind", None)
+    item.update(
+        dict(
+            filter(
+                lambda entry: entry[1] is not None,
+                (
+                    ("content", serialized["content"]),
+                    ("media_content", serialized["media"]),
+                ),
             )
-            content_kind = cast(
-                ContentKind,
-                {
-                    (False, False): "none",
-                    (False, True): "media_description",
-                    (True, False): "message_text",
-                    (True, True): "message_text",
-                }[(bool(text), bool(media_description))],
-            )
-            payload = item.pop("media_payload", None)
-            serialized = serialize_message_content(
-                text,
-                media_description,
-                content_kind,
-                item.get("media_kind"),
-                payload if isinstance(payload, dict) else None,
-            )
-            # These assignments intentionally overwrite daemon-provided
-            # wrappers.  The daemon owns projection; this tool owns only the
-            # canonical delivery envelope and must not re-project text.
-            item.pop("content", None)
-            item.pop("media_content", None)
-            item.pop("media_description", None)
-            item.pop("media_kind", None)
-            item.update(
-                dict(
-                    filter(
-                        lambda entry: entry[1] is not None,
-                        (
-                            ("content", serialized["content"]),
-                            ("media_content", serialized["media"]),
-                        ),
-                    )
-                )
-            )
-            _ = bool(text or media_description) and item.setdefault("untrusted_content", True)
+        )
+    )
+    _ = bool(text or media_description) and item.setdefault("untrusted_content", True)
 
 
 def _trace_evidence_key(item: dict) -> tuple[int, int, int]:

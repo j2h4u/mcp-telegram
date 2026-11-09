@@ -188,3 +188,7 @@ FolderCommandArguments.expected_catalog_version
 
 # Serialized contact command-state field read by mapping keys in state and composition.
 ContactCommandState.phone_state
+
+# HTMLParser calls this callback dynamically; the wire reader accesses this TypedDict key.
+_MediaDetector.handle_starttag
+Attachment.todo_status
