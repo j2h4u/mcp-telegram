@@ -156,6 +156,7 @@ from .telegram_rpc_scheduler import (
     BudgetRejectionBoundary,
     ResendCause,
     RpcAdmission,
+    RpcAdmissionClosedError,
     RpcAdmissionError,
     RpcAdmissionExpiredError,
     RpcAdmissionSaturatedError,
@@ -1498,6 +1499,7 @@ class TelegramRpcSafetyLedger:
             if item["phase"] != "acknowledged_unknown"
         ]
         scope = cast(dict[str, object], self._record.get("scope", {}))
+        unresolved.sort(key=lambda item: not _intent_blocks(item, scope))
         blocking = sum(_intent_blocks(item, scope) for item in unresolved)
         historical = sum(item["phase"] == "unknown" and not _intent_blocks(item, scope) for item in unresolved)
         return {
@@ -4044,7 +4046,7 @@ class TelegramRpcGate(TelegramClient):
         self._auto_resume_identity_owner: asyncio.Task[object] | None = None
         self._startup_safety_prepared = False
         self._native_write_domains: dict[NativeWriteDomain, NativeWriteDomainOwner] = {}
-        self._auto_resume_stopped: Callable[[], bool] = lambda: False
+        self._shutdown_requested: Callable[[], bool] = lambda: False
         self._pending_method_receipts: dict[str, int] = {}
         self._rpc_eligibility_observer: Callable[[str | None], None] | None = None
         self._update_loop_owner: asyncio.Task[object] | None = None
@@ -5463,7 +5465,7 @@ class TelegramRpcGate(TelegramClient):
         return (
             snapshot.mode is RecoveryMode.AUTO
             and snapshot.phase is RecoveryPhase.CONSUMED
-            and (not snapshot.enabled or self._auto_resume_stopped())
+            and (not snapshot.enabled or self._shutdown_requested())
         )
 
     def _connection_write_ready(self, scope: TelegramRpcScope) -> bool:
@@ -5509,6 +5511,7 @@ class TelegramRpcGate(TelegramClient):
 
     async def _prepare_wire_write(self, owner: _WireAttempt) -> _WirePermit:
         scope = owner.scope
+        self._require_application_admission(scope)
         if owner.revoked:
             raise asyncio.CancelledError
         if owner.terminal and not scope.transport_control:
@@ -5608,6 +5611,7 @@ class TelegramRpcGate(TelegramClient):
         scope = owner.scope
         ledger = self._ensure_safety_ledger()
         if not scope.transport_control:
+            self._require_application_admission(scope)
             ledger.require_writable(auth_only=scope.transport_auth)
             self._check_method_eligibility(owner)
             lease = owner.photo_lease
@@ -5617,6 +5621,7 @@ class TelegramRpcGate(TelegramClient):
                 dc_id = lease.dc_id
                 key_id = lease.sender.auth_key.key_id if lease.sender is not None and lease.sender.auth_key else None
             await self._bind_application_key(owner, ledger, dc_id, key_id)
+            self._require_application_admission(scope)
             await ledger.prepare(
                 owner.attempt_id,
                 owner.method,
@@ -5625,7 +5630,15 @@ class TelegramRpcGate(TelegramClient):
                 aux_bootstrap=owner.photo_capability.aux_bootstrap if owner.photo_capability is not None else None,
                 native_binding=owner.native_check.binding if owner.native_check is not None else None,
             )
+            self._require_application_admission(scope)
             self._check_method_eligibility(owner)
+
+    def _application_shutdown_requested(self, scope: TelegramRpcScope) -> bool:
+        return not scope.transport_control and self._shutdown_requested()
+
+    def _require_application_admission(self, scope: TelegramRpcScope) -> None:
+        if self._application_shutdown_requested(scope):
+            raise RpcAdmissionClosedError(scope, "Telegram RPC admission is closed for shutdown")
 
     @staticmethod
     async def _bind_application_key(
@@ -5659,6 +5672,8 @@ class TelegramRpcGate(TelegramClient):
         owner = self._require_wire_owner(owner)
         if not isinstance(permit, _WirePermit) or permit.owner is not owner or permit.released:
             raise RuntimeError("unowned Telegram write permission")
+        if self._application_shutdown_requested(owner.scope):
+            return False
         self._check_native_phase(owner)
         self._claim_peer_access(owner)
         self._check_scheduled_claim(owner, permit)
@@ -5677,8 +5692,6 @@ class TelegramRpcGate(TelegramClient):
         except RpcAttemptBudgetExhaustedError:
             self._observe_budget_rejection(owner.scope, owner, None, boundary=BudgetRejectionBoundary.OWNER_CLAIM)
             raise
-        if not owner.claimed and self._is_update_difference_owner(owner):
-            self._message_box.difference_claimed()
         self._record_wire_dispatch(owner, permit)
         return True
 
@@ -5871,6 +5884,8 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("outbound attempt lacks durable intent")
 
     def _record_wire_dispatch(self, owner: _WireAttempt, permit: _WirePermit) -> None:
+        if not owner.claimed and self._is_update_difference_owner(owner):
+            self._message_box.difference_claimed()
         owner.claimed += 1
         self._record_difference_claim(owner)
         owner.dispatch_at = time.monotonic()
@@ -6044,7 +6059,7 @@ class TelegramRpcGate(TelegramClient):
             or owner.scope.transport_control
         ):
             return True
-        if not self.automatic_trial_active() or not snapshot.enabled or self._auto_resume_stopped():
+        if not self.automatic_trial_active() or not snapshot.enabled or self._shutdown_requested():
             return False
         capability = self._connection_capability
         bootstrap = (
@@ -6720,9 +6735,9 @@ class TelegramRpcGate(TelegramClient):
         self._session_pin = lease._pin()
         self._session_lease = lease
 
-    def set_auto_resume_stop(self, stopped: Callable[[], bool]) -> None:
-        """Use the daemon's existing stop signal at the physical trial boundary."""
-        self._auto_resume_stopped = stopped
+    def set_shutdown_requested(self, requested: Callable[[], bool]) -> None:
+        """Use the daemon's stop signal at application admission boundaries."""
+        self._shutdown_requested = requested
 
     def automatic_trial_active(self) -> bool:
         """Report only a trial consumed by this lifecycle."""
@@ -6797,7 +6812,7 @@ class TelegramRpcGate(TelegramClient):
             return await ledger.maintain_auto_resume(cause=cause, quiesced=True)
 
     def _automatic_lifecycle_available(self) -> bool:
-        if self._auto_resume_stopped():
+        if self._shutdown_requested():
             return False
         return not (
             self._logout_mode

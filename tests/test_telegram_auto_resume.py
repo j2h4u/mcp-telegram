@@ -441,10 +441,10 @@ async def test_recovery_gate_reports_actual_local_guards(wire: _WireHarness, mon
     assert not await gate.maintain_auto_resume()
     assert events[-1].event is RecoveryObservationEvent.STARTUP_UNPREPARED
     gate._startup_safety_prepared = True
-    gate._auto_resume_stopped = lambda: True
+    gate._shutdown_requested = lambda: True
     assert not await gate.maintain_auto_resume()
     assert events[-1].event is RecoveryObservationEvent.LIFECYCLE_UNAVAILABLE
-    gate._auto_resume_stopped = lambda: False
+    gate._shutdown_requested = lambda: False
     gate._pending_method_receipts["private"] = 1
     assert not await gate.maintain_auto_resume()
     assert events[-1].event is RecoveryObservationEvent.PENDING_RECEIPT
@@ -655,7 +655,7 @@ async def test_stop_during_blocked_intent_commit_prevents_physical_write(
     gate, _, _, sink = wire
     ledger = gate._ensure_safety_ledger()
     entered, released, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    gate.set_auto_resume_stop(stopped.is_set)
+    gate.set_shutdown_requested(stopped.is_set)
     original = ledger._store
 
     async def blocked_save(expected: str | None, encoded: str) -> None:
@@ -683,7 +683,7 @@ async def test_stop_revokes_prepared_trial_packet_without_stopping_controls(
     wire, clock = trial_wire
     gate, sender, connection, sink = wire
     stopped = asyncio.Event()
-    gate.set_auto_resume_stop(stopped.is_set)
+    gate.set_shutdown_requested(stopped.is_set)
     response, packet = await _prepared_packet(wire, clock)
     budget = cast(telegram_rpc._WireAttempt, sender.application_owner(response)).scope.attempt_budget
     assert budget is not None and budget.limit == 1
