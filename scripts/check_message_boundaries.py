@@ -180,8 +180,12 @@ MESSAGE_BODY_SERIALIZER_PATHS = frozenset(
 MESSAGE_BODY_ENTRYPOINTS = {
     "tools/reading.py": frozenset({"_list_message_structured_item"}),
     "inbox_projection.py": frozenset({"_structured_messages"}),
-    "tools/activity.py": frozenset({"_structured_comment"}),
-    "tools/account_trace.py": frozenset({"_attach_trace_content_metadata"}),
+    "tools/activity.py": frozenset({"_comment_content"}),
+    "tools/account_trace.py": frozenset({"_attach_trace_item_content"}),
+}
+MESSAGE_BODY_DELEGATES = {
+    "tools/activity.py": ("_structured_comment", "_comment_content"),
+    "tools/account_trace.py": ("_attach_trace_content_metadata", "_attach_trace_item_content"),
 }
 CANONICAL_MESSAGE_VIEW_ENTRYPOINTS = {
     "tools/reading.py": frozenset({"_list_message_structured_item"}),
@@ -1035,6 +1039,19 @@ def _raw_message_content_violations(path: str, tree: ast.AST) -> list[Finding]:
             previous, old_tainted = self.function, self.tainted
             self.function, self.tainted = node.name, set()
             self.generic_visit(node)
+            delegation = MESSAGE_BODY_DELEGATES.get(path)
+            if delegation is not None and node.name == delegation[0]:
+                helper = delegation[1]
+                if not any(
+                    isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == helper
+                    for call in ast.walk(node)
+                ):
+                    findings.append(Finding(path, node.lineno, f"message delivery path must call {helper}"))
+                if not any(
+                    isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef) and function.name == helper
+                    for function in ast.walk(tree)
+                ):
+                    findings.append(Finding(path, node.lineno, f"message delivery helper {helper} must be defined"))
             if node.name in MESSAGE_BODY_ENTRYPOINTS.get(path, frozenset()):
                 message_view_count = self.message_view_counts.get(node.name, 0)
                 if node.name in CANONICAL_MESSAGE_VIEW_ENTRYPOINTS.get(path, frozenset()):

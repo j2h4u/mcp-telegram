@@ -733,24 +733,34 @@ def test_baseline_has_no_message_boundary_violations() -> None:
 
 
 @pytest.mark.parametrize(
-    ("relative_path", "entrypoint"),
+    ("relative_path", "entrypoint", "helper"),
     [
-        ("tools/activity.py", "_structured_comment"),
-        ("tools/account_trace.py", "_attach_trace_content_metadata"),
+        ("tools/activity.py", "_structured_comment", "_comment_content"),
+        ("tools/account_trace.py", "_attach_trace_content_metadata", "_attach_trace_item_content"),
     ],
 )
 def test_activity_trace_delivery_entrypoints_require_one_canonical_serializer(
-    relative_path: str, entrypoint: str
+    relative_path: str, entrypoint: str, helper: str
 ) -> None:
     gate = _gate()
     path = gate.SOURCE_ROOT / relative_path
     missing = f"def {entrypoint}(value):\n    return value\n"
+    assert any(f"must call {helper}" in finding.message for finding in gate.violations_for(path, missing))
+
+    missing_serializer = (
+        f"def {entrypoint}(value):\n    return {helper}(value)\ndef {helper}(value):\n    return value\n"
+    )
     assert any(
-        "must call serialize_message_content" in finding.message for finding in gate.violations_for(path, missing)
+        "must call serialize_message_content" in finding.message
+        for finding in gate.violations_for(path, missing_serializer)
     )
 
+    missing_helper = f"def {entrypoint}(value):\n    return {helper}(value)\n"
+    assert any("must be defined" in finding.message for finding in gate.violations_for(path, missing_helper))
+
     duplicate = (
-        f"def {entrypoint}(value):\n"
+        f"def {entrypoint}(value):\n    return {helper}(value)\n"
+        f"def {helper}(value):\n"
         "    serialize_message_content(None, None, 'none')\n"
         "    return serialize_message_content(None, None, 'none')\n"
     )
