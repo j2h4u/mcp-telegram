@@ -423,6 +423,13 @@ class GetSyncStatus(ToolArgs):
     sync_progress is the raw message_id offset cursor, not a row count.
     Retained messages, counts and any known history horizon remain available while acquisition
     is pending or disabled.
+    A recent event or retained message is a local fact, not proof of continuous history beyond
+    history_complete_at. message_delivery.catch_up describes protocol delivery recovery, not
+    forward history reconciliation. Automatic reconciliation becomes eligible on its schedule;
+    eligibility does not guarantee completion. To request a bounded background refresh, use
+    mark_dialog_for_sync with enable=true; this also enables history enrollment if disabled.
+    For an already synced dialog, access, topic attribution, and retry conditions can affect the
+    work; an accepted request does not mean it completed.
     Retention policy says which delivered messages may be saved; it does not verify delivery.
     Automatic group eligibility describes local facts; a fresh Telegram total requires a background probe.
     The latest retained message is ordered by Telegram sent time, not local arrival."""
