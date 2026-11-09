@@ -20,7 +20,7 @@ from mcp_telegram.sync_transactions import require_write_transaction
 
 HISTORY_LIMIT = 10
 HISTORY_RETENTION_SECONDS = 7 * 86_400
-_RESULT_MAX_BYTES = 512 * 1024
+MAX_DRAFT_RESULT_BYTES = 512 * 1024
 _MAX_PRUNE_BATCH = 1_000
 _SCOPE_WHERE = "account_id=? AND dialog_id=? AND top_message_id=? AND subdialog_peer_id=?"
 
@@ -371,7 +371,7 @@ def finish_draft_operation(  # noqa: PLR0913 - explicit receipt identity and res
     if outcome == "pending":
         raise ValueError("a finished draft operation cannot be pending")
     encoded = json.dumps(dict(result), ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
-    if len(encoded.encode()) > _RESULT_MAX_BYTES:
+    if len(encoded.encode()) > MAX_DRAFT_RESULT_BYTES:
         raise ValueError("draft operation result exceeds its storage bound")
     previous = read_draft_operation(conn, account_id, operation_key)
     if previous is None:
@@ -444,7 +444,7 @@ def refine_draft_verification(
     ):
         raise DraftOperationConflictError("draft verification changed immutable receipt evidence")
     encoded = json.dumps(dict(result), ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
-    if len(encoded.encode()) > _RESULT_MAX_BYTES:
+    if len(encoded.encode()) > MAX_DRAFT_RESULT_BYTES:
         raise ValueError("draft operation result exceeds its storage bound")
     conn.execute(
         "UPDATE draft_operation_receipts SET result_json=?,updated_at=? WHERE account_id=? AND operation_key=?",

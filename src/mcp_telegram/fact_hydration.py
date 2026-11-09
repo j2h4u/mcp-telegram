@@ -33,6 +33,7 @@ from .messages.sqlite_hydration_jobs import (
     repair_media_metadata_hydration_jobs,
     repair_rich_composition_hydration_jobs,
     repair_transcription_hydration_jobs,
+    rich_composition_is_unknown,
     rich_composition_repair_revision,
 )
 from .messages.telegram_adapter import extract_received_messages
@@ -347,7 +348,9 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         if isinstance(selection, SliceOutcome):
             return selection
         with durable_demand_context(self.demand_kind):
-            outcome = await self._worker.run_priority_slice(self._priority, budget, selected_job=selection)
+            outcome = await self._worker.run_priority_slice(
+                self._priority, budget, selected_job=selection, excluded=budget.excluded, account_id=self._account_id
+            )
         return self._slice_outcome(selected, outcome)
 
     async def _run_repair_slice(self, selected: WorkRevision) -> SliceOutcome:
@@ -472,7 +475,13 @@ class MessageFactHydrationWorker:
         self._profile_owner_account_id = account_id
 
     async def run_priority_slice(
-        self, priority: HydrationPriority, budget: RpcAttemptBudget, *, selected_job: HydrationJob | None = None
+        self,
+        priority: HydrationPriority,
+        budget: RpcAttemptBudget,
+        *,
+        selected_job: HydrationJob | None = None,
+        excluded: frozenset[WorkRevision] = frozenset(),
+        account_id: int | None = None,
     ) -> _BatchOutcome | None:
         """Run at most one due batch from a single durable priority tier."""
         if not isinstance(priority, HydrationPriority):
@@ -488,7 +497,9 @@ class MessageFactHydrationWorker:
             effective_now = int(self._clock())
         if budget.exhausted and not budget.can_prepare_retry:
             return None
-        batch = self._select_batch(priority, budget, selected_job, effective_now)
+        batch = self._select_batch(
+            priority, budget, selected_job, effective_now, excluded=excluded, account_id=account_id
+        )
         if batch is None:
             return None
         return await self._process_batch(
@@ -498,26 +509,22 @@ class MessageFactHydrationWorker:
             attempt_budget=budget,
         )
 
-    def _select_batch(
+    def _select_batch(  # noqa: PLR0913
         self,
         priority: HydrationPriority,
         budget: RpcAttemptBudget,
         selected_job: HydrationJob | None,
         effective_now: int,
+        *,
+        excluded: frozenset[WorkRevision] = frozenset(),
+        account_id: int | None = None,
     ) -> list[HydrationJob] | None:
-        per_kind = (
-            {selected_job.kind: [selected_job]}
-            if selected_job is not None
-            else {
-                kind: self._queue.due_jobs(
-                    effective_now,
-                    self._max_jobs_per_cycle,
-                    kind=kind,
-                    priority=priority,
-                )
-                for kind in self._handlers
-            }
-        )
+        if selected_job is not None:
+            return self._selected_batch(priority, budget, selected_job, effective_now, excluded, account_id)
+        per_kind = {
+            kind: self._queue.due_jobs(effective_now, self._max_jobs_per_cycle, kind=kind, priority=priority)
+            for kind in self._handlers
+        }
         selected: list[HydrationJob] = []
         _append_due_priority_tier(
             selected,
@@ -526,19 +533,60 @@ class MessageFactHydrationWorker:
             self._max_jobs_per_cycle,
         )
         batches = batch_jobs(selected, self._handlers, backfill_first=priority is HydrationPriority.BACKFILL)
-        # A method-recovery retry may still need the exact selected batch to
-        # reach the RPC gate, which owns the physical-send decision. Preparing
-        # this one bounded candidate does not reserve or debit any attempts.
-        # Without an owner-selected job, do not let retry credit select ambient
-        # work while the ordinary slice budget is exhausted.
-        can_prepare_selected_retry = selected_job is not None and budget.exhausted and budget.can_prepare_retry
         return next(
-            (
-                candidate
-                for candidate in batches
-                if self._handlers[candidate[0].kind].request_cost <= budget.remaining or can_prepare_selected_retry
-            ),
+            (candidate for candidate in batches if self._handlers[candidate[0].kind].request_cost <= budget.remaining),
             None,
+        )
+
+    def _selected_batch(  # noqa: PLR0913, PLR0917
+        self,
+        priority: HydrationPriority,
+        budget: RpcAttemptBudget,
+        selected: HydrationJob,
+        now: int,
+        excluded: frozenset[WorkRevision],
+        account_id: int | None,
+    ) -> list[HydrationJob] | None:
+        handler = self._handlers[selected.kind]
+        if budget.can_prepare_retry:
+            return [selected]
+        if budget.exhausted:
+            return None
+        if handler.request_cost > budget.remaining:
+            return None
+        limit = min(handler.batch_size, self._max_jobs_per_cycle)
+        if limit == 1 or not self._batchable_unknown(selected):
+            return [selected]
+        jobs = [selected]
+        for job in self._queue.due_jobs(now, self._max_jobs_per_cycle, kind=selected.kind, priority=priority):
+            if not self._compatible_companion(selected, job, excluded, account_id):
+                continue
+            jobs.append(job)
+            if len(jobs) == limit:
+                break
+        return jobs
+
+    def _compatible_companion(
+        self, selected: HydrationJob, job: HydrationJob, excluded: frozenset[WorkRevision], account_id: int | None
+    ) -> bool:
+        if not excluded:
+            return job != selected and job.dialog_id == selected.dialog_id and self._batchable_unknown(job)
+        if account_id is None:
+            raise ValueError("account_id is required when excluding revisions")
+        revision = WorkRevision(
+            WorkKey(_hydration_demand_kind(job.priority), account_id, f"{job.kind}:{job.dialog_id}:{job.message_id}"),
+            hydration_work_revision(self._conn, job),
+        )
+        return (
+            job != selected
+            and job.dialog_id == selected.dialog_id
+            and revision not in excluded
+            and self._batchable_unknown(job)
+        )
+
+    def _batchable_unknown(self, job: HydrationJob) -> bool:
+        return job.kind != RICH_COMPOSITION_KIND or rich_composition_is_unknown(
+            self._conn, job.dialog_id, job.message_id
         )
 
     async def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
@@ -865,7 +913,11 @@ class MessageFactHydrationWorker:
         reaction_boundary: ReactionObservationBoundary | None,
     ) -> MediaPublication:
         values = result if isinstance(result, (list, tuple)) else [result]
-        ids = {job.message_id for job in jobs}
+        ids = {
+            job.message_id
+            for job in jobs
+            if hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
+        }
         received = extract_received_messages([value for value in values if getattr(value, "id", None) in ids])
         accepted: set[int] = set()
         for message in received:
@@ -1242,8 +1294,8 @@ class MessageFactHydrationWorker:
                     HydrationQueueRepository(conn).mark_terminal(
                         job, outcome=HydrationOutcome.TERMINAL_ERROR, error_code=descriptor.symbol
                     )
-                if current:
-                    committed_revision = self._revision_for_conn(conn, current[0])
+                if current and any(job.message_id == batch[0].message_id for job in current):
+                    committed_revision = self._revision_for_conn(conn, batch[0])
                 self._require_media_scope(conn, scope)
             self._log_drops(batch, preflight_observations)
             self._log_drops(current, self._observations("terminal_rpc", current), descriptor=descriptor)
@@ -1301,14 +1353,47 @@ class MessageFactHydrationWorker:
             )
         self._log_drops(batch, preflight_observations)
         self._log_drops(started, applied.drop_observations)
+        completed, committed_revision, terminal_revision = self._selected_result(
+            conn, handler, batch[0], started, applied
+        )
         return _BatchOutcome(
             hydrated=applied.hydrated,
-            completed=applied.completed,
+            completed=completed,
             pending=pending,
             dropped=len(preflight_observations) + applied.dropped,
-            committed_revision=(
-                self._revision_for_conn(conn, started[0])
-                if started and (applied.hydrated or applied.completed)
+            committed_revision=committed_revision,
+            terminal_revision=terminal_revision,
+        )
+
+    def _selected_result(
+        self,
+        conn: sqlite3.Connection,
+        handler: HydrationHandler,
+        selected: HydrationJob,
+        started: Sequence[HydrationJob],
+        applied: AppliedFacts,
+    ) -> tuple[int, str | None, str | None]:
+        selected_current = any(job.message_id == selected.message_id for job in started)
+        selected_row = cast(
+            tuple[int] | None,
+            conn.execute(
+                "SELECT terminal FROM hydration_jobs WHERE kind=? AND dialog_id=? AND message_id=?",
+                (selected.kind, selected.dialog_id, selected.message_id),
+            ).fetchone(),
+        )
+        selected_revision = self._revision_for_conn(conn, selected) if selected_current else None
+        return (
+            int(selected_current and selected_row is None),
+            (
+                selected_revision
+                if handler.kind in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND) or applied.hydrated or applied.completed
+                else None
+            ),
+            (
+                selected_revision
+                if handler.kind in (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND)
+                and selected_row is not None
+                and selected_row[0]
                 else None
             ),
         )

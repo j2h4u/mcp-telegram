@@ -90,6 +90,9 @@ class MediaFactHydrationHandler:
                     HydrationDropObservation("not_applied", job.message_id, job.kind, job.dialog_id, job.attempts)
                 )
                 continue
+            if self.kind == RICH_COMPOSITION_KIND and getattr(getattr(message, "rich_message", None), "part", False):
+                queue.requeue_not_applied(job, job.due_at)
+                continue
             queue.remove(job)
             completed += 1
             if extract_media_fact(getattr(message, "media", None)) is not None:
@@ -112,8 +115,8 @@ class RichCompositionHydrationHandler(MediaFactHydrationHandler):
     kind = RICH_COMPOSITION_KIND
     request_cost = 3
 
-    def __init__(self) -> None:
-        super().__init__(batch_size=1)
+    def __init__(self, *, batch_size: int) -> None:
+        super().__init__(batch_size=batch_size)
 
     def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool:
         return rich_composition_hydration_eligible(conn, job.dialog_id, job.message_id)
@@ -121,9 +124,11 @@ class RichCompositionHydrationHandler(MediaFactHydrationHandler):
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
         result = await super().request(client, jobs)
         by_id, valid = _response_map(result)
-        message = by_id.get(jobs[0].message_id) if valid else None
-        if message is not None:
+        for message in by_id.values():
             _require_rich_peer(message, jobs[0].dialog_id)
+        message = by_id.get(jobs[0].message_id) if valid else None
+        if len(jobs) > 1:
+            return result
         rich = getattr(message, "rich_message", None)
         if not getattr(rich, "part", False):
             return result

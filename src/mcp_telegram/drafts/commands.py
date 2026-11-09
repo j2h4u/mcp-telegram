@@ -19,6 +19,7 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from mcp_telegram.drafts.contracts import MAX_DRAFT_TEXT_LENGTH, DraftScope, project_draft_result
 from mcp_telegram.drafts.history import (
+    MAX_DRAFT_RESULT_BYTES,
     DraftOperationConflictError,
     DraftOperationReceipt,
     DraftRestoreUnavailableError,
@@ -32,14 +33,17 @@ from mcp_telegram.drafts.history import (
     refine_draft_verification,
 )
 from mcp_telegram.drafts.ports import DraftPreflightBusyError
+from mcp_telegram.drafts.read_service import current_draft_output
 from mcp_telegram.drafts.snapshot import (
     DraftSnapshotError,
     build_clear_draft_request,
+    build_rich_draft_request,
     build_save_draft_request,
     build_text_draft_request,
     compare_draft_request,
 )
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.rich_authoring import AuthoredBody, BodyFormat, parse_authored_body
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget, current_demand_token, demand_context, require_execution_mode
@@ -80,6 +84,7 @@ class _Command:
     operation_key: str
     expected_version: str | None
     text: str | None
+    body_format: BodyFormat | None
     history_id: int | None
     drop_formatting: bool
 
@@ -92,6 +97,7 @@ class _Command:
             "subdialog_peer_id": self.scope.subdialog_peer_id,
             "expected_version": self.expected_version,
             "text": self.text,
+            "format": self.body_format,
             "history_id": self.history_id,
             "drop_formatting": self.drop_formatting,
         }
@@ -139,13 +145,14 @@ def _parse_command(request: Mapping[str, object], account_id: int) -> _Command:
     if not isinstance(operation_key, str) or not operation_key.strip() or len(operation_key) > _OPERATION_KEY_LIMIT:
         raise DraftCommandError("invalid_arguments", "operation_key must contain between 1 and 128 characters.")
     expected = _expected_version(request, action)
-    text, history_id, drop_formatting = _composition_arguments(request, action)
+    text, body_format, history_id, drop_formatting = _composition_arguments(request, action)
     return _Command(
         cast(Literal["create", "update", "clear", "restore"], action),
         scope,
         operation_key,
         expected,
         text,
+        body_format,
         history_id,
         drop_formatting,
     )
@@ -164,15 +171,34 @@ def _draft_text(text: object, action: str) -> str | None:
     return cast(str | None, text)
 
 
-def _composition_arguments(request: Mapping[str, object], action: str) -> tuple[str | None, int | None, bool]:
-    text = _draft_text(request.get("text"), action)
+def _composition_arguments(
+    request: Mapping[str, object], action: str
+) -> tuple[str | None, BodyFormat | None, int | None, bool]:
+    text, body_format, drop_formatting = _body_arguments(request, action)
     history_id = _positive_optional(request.get("history_id"), "history_id")
     if (action == "restore") != (history_id is not None):
         raise DraftCommandError("invalid_arguments", "history_id is required only for restore.")
+    return text, body_format, history_id, drop_formatting
+
+
+def _body_arguments(request: Mapping[str, object], action: str) -> tuple[str | None, BodyFormat | None, bool]:
+    try:
+        body = parse_authored_body(request)
+    except ValueError as exc:
+        raise DraftCommandError("invalid_arguments", str(exc)) from None
+    if action not in {"create", "update"} and ("text" in request or "format" in request):
+        raise DraftCommandError("invalid_arguments", "text and format are only accepted for create and update.")
+    text = _draft_text(None if body is None else body.text, action)
+    return text, None if body is None else body.format, _drop_formatting(request, action, body)
+
+
+def _drop_formatting(request: Mapping[str, object], action: str, body: AuthoredBody | None) -> bool:
     drop_formatting = request.get("drop_formatting", False)
     if type(drop_formatting) is not bool or (drop_formatting and action != "update"):
         raise DraftCommandError("invalid_arguments", "drop_formatting is a boolean for update only.")
-    return text, history_id, drop_formatting
+    if body is not None and body.format != "plain" and drop_formatting:
+        raise DraftCommandError("invalid_arguments", "drop_formatting cannot be used with rich text.")
+    return drop_formatting
 
 
 def _public_current(state: DraftState) -> dict[str, object]:
@@ -183,6 +209,73 @@ def _public_current(state: DraftState) -> dict[str, object]:
         "observed_at": state.observed_at,
         "uncertain": state.uncertain,
     }
+
+
+def _bound_observation(result: dict[str, object]) -> None:
+    encoded = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    if len(encoded.encode()) <= MAX_DRAFT_RESULT_BYTES:
+        return
+    current = cast(dict[str, object], result["current"])
+    reference: dict[str, object] = {
+        key: current[key] for key in ("presence", "expected_version", "observed_at", "uncertain") if key in current
+    }
+    result["current"] = {
+        **reference,
+        "content_included": False,
+        "content_omission_reason": "response_budget",
+    }
+    result["verification"] = {"status": "unverified", "basis": "none", "reason": "snapshot_too_large"}
+    result["current_is_operation_confirmation"] = False
+    result["next_action"] = "Read get_draft for the retained observation. Do not repeat the write."
+
+
+def _same_plain_body(command: _Command, current: DraftState) -> bool:
+    return (
+        command.body_format == "plain"
+        and command.action == "update"
+        and command.text == current.text
+        and not command.drop_formatting
+        and current_draft_output(current).get("rich_content_status") == "absent"
+    )
+
+
+def _body_request(command: _Command, current: DraftState, peer: object) -> SaveDraftRequest | None:
+    assert command.text is not None
+    if _same_plain_body(command, current):
+        return None
+    existing = current.restore_snapshot if command.action == "update" else None
+    if command.body_format != "plain":
+        assert command.body_format is not None
+        return build_rich_draft_request(
+            peer, command.scope, AuthoredBody(command.text, command.body_format), existing=existing
+        )
+    return build_text_draft_request(
+        peer, command.scope, command.text, existing=existing, drop_formatting=command.drop_formatting
+    )
+
+
+def _rich_verification(state: DraftState, current: Mapping[str, object], acknowledged: bool) -> str:
+    if acknowledged and current.get("rich_content_status") == "complete" and state.restore_snapshot is not None:
+        return "observed"
+    return "conflict" if current.get("rich_content_status") == "absent" else "unverified"
+
+
+def _verification_status(
+    command: _Command,
+    request: SaveDraftRequest,
+    state: DraftState,
+    result: Mapping[str, object],
+    *,
+    intended_absent: bool,
+) -> str:
+    if (state.presence == "absent") != intended_absent:
+        return "conflict"
+    if command.body_format not in {None, "plain"}:
+        return _rich_verification(
+            state, cast(Mapping[str, object], result["current"]), result.get("save_acknowledged") is True
+        )
+    match = compare_draft_request(request, command.scope, state.restore_snapshot, present=not intended_absent)
+    return "unverified" if match is None else "verified" if match else "conflict"
 
 
 class DraftCommandOwner:
@@ -353,16 +446,7 @@ class DraftCommandOwner:
             return None if current.presence == "absent" else build_clear_draft_request(peer, command.scope)
         if command.action == "restore":
             return self._restore_request(command, current, peer)
-        assert command.text is not None
-        if command.action == "update" and command.text == current.text:
-            return None
-        return build_text_draft_request(
-            peer,
-            command.scope,
-            command.text,
-            existing=current.restore_snapshot if command.action == "update" else None,
-            drop_formatting=command.drop_formatting,
-        )
+        return _body_request(command, current, peer)
 
     def _restore_request(self, command: _Command, current: DraftState, peer: object) -> SaveDraftRequest | None:
         assert command.history_id is not None
@@ -499,26 +583,33 @@ class DraftCommandOwner:
         self, command: _Command, request: SaveDraftRequest, intended_absent: bool, result: dict[str, object]
     ) -> None:
         state = read_current_draft(self._reader, command.scope)
-        result["current"] = _public_current(state)
+        current = current_draft_output(state)
+        current.setdefault("text", state.text)
+        result["current"] = current
         if state.uncertain or state.expected_version is None or state.presence == "unknown":
             result["verification"] = {"status": "unverified", "basis": "none", "reason": "state_uncertain"}
             return
-        if (state.presence == "absent") != intended_absent:
-            match: bool | None = False
-        else:
-            match = compare_draft_request(request, command.scope, state.restore_snapshot, present=not intended_absent)
-        status = "unverified" if match is None else "verified" if match else "conflict"
+        status = _verification_status(
+            command,
+            request,
+            state,
+            result,
+            intended_absent=intended_absent,
+        )
         result["verification"] = {"status": status, "basis": "post_write_snapshot"}
         result["current_is_operation_confirmation"] = status == "verified"
         result["next_action"] = (
             "Draft verified; it remains unsent."
             if status == "verified"
+            else "Review the observed draft; it remains unsent."
+            if status == "observed"
             else "Review the observed draft before another command."
         )
 
     async def _refine_owned(self, command: _Command, result: dict[str, object]) -> None:
         if result.get("result_persisted") is not True:
             return
+        _bound_observation(result)
 
         def persist(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):
@@ -601,6 +692,7 @@ class DraftCommandOwner:
     async def _finish(self, command: _Command, result: dict[str, object]) -> None:
         result.setdefault("verification", {"status": "unverified", "basis": "none", "reason": "not_verified"})
         result["result_persisted"] = True
+        _bound_observation(result)
 
         def persist(conn: sqlite3.Connection) -> None:
             with write_transaction(conn):

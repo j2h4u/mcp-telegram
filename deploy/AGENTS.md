@@ -25,13 +25,39 @@ This directory is the live deployment workspace, not the source checkout.
 
 ### SQLite backup, restore and retention
 
-Before changing the schema or an incompatible persisted format, stop the
-writer daemon and create a consistent matching backup pair of `sync.db` and
+Before changing the schema or an incompatible persisted format, create a
+consistent matching backup pair of `sync.db` and
 `mcp_telegram_session.session` in the operator-owned `backups/` directory.
 Use SQLite-aware backups of both databases while the writer daemon is stopped, or
 copy their complete stopped database families, including required WAL/SHM
 sidecars. Copying only live database files is insufficient. Protect Session
 backups as credentials and retain the matching release/configuration reference.
+
+Use `just runtime-migrate STATE OUTPUT SOURCE_SCHEMA RELEASE CONFIG_REFERENCE`
+from the repository root. OUTPUT must be a new path in the private backup
+directory; RELEASE and CONFIG_REFERENCE identify the release and configuration
+without containing credentials. The recipe pins the actual running image before
+building, prepares the candidate while the old service runs, stops the captured
+container, and acquires the stable session lease for both SQLite backup API
+copies and bounded read-only checks. It publishes the matching-pair manifest
+last, then starts the prepared image and runs readiness and official MCP smoke.
+Check the relevant product scenario before acceptance. Record stop-to-pair and
+validation timings. I/O and stop time are unbounded on this host.
+
+If backup or lightweight validation fails, the recipe resumes the captured old
+container and returns failure; investigate the retained incomplete artifacts.
+After candidate startup is attempted, do not automatically start the old binary:
+the migration may already have committed. Prefer a forward fix. An image pin
+does not establish compatibility with the migrated schema.
+
+Full `quick_check`, whole-file hashes and exhaustive counts are optional after
+service recovery. Run them on immutable backup inputs, retain those inputs until
+the verifier finishes or is explicitly cancelled, and investigate failures;
+never automatically restore on verifier failure. They can compete for disk I/O.
+Restore only the matching pair after explicitly acknowledging the facts that may be
+lost since capture. Retain the printed task-owned image pin, override, and pair
+until acceptance and until no verifier or recovery needs them; then remove only
+those identified artifacts.
 
 Restore only a matching pair with the writer daemon stopped; first preserve the
 current pair. Restoring an older backup loses facts ingested after its capture

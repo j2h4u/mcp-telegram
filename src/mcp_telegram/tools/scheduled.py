@@ -12,6 +12,7 @@ from ..dialog_selector import (
     DialogSelectorError,
     required_dialog_selector,
 )
+from ..rich_authoring import BodyFormat, parse_authored_body
 from ..scheduled_contracts import SCHEDULED_OPERATION_KEY_LIMIT
 from ..temporal import parse_utc_boundary
 from ._base import (
@@ -52,7 +53,8 @@ class ManageScheduledMessage(ToolArgs):
     operation_key: str = Field(min_length=1, max_length=SCHEDULED_OPERATION_KEY_LIMIT)
     scheduled_message_id: StrictInt | None = Field(default=None, gt=0, description="Queue ID, not a sent-message ID.")
     expected_version: str | None = Field(default=None, min_length=1, max_length=256)
-    text: str | None = Field(default=None, max_length=65_536, description="Plain text; create does not accept media.")
+    text: str | None = Field(default=None, max_length=65_536, description="Text source; media input is not supported.")
+    format: BodyFormat = Field(default="plain", description="Plain text or Telegram native rich Markdown/HTML source.")
     schedule_at_utc: str | None = Field(
         default=None,
         description="Absolute RFC3339 UTC time (Z or +00:00). New writes need at least 60 seconds of lead at dispatch; same-key receipt replay may reuse the original time.",
@@ -66,6 +68,15 @@ class ManageScheduledMessage(ToolArgs):
         default=False,
         description="Explicitly discard existing formatting when replacing formatted text.",
     )
+
+    @model_validator(mode="after")
+    def validate_format(self) -> ManageScheduledMessage:
+        body = parse_authored_body(self.model_dump(include={"text", "format"}, exclude_unset=True))
+        if body is not None and body.format != "plain" and self.drop_formatting:
+            raise ValueError("rich format cannot be combined with drop_formatting")
+        if self.action == "cancel" and "format" in self.model_fields_set:
+            raise ValueError("cancel does not accept format")
+        return self
 
     @model_validator(mode="after")
     def validate_request(self) -> ManageScheduledMessage:
@@ -150,7 +161,25 @@ MANAGE_SCHEDULED_MESSAGE_OUTPUT_SCHEMA: dict[str, object] = {
         "mutation_dispatched": {"type": ["boolean", "null"]},
         "acknowledged": {"type": ["boolean", "null"]},
         "receipt_persisted": {"type": "boolean"},
-        "current_is_operation_confirmation": {"type": "boolean"},
+        "current_is_operation_confirmation": {
+            "type": "boolean",
+            "description": "False with observed still includes the complete post-write snapshot; it does not assert source equivalence.",
+        },
+        "current": {"type": "object", "description": "Canonical observed scheduled message, when available."},
+        "current_version": {
+            "type": "string",
+            "description": "Version of an observed item too large to include in this receipt.",
+        },
+        "verification": {
+            "type": "object",
+            "properties": {
+                "status": {"enum": ["verified", "observed", "conflict", "unverified"]},
+                "basis": {"enum": ["post_write_snapshot", "preflight", "none"]},
+                "reason": {"type": "string", "maxLength": 128},
+            },
+            "required": ["status", "basis"],
+            "additionalProperties": False,
+        },
         "schedule_at_utc": {"type": ["string", "null"]},
     },
     "required": [
@@ -208,6 +237,9 @@ def _scheduled_error_response(response: Mapping[str, object]) -> ToolResult | No
         "acknowledged",
         "receipt_persisted",
         "current_is_operation_confirmation",
+        "current",
+        "current_version",
+        "verification",
         "schedule_at_utc",
     ):
         if field in response:

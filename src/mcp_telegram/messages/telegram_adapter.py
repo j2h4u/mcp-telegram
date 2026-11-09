@@ -37,6 +37,7 @@ from ..telegram_demand import (
 )
 from ..telethon_media import extract_media_fact
 from ..telethon_message import is_service_message
+from ..todo_content import todo_content
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -488,21 +489,24 @@ def _concrete_attr(obj: object, name: str) -> object | None:
     return values.get(name)
 
 
+def _merge_rich_text(native: str | None, rich_text: str) -> str | None:
+    if not native:
+        return rich_text or native
+    if rich_text == native.strip() or rich_text.startswith(native.strip() + "\n"):
+        return rich_text
+    return f"{native}\n{rich_text}" if rich_text else native
+
+
 def extract_message_text(msg: object) -> str | None:
     text = _attr(msg, "message", None)
     native = text if isinstance(text, str) else None
     rich = _concrete_attr(msg, "rich_message")
-    if rich is None:
-        return native
-    tree, _, _ = decode_rich_message(capture_rich_message(rich))
-    rich_text = rich_message_text(tree).strip() if tree is not None else ""
-    if not native:
-        return rich_text or native
-    if not rich_text:
-        return native
-    if rich_text == native.strip() or rich_text.startswith(native.strip() + "\n"):
-        return rich_text
-    return f"{native}\n{rich_text}"
+    if rich is not None:
+        tree, _, _ = decode_rich_message(capture_rich_message(rich))
+        native = _merge_rich_text(native, rich_message_text(tree).strip() if tree is not None else "")
+    fact = extract_media_fact(_attr(msg, "media", None))
+    checklist = todo_content(fact.payload).text if fact is not None and fact.kind == "todo" else ""
+    return f"{native}\n{checklist}" if native and checklist else native or checklist or native
 
 
 def _extract_media_fact(msg: object) -> tuple[str | None, str | None, int | None]:

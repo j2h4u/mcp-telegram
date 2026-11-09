@@ -2,6 +2,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 from .media_fact import MEDIA_KIND_VALUES, MEDIA_KINDS, MediaKind
 from .message_content import ContentKind
+from .todo_content import todo_content
 
 TelegramContentKind = Literal[
     "message_text",
@@ -63,6 +64,8 @@ class Attachment(TypedDict):
 
     type: MediaKind
     description: NotRequired[str]
+    todo: NotRequired[dict[str, object]]
+    todo_status: NotRequired[Literal["captured", "unknown", "unsupported"]]
 
 
 class SerializedMessageContent(TypedDict):
@@ -78,6 +81,8 @@ MEDIA_OUTPUT_SCHEMA = {
             "enum": list(MEDIA_KIND_VALUES),
         },
         "description": {"type": "string"},
+        "todo": {"type": "object"},
+        "todo_status": {"type": "string", "enum": ["captured", "unknown", "unsupported"]},
     },
     "required": ["type"],
     "additionalProperties": False,
@@ -117,13 +122,14 @@ def serialize_message_content(
     media_description: str | None,
     kind: DeliveryContentKind,
     media_kind: str | None = None,
+    media_payload: dict[str, object] | None = None,
 ) -> SerializedMessageContent:
     """Serialize already-projected message facts for delivery surfaces.
 
     Projection (including hidden-link rendering) belongs to ``MessageContent``;
     this helper only applies the shared wire wrapper and primary-content rule.
     """
-    media = project_media_description(media_description, media_kind)
+    media = project_media_description(media_description, media_kind, media_payload)
     # Media is represented once by its attachment object.  Keep content for
     # captions/text only so the description cannot be duplicated.
     normalized_text = text or None
@@ -141,12 +147,17 @@ def serialize_message_content(
     }
 
 
-def project_media_description(media_description: str | None, media_kind: str | None = None) -> Attachment | None:
+def project_media_description(
+    media_description: str | None, media_kind: str | None = None, media_payload: dict[str, object] | None = None
+) -> Attachment | None:
     """Project persisted media facts into one stable agent-facing attachment."""
     if media_kind is None or media_kind not in MEDIA_KINDS:
         return None
     attachment: Attachment = {"type": cast(MediaKind, media_kind)}
-    if media_description:
+    if media_kind == "todo":
+        attachment["todo"] = media_payload or {}
+        attachment["todo_status"] = todo_content(media_payload).status
+    if media_description and media_kind != "todo":
         attachment["description"] = media_description
     return attachment
 

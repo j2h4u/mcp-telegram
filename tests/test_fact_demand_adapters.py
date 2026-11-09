@@ -141,6 +141,103 @@ def test_hydration_retry_preflight_selects_only_the_exact_bounded_candidate() ->
         conn.close()
 
 
+def test_selected_batch_respects_peer_priority_due_and_exclusions() -> None:
+    conn = _hydration_db()
+    try:
+        conn.executemany(
+            "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,priority,terminal) VALUES (?,?,?,?,?,?)",
+            [
+                ("test", 1, 1, 1, 1, 0),
+                ("test", 1, 2, 1, 1, 0),
+                ("test", 1, 3, 1, 1, 0),
+                ("test", 2, 4, 1, 1, 0),
+                ("test", 1, 5, 101, 1, 0),
+                ("test", 1, 6, 1, 0, 0),
+                ("test", 1, 7, 1, 1, 1),
+            ],
+        )
+        worker = _hydration_worker(conn, _HydrationHandler(), clock=lambda: 100.0)
+        worker._max_jobs_per_cycle = 10
+        adapter = FactHydrationDemandAdapter(worker, HydrationPriority.FOREGROUND, account_id=1)
+        jobs = worker._queue.due_jobs(100, 20, kind="test", priority=HydrationPriority.FOREGROUND)
+        selected = next(job for job in jobs if job.message_id == 1)
+        excluded = adapter._revision(next(job for job in jobs if job.message_id == 3))
+        result = worker._select_batch(
+            HydrationPriority.FOREGROUND,
+            RpcAttemptBudget(3),
+            selected,
+            100,
+            excluded=frozenset({excluded}),
+            account_id=1,
+        )
+        assert result is not None
+        assert [job.message_id for job in result] == [1, 2]
+        without_exclusions = worker._select_batch(HydrationPriority.FOREGROUND, RpcAttemptBudget(3), selected, 100)
+        assert without_exclusions is not None
+        assert [job.message_id for job in without_exclusions] == [1, 2, 3]
+        retry = RpcAttemptBudget(limit=3, attempts=1)
+        retry._retry_candidate = object()
+        assert worker._select_batch(HydrationPriority.FOREGROUND, retry, selected, 100) == [selected]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ineligible_selected_job_does_not_inherit_sibling_success() -> None:
+    conn = _hydration_db()
+    try:
+        conn.executemany(
+            "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,priority) VALUES ('test',1,?,1,1)",
+            [(1,), (2,)],
+        )
+        handler = _HydrationHandler()
+        worker = _hydration_worker(conn, handler, clock=lambda: 100.0)
+        worker._max_jobs_per_cycle = 10
+        adapter = FactHydrationDemandAdapter(worker, HydrationPriority.FOREGROUND, account_id=1)
+        status = adapter.status(100)
+        assert status is not None and status.selected is not None
+        with patch.object(handler, "eligible", side_effect=lambda _conn, job: job.message_id != 1):
+            outcome = await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
+        assert outcome.kind is SliceOutcomeKind.NO_PROGRESS
+        assert conn.execute("SELECT count(*) FROM hydration_jobs WHERE kind='test'").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_passes_exclusions_to_batch_selection() -> None:
+    conn = _hydration_db()
+    try:
+        conn.executemany(
+            "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,priority) VALUES ('test',1,?,1,1)",
+            [(1,), (2,), (3,)],
+        )
+        seen: list[int] = []
+
+        class Handler(_HydrationHandler):
+            async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
+                seen.extend(job.message_id for job in jobs)
+                return await super().request(client, jobs)
+
+        worker = _hydration_worker(conn, Handler(), clock=lambda: 100.0)
+        worker._max_jobs_per_cycle = 10
+        adapter = FactHydrationDemandAdapter(worker, HydrationPriority.FOREGROUND, account_id=1)
+        adapters = {kind: cast(DurableDemandAdapter, _IdleDemandAdapter()) for kind in DURABLE_DEMAND_ORDER}
+        adapters[DemandKind.LIVE_HYDRATION_BATCH] = adapter
+        coordinator = TelegramDemandCoordinator(adapters, asyncio.Event(), clock=lambda: 100.0)
+        jobs = worker._queue.due_jobs(100, 10, kind="test", priority=HydrationPriority.FOREGROUND)
+        selected = adapter._revision(jobs[0])
+        excluded = adapter._revision(jobs[1])
+        coordinator._excluded.add(excluded)
+        await coordinator._run_adapter(
+            DemandKind.LIVE_HYDRATION_BATCH, RpcAttemptBudget(3, selected=selected), selected
+        )
+        assert seen == [jobs[0].message_id, jobs[2].message_id]
+        assert conn.execute("SELECT message_id FROM hydration_jobs").fetchall() == [(jobs[1].message_id,)]
+    finally:
+        conn.close()
+
+
 class _HydrationHandler:
     kind = "test"
     batch_size = 10

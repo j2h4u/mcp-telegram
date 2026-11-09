@@ -27,6 +27,9 @@ from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 from .access_lifecycle import not_access_lost_sql
 from .message_composition import decode_formatting_entities
 from .observation_order import delivered_observation_order
+from .reading.scheduled_projection import scheduled_current
+from .rich_authoring import AuthoredBody, BodyFormat, native_rich_input, parse_authored_body
+from .rich_content import capture_rich_message, decode_rich_message
 from .scheduled_contracts import SCHEDULED_OPERATION_KEY_LIMIT, scheduled_message_version
 from .scheduled_messages import mark_scheduled_messages_removed, upsert_scheduled_message
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL as _SCHEDULED_OPERATION_RECEIPT_DDL
@@ -60,6 +63,7 @@ _ALLOWED_ARGUMENTS = frozenset(
         "scheduled_message_id",
         "expected_version",
         "text",
+        "format",
         "schedule_at_utc",
         "repeat_period_seconds",
         "drop_formatting",
@@ -104,6 +108,7 @@ class ScheduledCommand:
     repeat_period_seconds: int | None
     repeat_was_supplied: bool
     drop_formatting: bool
+    body_format: BodyFormat | None = None
 
     def fingerprint(self) -> str:
         payload = {
@@ -115,6 +120,7 @@ class ScheduledCommand:
             "scheduled_message_id": self.scheduled_message_id,
             "expected_version": self.expected_version,
             "text": self.text,
+            "format": self.body_format,
             "schedule_at_utc": self.schedule_at_utc,
             "repeat_period_seconds": self.repeat_period_seconds,
             "repeat_was_supplied": self.repeat_was_supplied,
@@ -259,7 +265,7 @@ def finish_scheduled_operation(  # noqa: PLR0913 - one receipt transition needs 
     conn.execute(
         "UPDATE scheduled_operation_receipts SET outcome=?,mutation_dispatched=?,result_json=?,"
         "scheduled_message_id=COALESCE(?,scheduled_message_id),updated_at=? "
-        "WHERE account_id=? AND operation_key=? AND outcome='pending'",
+        "WHERE account_id=? AND operation_key=? AND (outcome='pending' OR (outcome='acknowledged' AND ?='acknowledged'))",
         (
             outcome,
             None if mutation_dispatched is None else int(mutation_dispatched),
@@ -268,6 +274,7 @@ def finish_scheduled_operation(  # noqa: PLR0913 - one receipt transition needs 
             timestamp,
             account_id,
             operation_key,
+            outcome,
         ),
     )
     receipt = read_scheduled_operation(conn, account_id, operation_key)
@@ -403,6 +410,15 @@ def _validate_cancel(command: ScheduledCommand) -> None:
         )
 
 
+def _parse_drop_formatting(request: Mapping[str, object], body: AuthoredBody | None) -> bool:
+    value = request.get("drop_formatting", False)
+    if type(value) is not bool:
+        raise ScheduledCommandError("invalid_arguments", "drop_formatting must be a boolean.")
+    if body is not None and body.format != "plain" and value:
+        raise ScheduledCommandError("invalid_arguments", "drop_formatting cannot be combined with rich text.")
+    return value
+
+
 def _parse_command(request: Mapping[str, object], account_id: int) -> ScheduledCommand:
     if set(request) - _ALLOWED_ARGUMENTS:
         raise ScheduledCommandError("invalid_arguments", "The scheduled command contains unsupported fields.")
@@ -412,12 +428,14 @@ def _parse_command(request: Mapping[str, object], account_id: int) -> ScheduledC
     dialog_id, topic_id = _parse_scope(request, account_id)
     operation_key = _parse_operation_key(request)
     message_id, expected = _parse_item_version(request)
+    try:
+        body = parse_authored_body(request)
+    except ValueError as error:
+        raise ScheduledCommandError("invalid_arguments", str(error)) from error
     text = _parse_text(request)
     schedule_at = _parse_schedule(request)
     repeat = _parse_repeat(request)
-    drop_formatting = request.get("drop_formatting", False)
-    if type(drop_formatting) is not bool:
-        raise ScheduledCommandError("invalid_arguments", "drop_formatting must be a boolean.")
+    drop_formatting = _parse_drop_formatting(request, body)
     command = ScheduledCommand(
         cast(Literal["create", "update", "cancel"], action),
         account_id,
@@ -431,6 +449,7 @@ def _parse_command(request: Mapping[str, object], account_id: int) -> ScheduledC
         repeat,
         "repeat_period_seconds" in request,
         drop_formatting,
+        body.format if body is not None else None,
     )
     if action == "create":
         _validate_create(command)
@@ -581,6 +600,16 @@ def _text_replacement_flags(row: Mapping[str, object]) -> tuple[bool | None, boo
     return _caption_placement(row), None
 
 
+def _native_body(command: ScheduledCommand) -> types.TypeInputRichMessage | None:
+    if command.text is None or command.body_format in {None, "plain"}:
+        return None
+    return native_rich_input(AuthoredBody(command.text, cast(BodyFormat, command.body_format)))
+
+
+def _scheduled_reply(topic_id: int | None) -> types.InputReplyToMessage | None:
+    return types.InputReplyToMessage(reply_to_msg_id=topic_id, top_msg_id=topic_id) if topic_id is not None else None
+
+
 def _build_create_request(
     command: ScheduledCommand, peer: object, random_id: int | None, premium: bool | None
 ) -> object:
@@ -591,20 +620,17 @@ def _build_create_request(
         raise ScheduledCommandError(
             "topic_scope_unsupported", "Exact topic scheduling requires a retained forum channel."
         )
-    if repeat is not None and repeat > 0 and premium is not True:
+    if all((repeat is not None, (repeat or 0) > 0, premium is not True)):
         raise ScheduledCommandError(
             "premium_required", "A Premium account is required for repeating scheduled messages."
         )
     return SendMessageRequest(
         peer=cast(types.TypeInputPeer, peer),
-        message=command.text,
+        message=command.text if command.body_format == "plain" else "",
+        rich_message=_native_body(command),
         random_id=random_id,
-        reply_to=(
-            types.InputReplyToMessage(reply_to_msg_id=command.topic_id, top_msg_id=command.topic_id)
-            if command.topic_id is not None
-            else None
-        ),
-        entities=[],
+        reply_to=_scheduled_reply(command.topic_id),
+        entities=[] if command.body_format == "plain" else None,
         schedule_date=datetime.fromtimestamp(schedule_at, UTC),
         schedule_repeat_period=repeat if repeat and repeat > 0 else None,
     )
@@ -629,15 +655,65 @@ def _update_repeat(command: ScheduledCommand, row: Mapping[str, object], premium
     return current_repeat, effective_repeat
 
 
+def _validate_rich_replacement(row: Mapping[str, object]) -> None:
+    if row.get("media_kind") is not None or row.get("media_payload") is not None:
+        raise ScheduledCommandError(
+            "unsupported_composition", "Rich body replacement cannot preserve media dependencies."
+        )
+    if row.get("has_rich_message") is None:
+        raise ScheduledCommandError("unsupported_composition", "Rich composition is incomplete.")
+    if row.get("has_rich_message"):
+        try:
+            rich = cast(object, json.loads(cast(str, row.get("rich_message"))))
+        except TypeError, ValueError:
+            raise ScheduledCommandError("unsupported_composition", "Rich composition is incomplete.") from None
+        if not isinstance(rich, dict) or _rich_dependencies(rich):
+            raise ScheduledCommandError("unsupported_composition", "Rich composition has media dependencies.")
+    if bool(row.get("is_service")):
+        raise ScheduledCommandError("unsupported_composition", "Service messages cannot be edited through this tool.")
+
+
+def _rich_dependencies(value: object) -> bool:
+    if isinstance(value, list):
+        return any(_rich_dependencies(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    constructor = value.get("_")
+    if isinstance(constructor, str) and constructor in {
+        "PageBlockPhoto",
+        "PageBlockVideo",
+        "PageBlockAudio",
+        "PageBlockDocument",
+        "TextImage",
+        "PageBlockEmbed",
+        "PageBlockMap",
+        "PageBlockUnsupported",
+    }:
+        return True
+    if value.get("part") or value.get("photos") or value.get("documents"):
+        return True
+    return any(_rich_dependencies(item) for item in value.values())
+
+
 def _update_text_fields(
     command: ScheduledCommand, row: Mapping[str, object]
 ) -> tuple[str | None, list[types.TypeMessageEntity] | None, bool | None, bool | None]:
     if command.text is None:
         return None, None, None, None
-    if command.text == row["text"] and not command.drop_formatting:
+    if all(
+        (
+            command.text == row["text"],
+            command.body_format == "plain",
+            not command.drop_formatting,
+            not row.get("has_rich_message"),
+        )
+    ):
         return None, None, None, None
     if command.text != row["text"] and bool(row["is_service"]):
         raise ScheduledCommandError("unsupported_composition", "Service messages cannot be edited through this tool.")
+    if command.body_format != "plain":
+        _validate_rich_replacement(row)
+        return "", None, None, True
     invert_media, no_webpage = _text_replacement_flags(row)
     if not command.drop_formatting and _has_stored_formatting(row["formatting_entities"]):
         raise ScheduledCommandError(
@@ -671,6 +747,7 @@ def _build_update_request(
         peer=cast(types.TypeInputPeer, peer),
         id=cast(int, command.scheduled_message_id),
         message=message,
+        rich_message=_native_body(command),
         entities=entities,
         no_webpage=no_webpage,
         invert_media=invert_media,
@@ -834,6 +911,101 @@ def _response_row_confirmed(
     return row is not None and row["message_state"] == state and row["observation_order"] == observation_order
 
 
+def _incomplete_response(command: ScheduledCommand, evidence: object, before: Mapping[str, object] | None) -> bool:
+    rich = cast(object, getattr(evidence, "rich_message", None))
+    if rich is not None and decode_rich_message(capture_rich_message(rich))[1] == "partial":
+        return True
+    if command.body_format not in {None, "plain"} and rich is None:
+        return True
+    if not all((command.action == "update", command.text is None, before is not None)):
+        return False
+    assert before is not None
+    return bool(
+        (before.get("rich_message_status") == "complete" and rich is None)
+        or (before.get("media_kind") is not None and getattr(evidence, "media", None) is None)
+    )
+
+
+def _observation_matches(
+    command: ScheduledCommand, current: Mapping[str, object], before: Mapping[str, object] | None
+) -> bool | None:
+    schedule_matches = command.schedule_at_utc is None or current.get("scheduled_at") == command.schedule_at_utc
+    repeat_matches = (
+        not command.repeat_was_supplied or (current.get("repeat_period") or 0) == command.repeat_period_seconds
+    )
+    if not all((schedule_matches, repeat_matches)):
+        return False
+    if command.body_format not in {None, "plain"}:
+        return None
+    if command.text is not None:
+        return all(
+            (
+                schedule_matches,
+                repeat_matches,
+                current.get("text") == command.text,
+                not current.get("formatting_entities"),
+                current.get("rich_message_status") == "absent",
+            )
+        )
+    if before is None or before.get("rich_message_status") not in {"complete", "absent"}:
+        return None
+    fields = (
+        "text",
+        "rich_message",
+        "rich_message_status",
+        "media_kind",
+        "media_payload",
+        "formatting_entities",
+        "formatting_text",
+        "reply_to_msg_id",
+        "forum_topic_id",
+    )
+    return all((schedule_matches, repeat_matches, *(current.get(key) == before.get(key) for key in fields)))
+
+
+def _complete_current(command: ScheduledCommand, current: Mapping[str, object] | None) -> bool:
+    if current is None or current.get("rich_message_status") in {"partial", "unknown"}:
+        return False
+    return command.body_format in {None, "plain"} or current.get("rich_message_status") == "complete"
+
+
+def _result_with_observation(
+    result: dict[str, object],
+    command: ScheduledCommand,
+    current: dict[str, object] | None,
+    before: dict[str, object] | None,
+) -> dict[str, object]:
+    match = None if current is None else _observation_matches(command, current, before)
+    if current is not None:
+        result["current"] = current
+    result["verification"] = {
+        "status": _observation_status(current, match),
+        "basis": "none" if current is None else "post_write_snapshot",
+    }
+    if current is None:
+        cast(dict[str, object], result["verification"])["reason"] = "snapshot_unavailable"
+    result["current_is_operation_confirmation"] = match is True
+    normalized = cast(dict[str, object], json.loads(json.dumps(result)))
+    if (
+        len(json.dumps(normalized, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode())
+        > _MAX_RESULT_BYTES
+    ):
+        normalized.pop("current", None)
+        if current is not None and isinstance(current.get("expected_version"), str):
+            normalized["current_version"] = current["expected_version"]
+        normalized["verification"] = {"status": "unverified", "basis": "none", "reason": "snapshot_too_large"}
+        normalized["current_is_operation_confirmation"] = False
+    return normalized
+
+
+def _observation_status(current: object | None, match: bool | None) -> str:
+    if current is None:
+        return "unverified"
+    if match is None:
+        return "observed"
+    return "verified" if match else "conflict"
+
+
 class ScheduledCommandOwner:
     """Own one account-bound scheduled mutation and its durable receipt."""
 
@@ -849,6 +1021,7 @@ class ScheduledCommandOwner:
         account_is_premium: Callable[[], bool | None],
         request_recovery: Callable[[int, str], Awaitable[None]],
         prioritize_baseline: Callable[[int, int], Awaitable[bool]],
+        postflight: Callable[[int], Awaitable[bool]] | None = None,
     ) -> None:
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be positive")
@@ -861,6 +1034,7 @@ class ScheduledCommandOwner:
         self._account_is_premium = account_is_premium
         self._request_recovery = request_recovery
         self._prioritize_baseline = prioritize_baseline
+        self._postflight = postflight
         self._locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
 
     async def execute(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -996,6 +1170,11 @@ class ScheduledCommandOwner:
         self, command: ScheduledCommand, request_object: object, intent: ScheduledMutationIntent, response_order: int
     ) -> dict[str, object]:
         check = self._revalidation_check(command, intent)
+        before = (
+            scheduled_current(self._reader, command.dialog_id, command.scheduled_message_id, command.account_id)
+            if command.scheduled_message_id is not None and command.action == "update"
+            else None
+        )
         budget = RpcAttemptBudget(1)
         try:
             with demand_context(
@@ -1010,7 +1189,7 @@ class ScheduledCommandOwner:
             if not isinstance(error, Exception):
                 raise
             return result
-        return await self._dispatch_success(command, response, intent.random_id, response_order, budget)
+        return await self._dispatch_success(command, response, intent.random_id, response_order, budget, before)
 
     async def _dispatch_error(
         self, command: ScheduledCommand, error: BaseException, dispatched: bool
@@ -1045,34 +1224,70 @@ class ScheduledCommandOwner:
             await self._offer_recovery(command.dialog_id, "scheduled_mutation_unknown")
         return result
 
-    async def _dispatch_success(
+    async def _dispatch_success(  # noqa: PLR0913, PLR0917 - mutation evidence travels together.
         self,
         command: ScheduledCommand,
         response: object,
         random_id: int | None,
         response_order: int,
         budget: RpcAttemptBudget,
+        before: dict[str, object] | None,
     ) -> dict[str, object]:
         status, resulting_id, correlated = _correlated_response(command, response, random_id=random_id)
-        confirmed = False
-        if correlated is not None:
-            try:
-                confirmed = await self._apply_response(command, correlated, observation_order=response_order)
-            except Exception as error:  # noqa: BLE001 - preserve known remote outcome if local projection fails.
-                logger.warning("scheduled_response_projection_failed error_type=%s", type(error).__name__)
         dispatched = bool(budget.attempts) or response is not None
-        result = self._result(
-            command,
-            status,
-            dispatched,
-            acknowledged=True,
-            row_confirmed=confirmed,
-            scheduled_message_id=resulting_id,
+        provisional = self._result(
+            command, status, dispatched, acknowledged=True, row_confirmed=False, scheduled_message_id=resulting_id
         )
+        if command.action != "cancel":
+            provisional["verification"] = {"status": "unverified", "basis": "none", "reason": "snapshot_unavailable"}
+        await self._finish_receipt(command, "acknowledged", dispatched, provisional, resulting_id)
+        candidate_id = resulting_id
+        if candidate_id is None and command.action == "create":
+            candidate_id = _created_queue_id(_updates(response), random_id)
+        confirmed = await self._confirm_response(command, correlated, before, response_order)
+        current = await self._postflight_current(command, candidate_id, correlated, confirmed)
+        if current is not None:
+            resulting_id = candidate_id
+        result = self._result(
+            command, status, dispatched, acknowledged=True, row_confirmed=confirmed, scheduled_message_id=resulting_id
+        )
+        if command.action != "cancel":
+            result = _result_with_observation(result, command, current, before)
         await self._finish_receipt(command, "acknowledged", dispatched, result, resulting_id)
-        if not confirmed:
+        if not (confirmed if command.action == "cancel" else current is not None):
             await self._offer_recovery(command.dialog_id, "scheduled_mutation_unconfirmed")
         return result
+
+    async def _confirm_response(
+        self, command: ScheduledCommand, evidence: object | None, before: dict[str, object] | None, order: int
+    ) -> bool:
+        try:
+            if evidence is None or _incomplete_response(command, evidence, before):
+                return False
+            return await self._apply_response(command, evidence, observation_order=order)
+        except Exception as error:  # noqa: BLE001 - preserve known remote outcome.
+            logger.warning("scheduled_response_projection_failed error_type=%s", type(error).__name__)
+            return False
+
+    async def _postflight_current(
+        self, command: ScheduledCommand, candidate_id: int | None, evidence: object | None, confirmed: bool
+    ) -> dict[str, object] | None:
+        if command.action == "cancel" or candidate_id is None:
+            return None
+        complete = confirmed and isinstance(evidence, types.Message)
+        if not complete and self._postflight is not None:
+            try:
+                complete = await self._postflight(command.dialog_id)
+            except Exception as error:  # noqa: BLE001 - acknowledgement remains authoritative.
+                logger.warning("scheduled_postflight_failed error_type=%s", type(error).__name__)
+        if not complete:
+            return None
+        try:
+            current = scheduled_current(self._reader, command.dialog_id, candidate_id, command.account_id)
+            return current if _complete_current(command, current) else None
+        except Exception as error:  # noqa: BLE001 - preserve the acknowledged outcome.
+            logger.warning("scheduled_current_projection_failed error_type=%s", type(error).__name__)
+            return None
 
     async def _offer_recovery(self, dialog_id: int, reason: str) -> None:
         try:

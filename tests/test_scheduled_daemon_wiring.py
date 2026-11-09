@@ -499,6 +499,91 @@ async def test_saved_messages_target_uses_verified_self_without_entity_cache(con
     await server.shutdown()
 
 
+async def test_bound_postflight_runs_scheduled_gateway_with_single_admitted_attempt(  # noqa: PLR0914
+    wire: _WireHarness, tmp_path: Path
+) -> None:
+    from mcp_telegram.observation_order import allocate_observation_order
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+    from mcp_telegram.telegram_demand import AcquisitionKind
+    from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope
+
+    path = tmp_path / "postflight.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    reader = sqlite3.connect(path)
+    reader.row_factory = sqlite3.Row
+    gate, sender, connection, sink = wire
+    scopes: list[TelegramRpcScope] = []
+
+    def seed(db: sqlite3.Connection) -> None:
+        with write_transaction(db):
+            db.execute("UPDATE scheduled_sync_state SET account_id=42 WHERE key='account'")
+            order = allocate_observation_order(db)
+            db.execute(
+                "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,snapshot_observation_order,"
+                "baseline_observed_at,coverage_state) VALUES(42,1,?,1,'complete')",
+                (order,),
+            )
+
+    class Client:
+        async def get_input_entity(self, dialog_id: int) -> object:
+            assert dialog_id == 42
+            return types.InputPeerSelf()
+
+        async def __call__(self, request: object) -> object:
+            from telethon.tl.functions.messages import GetScheduledHistoryRequest
+
+            assert isinstance(request, GetScheduledHistoryRequest)
+            scope = current_rpc_scope()
+            scopes.append(scope)
+            result = sender.send_owned(request, scope)
+            state = await sender._send_queue.next_state()
+            await sender._prepare_state(state)
+            packet = connection._send_queue.get_nowait()
+            assert sender.write_packet(packet, connection._send)
+            state.future.set_result(types.messages.Messages(messages=[], chats=[], users=[], topics=[]))
+            return await result
+
+    await writer.run(seed)
+    client = Client()
+    server = make_server(reader, client, feedback_conn=reader)
+    server.self_id = 42
+    fence = ScheduledMutationFence()
+    reconciler = ScheduledMessageReconciler(
+        cast(ScheduledHistoryClient, client),
+        reader,
+        asyncio.Event(),
+        policy=ScheduledReconciliationPolicy(10),
+        writer=writer,
+        mutation_fence=fence,
+    )
+    reconciler.bind_account_id(42)
+    runtime = SimpleNamespace(scheduled_reconciler=reconciler, coordinator=SimpleNamespace(offer=lambda *_: None))
+    ctx = _typed_ctx(
+        conn=reader,
+        writer=writer,
+        client=client,
+        api_server=server,
+        demand_runtime=runtime,
+        scheduled_mutation_fence=fence,
+    )
+    try:
+        await _bind_scheduled_commands(ctx)
+        owner = cast(ScheduledCommandOwner, server._scheduled_commands)
+        assert owner._postflight is not None and await owner._postflight(42)
+        assert len(sink.frames) == 1 and len(scopes) == 1
+        scope = scopes[0]
+        assert scope.demand_kind is DemandKind.SCHEDULED_DISCOVERY
+        assert scope.acquisition_kind is AcquisitionKind.SCHEDULED_MESSAGES_SNAPSHOT
+        assert scope.attempt_budget is not None
+        assert scope.attempt_budget.limit == 1 and scope.attempt_budget.attempts == 1
+        assert gate.account_safety_status() is None
+    finally:
+        await server.shutdown()
+        await writer.aclose()
+        reader.close()
+
+
 async def test_actual_canonical_event_between_owner_prepare_and_wire_claim(  # noqa: PLR0915 - one command-to-frame race scenario
     wire: _WireHarness,
     tmp_path: Path,

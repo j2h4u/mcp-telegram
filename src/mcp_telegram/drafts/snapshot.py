@@ -29,6 +29,7 @@ from mcp_telegram.drafts.snapshot_codec import (
 from mcp_telegram.drafts.snapshot_codec import (
     decode_restore_snapshot as decode_restore_snapshot,
 )
+from mcp_telegram.rich_authoring import AuthoredBody, native_rich_input
 
 _MAX_RICH_NODES = 4096
 _REPLAY_FIELDS = frozenset(
@@ -251,11 +252,11 @@ def compare_draft_request(
 
 
 def _replace_draft_text(draft: types.DraftMessage, text: str, *, drop_formatting: bool) -> None:
-    if text != draft.message:
-        if draft.rich_message is not None:
-            raise DraftSnapshotError("rich_text_update_unsupported")
-        if draft.entities and not drop_formatting:
-            raise DraftSnapshotError("draft_formatting_conflict")
+    if draft.rich_message is not None:
+        raise DraftSnapshotError("rich_text_update_unsupported")
+    if text != draft.message and draft.entities and not drop_formatting:
+        raise DraftSnapshotError("draft_formatting_conflict")
+    if text != draft.message or drop_formatting:
         draft.entities = None
     draft.message = text
 
@@ -279,3 +280,20 @@ def build_text_draft_request(
         draft = types.DraftMessage(text, date=None)
     _replace_draft_text(draft, text, drop_formatting=drop_formatting)
     return _save_request(peer, scope, draft)
+
+
+def build_rich_draft_request(
+    peer: object, scope: DraftScope, body: AuthoredBody, *, existing: RestoreSnapshot | None = None
+) -> SaveDraftRequest:
+    """Replace the body while retaining only supported existing composition context."""
+    _validate_target(peer, scope)
+    draft = decode_restore_snapshot(existing) if existing is not None else types.DraftMessage("", date=None)
+    if existing is not None and existing.restore_reason is not None:
+        raise DraftSnapshotError(existing.restore_reason)
+    if isinstance(draft, types.DraftMessageEmpty):
+        draft = types.DraftMessage("", date=None)
+    request = _save_request(peer, scope, draft)
+    request.message = ""
+    request.entities = None
+    request.rich_message = native_rich_input(body)
+    return request

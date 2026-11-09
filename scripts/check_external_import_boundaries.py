@@ -166,6 +166,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "messages/telegram_adapter.py",
             "media_hydration.py",  # Bounded rich-message acquisition through the shared RPC gateway.
             "reactions/telegram_adapter.py",
+            "rich_authoring.py",  # Constructs native rich inputs without client or network access.
             "scheduled_commands.py",  # Native scheduled receipt/fact writer through SQLiteWriter and the sole RPC gate.
             "scheduled_messages.py",
             "message_history/telegram_adapter.py",

@@ -129,9 +129,50 @@ crap-threshold:
     uv run coverage json -o "$coverage_file"; \
     uv run python -m devtools.crap_threshold --coverage "$coverage_file" --src src/mcp_telegram
 
-# Rebuild and restart the live Docker container.
-runtime-build:
-    docker compose -f {{compose_file}} up -d --build --timeout -1 {{container}}
+# Prepare the image without replacing the running container.
+runtime-prepare:
+    docker compose -f {{compose_file}} build {{container}}
+
+# Start the prepared image without building or pulling.
+runtime-start:
+    docker compose -f {{compose_file}} up -d --no-build --pull never --timeout -1 {{container}}
+
+runtime-build: runtime-prepare runtime-start
+
+# Offline schema migration: output must not exist; retain printed rollout artifacts.
+runtime-migrate state output schema release config:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    old=$(docker inspect --format '{{{{.Id}}' {{container}}) || exit 1
+    old_image=$(docker inspect --format '{{{{.Image}}' "$old") || exit 1
+    base_image=$(docker compose -f {{compose_file}} config --images {{container}}) || exit 1
+    [[ -n "$base_image" && "$base_image" != *$'\n'* ]] || exit 1
+    override=$(mktemp "${TMPDIR:-/tmp}/mcp-telegram-migration.XXXXXXXX") || exit 1
+    tag="mcp-telegram-migration:$(basename "$override" | tr '[:upper:]' '[:lower:]')"
+    old_tag="${tag}-old"
+    printf 'services:\n  {{container}}:\n    image: %s\n' "$tag" > "$override" || exit 1
+    printf 'Rollout override: %s\nOld image pin: %s\nBackup: %s\n' "$override" "$old_tag" {{quote(output)}}
+    docker tag "$old_image" "$old_tag" || exit 1
+    docker compose -f {{compose_file}} -f "$override" build {{container}} || exit 1
+    candidate=$(docker image inspect --format '{{{{.Id}}' "$tag") || exit 1
+    printf 'Prepared candidate image: %s\n' "$candidate"
+    SECONDS=0
+    docker stop --time -1 "$old" || exit 1
+    printf 'Writer stopped after %s seconds\n' "$SECONDS"
+    if ! uv run python -m devtools.migration_backup {{quote(state)}} {{quote(output)}} {{quote(schema)}} {{quote(release)}} "$old_image" {{quote(config)}}; then
+        docker start "$old" || printf 'Failed to resume old container: %s\n' "$old" >&2
+        exit 1
+    fi
+    printf 'Backup and validation completed %s seconds after stop began\n' "$SECONDS"
+    if ! docker tag "$candidate" "$base_image"; then
+        docker start "$old" || printf 'Failed to resume old container: %s\n' "$old" >&2
+        exit 1
+    fi
+    docker compose -f {{compose_file}} -f "$override" up -d --no-build --pull never --timeout -1 {{container}} || exit 1
+    running=$(docker inspect --format '{{{{.Image}}' {{container}}) || exit 1
+    [[ "$running" == "$candidate" ]] || { printf 'Candidate image mismatch\n' >&2; exit 1; }
+    just runtime-wait || exit 1
+    just runtime-smoke || exit 1
 
 # Wait until the live Docker container reports healthy.
 runtime-wait:

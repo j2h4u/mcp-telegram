@@ -342,6 +342,8 @@ Smoke и точечные запросы требуют живого daemon (к�
   ```bash
   just runtime-verify
   ```
+- For schema or incompatible persisted-format changes, follow the enforced
+  `just runtime-migrate` procedure in [deployment notes](deploy/AGENTS.md#sqlite-backup-restore-and-retention).
 
 ## Ownership
 

@@ -738,6 +738,7 @@ class TelegramDemandCoordinator:
 
     async def _run_adapter(self, kind: DemandKind, budget: RpcAttemptBudget, selected: WorkRevision) -> SliceOutcome:
         attempts_before = budget.attempts
+        budget.excluded = frozenset(self._excluded)
         try:
             return await self._adapters[kind].run_slice(budget)
         finally:

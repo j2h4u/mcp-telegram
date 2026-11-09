@@ -372,6 +372,23 @@ def scheduled_row_to_wire(
     return item
 
 
+def scheduled_current(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, account_id: int
+) -> dict[str, object] | None:
+    """Project the retained scheduled item with the same fields as queue reads."""
+    cursor = conn.execute(
+        _SCHEDULED_MESSAGE_SELECT_SQL
+        + _SCHEDULED_MESSAGE_LIST_FROM_SQL
+        + "WHERE sm.dialog_id = ? AND sm.message_id = ? AND sm.message_state = 'scheduled'",
+        (dialog_id, message_id),
+    )
+    row = cast(tuple[object, ...] | None, cursor.fetchone())
+    if row is None:
+        return None
+    values = dict(zip((column[0] for column in cursor.description), row, strict=True))
+    return scheduled_row_to_wire(values, account_id=account_id)
+
+
 def _optional_int(value: object | None) -> int | None:
     if value is None:
         return None

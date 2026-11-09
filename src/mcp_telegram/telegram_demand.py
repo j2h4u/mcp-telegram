@@ -172,6 +172,7 @@ class RpcAttemptBudget:
     _accounting: RpcAttemptAccounting
     selected: WorkRevision | None
     last_method: str | None
+    excluded: frozenset[WorkRevision]
     _retry_candidate: object | None
     _read_budget_failure_method: str | None
 
@@ -189,6 +190,7 @@ class RpcAttemptBudget:
         self._accounting = RpcAttemptAccounting(limit, attempts)
         self.selected = selected
         self.last_method = last_method
+        self.excluded = frozenset()
         self._retry_candidate = None
         self._read_budget_failure_method = None
 

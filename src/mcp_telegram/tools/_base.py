@@ -137,6 +137,10 @@ ACTIVE_ACCOUNT_PROTECTION_SCHEMA: dict[str, object] = {
 }
 
 
+def _native_content_field(key: object, value: Mapping[object, object]) -> bool:
+    return key == "rich_message" or (key == "todo" and value.get("type") == "todo")
+
+
 def omit_none_mapping_values(value: object) -> object:
     """Omit ``None``-valued mapping properties from an MCP response.
 
@@ -146,7 +150,11 @@ def omit_none_mapping_values(value: object) -> object:
     ``ToolResult`` paths share one wire contract.
     """
     if isinstance(value, Mapping):
-        return {key: omit_none_mapping_values(item) for key, item in value.items() if item is not None}
+        return {
+            key: item if _native_content_field(key, value) else omit_none_mapping_values(item)
+            for key, item in value.items()
+            if item is not None
+        }
     if isinstance(value, list):
         return [omit_none_mapping_values(item) for item in value]
     if isinstance(value, tuple):

@@ -16,6 +16,7 @@ from .dialog_directory_coverage import DialogDirectoryCoverage
 from .dialog_identity import read_dialog_identities
 from .dialog_identity_contracts import DialogIdentity
 from .dialog_selector import DialogSelector, DialogSelectorError, required_dialog_selector
+from .media_fact import decode_media_fact
 from .message_content import MessageSnapshot, project_message_content
 from .models import DialogType
 from .sync_db import open_sync_db_reader
@@ -545,6 +546,7 @@ def _project_activity_comments(
     for row in rows:
         dialog_id = int(cast(int | str, row[0]))
         message_id = int(cast(int | str, row[1]))
+        fact = decode_media_fact(row[4], row[5])
         content = project_message_content(
             MessageSnapshot(
                 text=cast(str | None, row[3]),
@@ -561,6 +563,7 @@ def _project_activity_comments(
                 "text": content.text,
                 "media_description": content.media_description,
                 "media_kind": content.media_kind,
+                "media_payload": None if fact is None else fact.payload,
                 "dialog_name": row[6] or str(row[0]),
                 "dialog_type": row[7],
                 "dialog_category": row[10],

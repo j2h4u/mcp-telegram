@@ -111,6 +111,7 @@ class TraceEvidenceItem(TypedDict):
     text: str | None
     media_description: str | None
     media_kind: str | None
+    media_payload: dict[str, object] | None
 
 
 class TraceCoverageGap(TypedDict):
@@ -176,6 +177,7 @@ class ReadMessage:
     sender_username: str | None = None
     media_description: str | None = None
     media_kind: str | None = None
+    media_payload: dict[str, object] | None = None
     content_kind: ContentKind = "none"
     reply_to_msg_id: int | None = None
     forum_topic_id: int | None = None

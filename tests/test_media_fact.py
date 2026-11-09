@@ -31,7 +31,10 @@ def test_media_kind_is_the_runtime_and_schema_vocabulary() -> None:
 
     for kind in MEDIA_KIND_VALUES:
         validate(instance={"type": kind}, schema=MEDIA_OUTPUT_SCHEMA)
-        assert project_media_description(None, kind) == {"type": kind}
+        expected: dict[str, object] = {"type": kind}
+        if kind == "todo":
+            expected.update({"todo": {}, "todo_status": "unknown"})
+        assert project_media_description(None, kind) == expected
 
     with pytest.raises(ValidationError):
         validate(instance={"type": "unknown"}, schema=MEDIA_OUTPUT_SCHEMA)

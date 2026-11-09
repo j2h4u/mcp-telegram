@@ -26,6 +26,7 @@ type MediaKind = Literal[
     "invoice",
     "dice",
     "story",
+    "todo",
     "other",
 ]
 
