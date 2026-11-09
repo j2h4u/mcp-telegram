@@ -2852,3 +2852,73 @@ def test_v102_formatting_source_requires_evidence_and_real_reobservation(
             "rich fallback",
             "",
         )
+
+
+def test_v102_migrates_real_empty_draft_snapshots_without_resurrecting_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from telethon.tl import types
+
+    from mcp_telegram.config import DraftRecoveryConfig
+    from mcp_telegram.drafts.contracts import DraftObservationSource
+    from mcp_telegram.drafts.sqlite_projection import SQLiteDraftProjection
+    from mcp_telegram.drafts.telethon_adapter import normalize_update_draft
+
+    path = tmp_path / "draft-state.db"
+    with monkeypatch.context() as old:
+        old.setattr(sync_db_module, "_CURRENT_SCHEMA_VERSION", 101)
+        ensure_sync_schema(path)
+    observed = datetime(2026, 1, 1, tzinfo=UTC)
+    with _sync_db_connection(path) as conn:
+        projection = SQLiteDraftProjection(conn, DraftRecoveryConfig())
+        projection.bind_account(42)
+        for dialog_id in (100, 101):
+            observation = normalize_update_draft(
+                types.UpdateDraftMessage(types.PeerUser(dialog_id), types.DraftMessageEmpty(observed)),
+                account_id=42,
+                source=DraftObservationSource.REALTIME,
+                observed_at=observed,
+            )
+            assert observation is not None and projection.apply_realtime(observation).accepted
+        conn.execute("UPDATE draft_current SET state='cleared' WHERE dialog_id=101")
+        conn.execute(
+            "INSERT INTO draft_versions(account_id,dialog_id,source_revision,state,text,restore_payload,"
+            "semantic_fingerprint,restore_reason,source_observed_at,source_order_at,archived_at) "
+            "SELECT account_id,dialog_id,projection_revision,state,text,restore_payload,semantic_fingerprint,"
+            "restore_reason,source_observed_at,source_order_at,source_observed_at FROM draft_current"
+        )
+        before_current = cast(
+            list[tuple[int, str, int, bytes | None, str | None]],
+            conn.execute(
+                "SELECT dialog_id,state,projection_revision,restore_payload,semantic_fingerprint FROM draft_current ORDER BY dialog_id"
+            ).fetchall(),
+        )
+        before_history = conn.execute(
+            "SELECT dialog_id,state,source_revision,restore_payload,semantic_fingerprint FROM draft_versions ORDER BY dialog_id"
+        ).fetchall()
+        assert all(row[3] is not None and row[4] is not None for row in before_current)
+        conn.commit()
+    ensure_sync_schema(path)
+    with _sync_db_connection(path) as conn:
+        assert (
+            conn.execute(
+                "SELECT dialog_id,state,projection_revision,restore_payload,semantic_fingerprint FROM draft_current ORDER BY dialog_id"
+            ).fetchall()
+            == before_current
+        )
+        assert (
+            conn.execute(
+                "SELECT dialog_id,state,source_revision,restore_payload,semantic_fingerprint FROM draft_versions ORDER BY dialog_id"
+            ).fetchall()
+            == before_history
+        )
+        assert conn.execute("SELECT rich_message_json FROM draft_current ORDER BY dialog_id").fetchall() == [
+            (None,),
+            (None,),
+        ]
+        assert conn.execute("SELECT rich_message_json FROM draft_versions ORDER BY dialog_id").fetchall() == [
+            (None,),
+            (None,),
+        ]
