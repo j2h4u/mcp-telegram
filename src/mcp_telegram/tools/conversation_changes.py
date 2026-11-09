@@ -21,6 +21,7 @@ from ._base import (
     mcp_tool,
     structured_result,
 )
+from .message_view import RICH_MEDIA_REFERENCE_GAPS_SCHEMA
 
 ChangeKind = Literal["edit", "deleted_message", "access_lost", "access_restored"]
 
@@ -31,6 +32,13 @@ _TEXT_EVIDENCE_SCHEMA = {
         "last_known_text": {"type": ["string", "null"]},
         "before_text": {"type": ["string", "null"]},
         "after_text": {"type": ["string", "null"]},
+        **{
+            name: {
+                "type": ["object", "null"],
+                "properties": {"rich_media_reference_gaps": RICH_MEDIA_REFERENCE_GAPS_SCHEMA},
+            }
+            for name in ("last_known_composition", "before_composition", "after_composition")
+        },
         "provenance": {"type": ["string", "null"]},
         "confidence": {"type": "string"},
     },
@@ -91,6 +99,7 @@ CONVERSATION_CHANGES_OUTPUT_SCHEMA = {
         "count": {"type": "integer"},
         "has_more": {"type": "boolean"},
         "next_navigation": {"type": ["string", "null"]},
+        "truncation_reason": {"type": ["string", "null"]},
         "coverage": {
             "type": "object",
             "properties": {

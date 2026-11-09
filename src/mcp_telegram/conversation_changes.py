@@ -13,6 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import cast
 
+from .budget import MESSAGE_RESPONSE_MAX_BYTES
 from .conversation_change_contracts import CHANGE_KINDS
 from .dialog_identity import read_dialog_identities
 
@@ -224,7 +225,11 @@ def _query_rows(
     placeholders = ",".join("?" for _ in request.kinds)
     query = f"""SELECT e.seq,e.kind,e.occurred_at,e.time_basis,e.dialog_id,
                        e.message_id,e.version,e.reason_code,e.access_change_cause,e.actor_id,
-                       m.text,mv.old_text,next_mv.old_text
+                       m.text,mv.old_text,next_mv.old_text,
+                       m.rich_message,m.formatting_text,m.formatting_entities,
+                       mv.old_rich_message,mv.old_formatting_text,mv.old_formatting_entities,
+                       next_mv.old_rich_message,next_mv.old_formatting_text,next_mv.old_formatting_entities,
+                       next_mv.version
                   FROM conversation_history_events e
                   LEFT JOIN messages m ON m.dialog_id=e.dialog_id AND m.message_id=e.message_id
                   LEFT JOIN message_versions mv
@@ -259,6 +264,9 @@ def _text_evidence(row: tuple[object, ...]) -> dict[str, object] | None:
             "last_known_text": current_text,
             "before_text": None,
             "after_text": None,
+            "last_known_composition": _composition_evidence(row[13:16]),
+            "before_composition": None,
+            "after_composition": None,
             "provenance": "messages.text[current_candidate]" if current_text is not None else None,
             "confidence": "candidate" if current_text is not None else "unavailable",
         }
@@ -270,12 +278,30 @@ def _text_evidence(row: tuple[object, ...]) -> dict[str, object] | None:
         "last_known_text": None,
         "before_text": before_text,
         "after_text": after_text,
+        "last_known_composition": None,
+        "before_composition": _composition_evidence(row[16:19]),
+        "after_composition": _composition_evidence(row[19:22] if row[22] is not None else row[13:16]),
         "provenance": (
             "message_versions.old_text+next_version"
             if next_before_text is not None
             else "message_versions.old_text+messages.text[current_candidate]"
         ),
         "confidence": "exact_before_candidate_after" if before_text is not None else "candidate_after_only",
+    }
+
+
+def _composition_evidence(values: tuple[object, ...]) -> dict[str, object]:
+    from .message_composition import decode_formatting_entities
+    from .rich_content import decode_rich_message, rich_media_reference_gaps
+
+    rich, status, text_status = decode_rich_message(cast(str | None, values[0]))
+    return {
+        "rich_message": rich,
+        **({"rich_media_reference_gaps": rich_media_reference_gaps(rich)} if rich is not None else {}),
+        "rich_message_status": status,
+        "rich_text_status": text_status,
+        "formatting_text": values[1],
+        "formatting_entities": decode_formatting_entities(cast(str | None, values[2])),
     }
 
 
@@ -306,21 +332,53 @@ def _event(row: tuple[object, ...], dialog_title: str) -> dict[str, object]:
     }
 
 
+def _bounded_events(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    size = 0
+    bounded: list[dict[str, object]] = []
+    for event in events:
+        event_size = len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode())
+        if bounded and size + event_size > MESSAGE_RESPONSE_MAX_BYTES:
+            break
+        bounded.append(event)
+        size += event_size
+    return bounded
+
+
+def _next_page_navigation(
+    codec: ConversationChangesTokenCodec,
+    request: ConversationChangesRequest,
+    snapshot_seq: int,
+    page_rows: list[tuple[object, ...]],
+    page_depth: int,
+) -> str:
+    return codec.encode(
+        ConversationChangesCursor(
+            request.since_utc,
+            request.until_utc,
+            request.kinds,
+            request.dialog_id,
+            request.page_limit,
+            snapshot_seq,
+            _strict_int(page_rows[-1][0], "event_id"),
+            page_depth + 1,
+        )
+    )
+
+
+def _snapshot_sequence(conn: sqlite3.Connection, cursor: ConversationChangesCursor | None) -> int:
+    if cursor is not None:
+        return cursor.snapshot_seq
+    return cast(tuple[int], conn.execute("SELECT COALESCE(MAX(seq),0) FROM conversation_history_events").fetchone())[0]
+
+
 def query_conversation_changes(
     conn: sqlite3.Connection, req: dict[str, object], codec: ConversationChangesTokenCodec
 ) -> dict[str, object]:
     try:
         parsed = parse_request(req)
         request, cursor = _effective_request(parsed, codec)
-        snapshot_seq = (
-            cursor.snapshot_seq
-            if cursor is not None
-            else cast(
-                tuple[int],
-                conn.execute("SELECT COALESCE(MAX(seq),0) FROM conversation_history_events").fetchone(),
-            )[0]
-        )
-        rows = _query_rows(conn, request, snapshot_seq=snapshot_seq, after_seq=cursor.after_seq if cursor else None)
+        snapshot_seq = _snapshot_sequence(conn, cursor)
+        rows = _query_rows(conn, request, snapshot_seq=snapshot_seq, after_seq=getattr(cursor, "after_seq", None))
         page_rows = rows[: request.page_limit]
         identities = read_dialog_identities(conn, (_strict_int(row[4], "dialog_id") for row in page_rows))
     except sqlite3.OperationalError:
@@ -332,29 +390,21 @@ def query_conversation_changes(
             "error": "invalid_navigation" if message == "invalid_navigation" else "invalid_input",
             "message": message,
         }
-    has_more = len(rows) > request.page_limit
-    page_depth = cursor.page_depth if cursor is not None else 1
-    next_navigation = None
-    if has_more:
-        next_navigation = codec.encode(
-            ConversationChangesCursor(
-                request.since_utc,
-                request.until_utc,
-                request.kinds,
-                request.dialog_id,
-                request.page_limit,
-                snapshot_seq,
-                _strict_int(page_rows[-1][0], "event_id"),
-                page_depth + 1,
-            )
-        )
+    events = [_event(row, identities[_strict_int(row[4], "dialog_id")].display_name) for row in page_rows]
+    bounded_events = _bounded_events(events)
+    budget_truncated = len(bounded_events) < len(events)
+    page_rows = page_rows[: len(bounded_events)]
+    has_more = len(rows) > request.page_limit or budget_truncated
+    page_depth = getattr(cursor, "page_depth", 1)
+    next_navigation = _next_page_navigation(codec, request, snapshot_seq, page_rows, page_depth) if has_more else None
     return {
         "ok": True,
         "data": {
-            "events": [_event(row, identities[_strict_int(row[4], "dialog_id")].display_name) for row in page_rows],
+            "events": bounded_events,
             "count": len(page_rows),
             "has_more": has_more,
             "next_navigation": next_navigation,
+            "truncation_reason": "response_budget" if budget_truncated else None,
             "coverage": {
                 "message_changes": "incoming_human_direct_messages",
                 "access_changes": "synced_dialogs",

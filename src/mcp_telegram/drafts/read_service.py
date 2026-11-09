@@ -1,9 +1,11 @@
 """Local-only draft reads shared with the daemon's MCP boundary."""
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from typing import cast
 
+from mcp_telegram.budget import MESSAGE_RESPONSE_MAX_BYTES
 from mcp_telegram.drafts.contracts import DraftScope
 from mcp_telegram.drafts.history import (
     DraftHistoryAccountError,
@@ -13,9 +15,11 @@ from mcp_telegram.drafts.history import (
     list_draft_history,
     read_current_draft,
 )
+from mcp_telegram.rich_content import decode_rich_message, rich_media_reference_gaps
 
 
 def current_draft_output(state: DraftState) -> dict[str, object]:
+    rich, rich_status, text_status = decode_rich_message(state.rich_message_json)
     return {
         key: value
         for key, value in {
@@ -24,6 +28,10 @@ def current_draft_output(state: DraftState) -> dict[str, object]:
             "text": state.text,
             "observed_at": state.observed_at,
             "uncertain": state.uncertain,
+            "rich_message": rich,
+            "rich_media_reference_gaps": rich_media_reference_gaps(rich) if rich is not None else None,
+            "rich_content_status": rich_status,
+            "rich_text_status": text_status,
         }.items()
         if value is not None
     }
@@ -32,17 +40,41 @@ def current_draft_output(state: DraftState) -> dict[str, object]:
 def _history_output(entry: DraftHistoryEntry) -> dict[str, object]:
     snapshot = entry.restore_snapshot
     restorable = entry.presence == "absent" or (snapshot is not None and snapshot.restore_reason is None)
+    rich, rich_status, text_status = decode_rich_message(entry.rich_message_json)
     result: dict[str, object] = {
         "history_id": entry.history_id,
         "presence": entry.presence,
         "archived_at": entry.archived_at,
         "restorable": restorable,
+        "rich_message": rich,
+        "rich_content_status": rich_status,
+        "rich_text_status": text_status,
+        "observed_at": entry.source_observed_at,
+        "source_order_at": entry.source_order_at,
     }
     if entry.text is not None:
         result["text"] = entry.text
+    if rich is not None:
+        result["rich_media_reference_gaps"] = rich_media_reference_gaps(rich)
     if not restorable:
         result["restore_reason"] = snapshot.restore_reason if snapshot else "restore_snapshot_unavailable"
     return result
+
+
+def _omit_content(item: dict[str, object], reason: str) -> dict[str, object]:
+    return {
+        **{
+            key: value
+            for key, value in item.items()
+            if key not in {"text", "rich_message", "rich_media_reference_gaps"}
+        },
+        "content_included": False,
+        "content_omission_reason": reason,
+    }
+
+
+def _response_size(result: dict[str, object]) -> int:
+    return len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode())
 
 
 def _optional_id(value: object, *, positive: bool) -> int | None:
@@ -85,6 +117,39 @@ def _sync_evidence(conn: sqlite3.Connection, account_id: int) -> dict[str, objec
     }
 
 
+def _draft_response(
+    conn: sqlite3.Connection,
+    account_id: int,
+    state: DraftState,
+    history: tuple[DraftHistoryEntry, ...],
+    selected: DraftHistoryEntry | None,
+) -> dict[str, object]:
+    current = current_draft_output(state)
+    full_history = [_history_output(entry) for entry in history]
+    result: dict[str, object] = {
+        "ok": True,
+        "current": current,
+        **_sync_evidence(conn, account_id),
+        "history": [_omit_content(entry, "response_budget") for entry in full_history],
+        "next_action": "Use get_draft with history_id to read omitted history content. "
+        "Use manage_draft explicitly to change a draft; send manually in Telegram.",
+    }
+    if selected is not None:
+        result["selected_history"] = _history_output(selected)
+        if _response_size(result) > MESSAGE_RESPONSE_MAX_BYTES:
+            result["current"] = _omit_content(current, "response_budget")
+    previews = cast(list[dict[str, object]], result["history"])
+    for index, entry in enumerate(full_history):
+        if selected is not None and entry["history_id"] == selected.history_id:
+            previews[index] = _omit_content(entry, "selected_history")
+            continue
+        previous = previews[index]
+        previews[index] = entry
+        if _response_size(result) > MESSAGE_RESPONSE_MAX_BYTES:
+            previews[index] = previous
+    return result
+
+
 def read_draft_request(
     conn: sqlite3.Connection, request: Mapping[str, object], *, account_id: int | None
 ) -> dict[str, object]:
@@ -110,13 +175,4 @@ def read_draft_request(
             "error": "history_unavailable",
             "message": "That previous state is unavailable or expired.\nAction: read get_draft for retained history.",
         }
-    result: dict[str, object] = {
-        "ok": True,
-        "current": current_draft_output(state),
-        **_sync_evidence(conn, account_id),
-        "history": [_history_output(entry) for entry in history],
-        "next_action": "Use manage_draft explicitly to change a draft. Review and send manually in Telegram.",
-    }
-    if selected is not None:
-        result["selected_history"] = _history_output(selected)
-    return result
+    return _draft_response(conn, account_id, state, history, selected)

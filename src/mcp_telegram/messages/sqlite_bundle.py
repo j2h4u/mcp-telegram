@@ -24,10 +24,11 @@ from ..hydration_queue import (
 )
 from ..image_authorization import ScopeToken, invalidate_message_source, invalidate_nonchannel_sources
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
-from ..observation_order import allocate_observation_order
-from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET, is_channel_peer_id
+from ..observation_order import allocate_observation_order, has_nonchannel_deletion
+from ..own_only_contracts import CHANNEL_PEER_ID_OFFSET
 from ..reactions.contracts import ReactionAggregate, ReactionAggregateSource, ReactionObservationBoundary
 from ..reactions.persistence import replace_reaction_aggregates
+from ..rich_content import decode_rich_message
 from ..sync_transactions import require_write_transaction
 from .sqlite_hydration_jobs import (
     _FACT_HYDRATION_EMPTY_KINDS,
@@ -52,7 +53,7 @@ _SELECT_MESSAGE_TEXT_SQL = "SELECT text FROM messages WHERE dialog_id = ? AND me
 _SELECT_MESSAGE_EXISTS_SQL = "SELECT 1 FROM messages WHERE dialog_id = ? AND message_id = ?"
 _SELECT_MESSAGE_OUT_SQL = "SELECT out FROM messages WHERE dialog_id = ? AND message_id = ?"
 _NEXT_VERSION_SQL = "SELECT COALESCE(MAX(version), 0) + 1 FROM message_versions WHERE dialog_id = ? AND message_id = ?"
-_INSERT_VERSION_SQL = "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date, origin) VALUES (?, ?, ?, ?, ?, ?)"
+_INSERT_VERSION_SQL = "INSERT INTO message_versions (dialog_id, message_id, version, old_text, edit_date, origin, old_rich_message, old_formatting_text, old_formatting_entities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
 _UPDATE_MESSAGE_TEXT_SQL = "UPDATE messages SET text = ? WHERE dialog_id = ? AND message_id = ?"
 _MARK_DELETED_SQL = (
     "UPDATE messages SET is_deleted = 1, deleted_at = ? WHERE dialog_id = ? AND message_id = ? AND is_deleted = 0"
@@ -211,16 +212,6 @@ def read_message_out(conn: sqlite3.Connection, dialog_id: int, message_id: int) 
     return MessageOutLookup(found=row is not None, outgoing=bool(row[0]) if row is not None else False)
 
 
-def has_nonchannel_deletion(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
-    """Channel message IDs are independent of the account's nonchannel namespace."""
-    if is_channel_peer_id(dialog_id):
-        return False
-    return (
-        conn.execute("SELECT 1 FROM nonchannel_message_deletions WHERE message_id=?", (message_id,)).fetchone()
-        is not None
-    )
-
-
 def _validated_message_ids(message_ids: Sequence[int]) -> tuple[int, ...]:
     return tuple(
         dict.fromkeys(
@@ -310,6 +301,30 @@ def _follows_stored_observation(state: tuple[int, int, int] | None, order: int |
     return source_rank >= state[2]
 
 
+def _same_body_or_enrichment(
+    old_text: str | None,
+    previous: tuple[str | None, str | None, str | None, int | None],
+    message: _message_contracts.StoredMessage,
+    edit_date: int | None,
+    source: ReactionAggregateSource | str,
+) -> bool:
+    if (old_text, *previous[:3]) == (
+        message.text,
+        message.rich_message,
+        message.formatting_text,
+        message.formatting_entities,
+    ):
+        return True
+    if source == ReactionAggregateSource.MESSAGE_EDIT or previous[3] != edit_date:
+        return False
+    old_status = decode_rich_message(previous[0])[1]
+    new_status = decode_rich_message(message.rich_message)[1]
+    enrichment = (old_status == "unknown" and new_status != "unknown") or (
+        old_status == "partial" and new_status == "complete"
+    )
+    return enrichment and (previous[1] == message.formatting_text or (previous[1] is None and old_text == message.text))
+
+
 def persist_edited_message(  # noqa: PLR0913
     conn: sqlite3.Connection,
     extracted: _message_contracts.ExtractedMessage,
@@ -327,7 +342,16 @@ def persist_edited_message(  # noqa: PLR0913
     current = read_message_text(conn, dialog_id, message_id)
     if not current.found:
         return EditedMessageWriteResult(None, MembershipSignalCounts())
-    if current.text == extracted.message.text:
+    previous = cast(
+        tuple[str | None, str | None, str | None, int | None],
+        conn.execute(
+            "SELECT rich_message,formatting_text,formatting_entities,edit_date FROM messages WHERE dialog_id=? AND message_id=?",
+            (dialog_id, message_id),
+        ).fetchone(),
+    )
+    if reaction_source != ReactionAggregateSource.MESSAGE_EDIT:
+        extracted = preserve_rich_observation(extracted, previous, current.text)
+    if _same_body_or_enrichment(current.text, previous, extracted.message, edit_date, reaction_source):
         result = insert_messages_with_fts(
             conn,
             [extracted],
@@ -351,7 +375,9 @@ def persist_edited_message(  # noqa: PLR0913
         return EditedMessageWriteResult(None, result.membership_counts)
     version_row = cast(tuple[int], conn.execute(_NEXT_VERSION_SQL, (dialog_id, message_id)).fetchone())
     next_version = int(version_row[0])
-    conn.execute(_INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date, "telegram_edit"))
+    conn.execute(
+        _INSERT_VERSION_SQL, (dialog_id, message_id, next_version, old_text, edit_date, "telegram_edit", *previous[:3])
+    )
     result = insert_messages_with_fts(
         conn,
         [extracted],
@@ -455,6 +481,8 @@ def insert_messages_with_fts(  # noqa: PLR0913
     accepted = _accepted_message_bundles(conn, extracted, reaction_source)
     if not accepted:
         return MessageWriteResult(0, MembershipSignalCounts())
+    if reaction_source != ReactionAggregateSource.MESSAGE_EDIT:
+        accepted = [_preserve_stored_rich(conn, item) for item in accepted]
     accepted = [_preserve_newer_received_media(conn, item) for item in accepted]
     evidence = _page_facts(conn, accepted)
     for item in accepted:
@@ -629,11 +657,17 @@ def _persist_received_message(
         return 0
     if _received_body_superseded(state, item):
         return 0
-    item = replace(item, invalidate_image_source=False)
+    item = _preserve_stored_rich(conn, replace(item, invalidate_image_source=False))
+    message = item.message
     current = read_message_text(conn, message.dialog_id, message.message_id)
-    if current.found and current.text != message.text:
+    if current.found and (current.text != message.text or not _received_body_unchanged(conn, item)):
         result = persist_edited_message(
-            conn, item, old_text=current.text, edit_date=message.edit_date, profile_owner_account_id=account_id
+            conn,
+            item,
+            old_text=current.text,
+            edit_date=message.edit_date,
+            reaction_source=ReactionAggregateSource.HISTORY,
+            profile_owner_account_id=account_id,
         )
         return int(
             result.version is not None
@@ -702,6 +736,40 @@ def _image_source_invalidation_requested(item: _message_contracts.ExtractedMessa
     return item.invalidate_image_source or not unchanged
 
 
+def preserve_rich_observation(
+    item: _message_contracts.ExtractedMessage,
+    previous: tuple[str | None, str | None, str | None, int | None],
+    previous_text: str | None,
+) -> _message_contracts.ExtractedMessage:
+    message = item.message
+    incoming_less_complete = message.rich_message is None or (
+        decode_rich_message(message.rich_message)[1] == "partial" and decode_rich_message(previous[0])[1] == "complete"
+    )
+    if (
+        incoming_less_complete
+        and previous[0] is not None
+        and message.edit_date == previous[3]
+        and message.formatting_text is not None
+        and message.formatting_text == previous[1]
+    ):
+        return replace(item, message=replace(message, rich_message=previous[0], text=previous_text))
+    return item
+
+
+def _preserve_stored_rich(
+    conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage
+) -> _message_contracts.ExtractedMessage:
+    message = item.message
+    row = cast(
+        tuple[str | None, str | None, str | None, int | None, str | None] | None,
+        conn.execute(
+            "SELECT rich_message,formatting_text,formatting_entities,edit_date,text FROM messages WHERE dialog_id=? AND message_id=?",
+            (message.dialog_id, message.message_id),
+        ).fetchone(),
+    )
+    return item if row is None else preserve_rich_observation(item, row[:4], row[4])
+
+
 def _received_body_unchanged(conn: sqlite3.Connection, item: _message_contracts.ExtractedMessage) -> bool:
     """Keep body ordering separate when a complete response only changed media."""
     message = item.message
@@ -711,7 +779,7 @@ def _received_body_unchanged(conn: sqlite3.Connection, item: _message_contracts.
     row = cast(
         tuple[object, ...] | sqlite3.Row | None,
         conn.execute(
-            "SELECT text,edit_date,formatting_entities,service_action,reply_to_msg_id,forum_topic_id,"
+            "SELECT text,edit_date,formatting_entities,rich_message,formatting_text,service_action,reply_to_msg_id,forum_topic_id,"
             "grouped_id,reply_to_peer_id,is_service,post_author FROM messages WHERE dialog_id=? AND message_id=?",
             key,
         ).fetchone(),
@@ -720,6 +788,8 @@ def _received_body_unchanged(conn: sqlite3.Connection, item: _message_contracts.
         message.text,
         message.edit_date,
         message.formatting_entities,
+        message.rich_message,
+        message.formatting_text,
         message.service_action,
         message.reply_to_msg_id,
         message.forum_topic_id,

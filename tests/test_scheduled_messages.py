@@ -20,6 +20,7 @@ from telethon.tl.types import PeerUser
 from mcp_telegram.delivered_update import DeliveredUpdate, delivered_update_context
 from mcp_telegram.event_handlers import _NewMessageEvent
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.fts import stem_text
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.scheduled_messages import (
     ScheduledDiscoveryDemandAdapter,
@@ -1529,11 +1530,14 @@ def test_v94_lost_complete_baseline_requires_refresh_after_restore(
             connection.execute(
                 "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at) VALUES(123,'access_lost',20)"
             )
-            upsert_scheduled_message(connection, 123, _message(11, "retained", scheduled_at=1_900_000_001), now=10)
             connection.execute(
-                "UPDATE scheduled_reconciliation_state SET coverage_state='complete',coverage_reason=NULL,"
-                "repair_due_at=NULL,discovery_due_at=NULL,dirty_since=NULL,dirty_generation=3,"
-                "snapshot_observation_order=5 WHERE dialog_id=123"
+                "INSERT INTO scheduled_messages(dialog_id,message_id,scheduled_at,text,first_seen_at,updated_at) "
+                "VALUES(123,11,1900000001,'retained',10,10)"
+            )
+            connection.execute(
+                "INSERT INTO scheduled_reconciliation_state(dialog_id,coverage_state,coverage_reason,repair_due_at,"
+                "discovery_due_at,dirty_since,dirty_generation,snapshot_observation_order,updated_at) "
+                "VALUES(123,'complete',NULL,NULL,NULL,NULL,3,5,10)"
             )
     finally:
         connection.close()
@@ -1553,3 +1557,40 @@ def test_v94_lost_complete_baseline_requires_refresh_after_restore(
             _current_state(connection, 42, 123, None)
     finally:
         connection.close()
+
+
+def test_scheduled_same_version_partial_keeps_complete_rich_and_index(conn: sqlite3.Connection) -> None:
+    complete = _message(994, "")
+    complete.rich_message = types.RichMessage([types.PageBlockParagraph(types.TextPlain("complete body"))], [], [])
+    partial = _message(994, "")
+    partial.rich_message = types.RichMessage([types.PageBlockParagraph(types.TextPlain("partial"))], [], [], part=True)
+    with write_transaction(conn):
+        upsert_scheduled_message(conn, 42, complete, now=100)
+        before = conn.execute("SELECT text,rich_message FROM scheduled_messages WHERE message_id=994").fetchone()
+        upsert_scheduled_message(conn, 42, partial, now=101)
+        assert (
+            conn.execute("SELECT text,rich_message FROM scheduled_messages WHERE message_id=994").fetchone() == before
+        )
+        assert conn.execute("SELECT stemmed_text FROM scheduled_messages_fts WHERE message_id=994").fetchone() == (
+            stem_text("complete body"),
+        )
+        partial.edit_date = datetime.fromtimestamp(102, UTC)
+        upsert_scheduled_message(conn, 42, partial, now=102)
+        assert conn.execute("SELECT text FROM scheduled_messages WHERE message_id=994").fetchone() == ("partial",)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_raw_event_same_second_partial_replaces_complete(conn: sqlite3.Connection) -> None:
+    from mcp_telegram.rich_content import capture_rich_message
+
+    manager = event_manager(MagicMock(), conn, asyncio.Event())
+    complete = _message(995, "")
+    complete.rich_message = types.RichMessage([types.PageBlockParagraph(types.TextPlain("old"))], [], [])
+    partial = _message(995, "")
+    partial.rich_message = types.RichMessage([types.PageBlockParagraph(types.TextPlain("new"))], [], [], part=True)
+    await manager.on_raw_new_scheduled_message(SimpleNamespace(message=complete))
+    await manager.on_raw_new_scheduled_message(SimpleNamespace(message=partial))
+    assert conn.execute("SELECT text,rich_message FROM scheduled_messages WHERE message_id=995").fetchone() == (
+        "new",
+        capture_rich_message(partial.rich_message),
+    )

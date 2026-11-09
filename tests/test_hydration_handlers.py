@@ -16,6 +16,7 @@ from telethon.tl import types
 
 from mcp_telegram.auth_scope import TelegramAuthScope
 from mcp_telegram.fact_hydration import (
+    FactHydrationDemandAdapter,
     HydrationDropObservation,
     HydrationHandler,
     MediaPublication,
@@ -24,14 +25,17 @@ from mcp_telegram.fact_hydration import (
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.hydration_queue import (
     MEDIA_METADATA_KIND,
+    RICH_COMPOSITION_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
+    HydrationPriority,
     HydrationQueueRepository,
 )
 from mcp_telegram.image_authorization import ScopeCell, ScopeToken
-from mcp_telegram.media_hydration import MediaFactHydrationHandler
+from mcp_telegram.media_hydration import MediaFactHydrationHandler, RichCompositionHydrationHandler
 from mcp_telegram.messages.sqlite_bundle import mark_message_deleted, persist_received_messages
 from mcp_telegram.messages.sqlite_hydration import apply_message_transcription
+from mcp_telegram.messages.sqlite_hydration_jobs import repair_rich_composition_hydration_jobs
 from mcp_telegram.messages.telegram_adapter import extract_received_messages
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.peer_access import current_peer_target
@@ -137,6 +141,192 @@ def _enqueue(
     with write_transaction(conn):
         HydrationQueueRepository(conn).enqueue(job)
     return job
+
+
+def test_rich_repair_resumes_bounded_scan_and_skips_ineligible(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    for message_id in range(1, 5):
+        _seed_message(db, message_id)
+    db.execute("UPDATE messages SET is_deleted=1 WHERE message_id=2")
+    db.commit()
+    with write_transaction(db):
+        assert repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
+    assert db.execute("SELECT message_id FROM hydration_jobs WHERE kind=?", (RICH_COMPOSITION_KIND,)).fetchall() == [
+        (4,)
+    ]
+    with write_transaction(db):
+        assert repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
+    assert db.execute(
+        "SELECT message_id FROM hydration_jobs WHERE kind=? ORDER BY message_id", (RICH_COMPOSITION_KIND,)
+    ).fetchall() == [(3,), (4,)]
+    with write_transaction(db):
+        assert not repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
+    assert db.execute(
+        "SELECT message_id FROM hydration_jobs WHERE kind=? ORDER BY message_id", (RICH_COMPOSITION_KIND,)
+    ).fetchall() == [(1,), (3,), (4,)]
+
+
+def test_rich_repair_rejects_invalid_saved_cursor(db: sqlite3.Connection) -> None:
+    db.execute(
+        "INSERT INTO daemon_state(key,value) VALUES('rich_composition_hydration_cursor',?)",
+        ('{"cursor":false,"done":false}',),
+    )
+    db.commit()
+    with pytest.raises(ValueError, match="invalid rich composition repair cursor"), write_transaction(db):
+        repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_rich_partial_fetch_uses_full_message_response() -> None:
+    partial = SimpleNamespace(id=1, peer_id=types.PeerUser(1), rich_message=SimpleNamespace(part=True))
+    full = SimpleNamespace(id=1, peer_id=types.PeerUser(1), rich_message=SimpleNamespace(part=False))
+
+    class Client:
+        async def get_messages(self, **kwargs: object) -> object:
+            return [partial]
+
+        async def get_input_entity(self, dialog_id: int) -> object:
+            return types.InputPeerSelf()
+
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            return SimpleNamespace(messages=[full])
+
+    job = HydrationJob(RICH_COMPOSITION_KIND, 1, 1, due_at=1, attempts=0)
+    assert await RichCompositionHydrationHandler().request(Client(), [job]) == [full]
+
+
+@pytest.mark.asyncio
+async def test_rich_expansion_rejects_another_peer() -> None:
+    partial = SimpleNamespace(id=1, peer_id=types.PeerUser(2), rich_message=SimpleNamespace(part=True))
+
+    class Client:
+        async def get_messages(self, **kwargs: object) -> object:
+            return [partial]
+
+    job = HydrationJob(RICH_COMPOSITION_KIND, 1, 1, due_at=1, attempts=0)
+    with pytest.raises(ValueError, match="different peer"):
+        await RichCompositionHydrationHandler().request(Client(), [job])
+
+
+def test_ingested_partial_rich_message_enqueues_existing_hydration_owner(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    db.commit()
+    message = _received_message(7)
+    message.rich_message = types.RichMessage(blocks=[], photos=[], documents=[], part=True)
+    with write_transaction(db):
+        assert _publication(db, message).accepted_message_ids == frozenset({7})
+    row = cast(
+        tuple[int] | None,
+        db.execute(
+            "SELECT terminal FROM hydration_jobs WHERE kind=? AND dialog_id=1 AND message_id=7",
+            (RICH_COMPOSITION_KIND,),
+        ).fetchone(),
+    )
+    assert row == (0,)
+
+
+@pytest.mark.asyncio
+async def test_partial_rich_owner_publishes_full_response_to_canonical_message(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    db.commit()
+    partial = _received_message(7)
+    partial.rich_message = types.RichMessage(blocks=[], photos=[], documents=[], part=True)
+    with write_transaction(db):
+        _publication(db, partial)
+    full = _received_message(7)
+    full.rich_message = types.RichMessage(
+        blocks=[types.PageBlockParagraph(text=types.TextPlain(text="recovered"))], photos=[], documents=[]
+    )
+
+    class Client(_ScopeClient):
+        async def get_messages(self, **kwargs: object) -> object:
+            return [partial]
+
+        async def get_input_entity(self, dialog_id: int) -> object:
+            return types.InputPeerSelf()
+
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            return SimpleNamespace(messages=[full])
+
+    client = Client()
+    handler = RichCompositionHydrationHandler()
+    worker = MessageFactHydrationWorker(
+        client,
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=3,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        profile_owner_account_id=42,
+    )
+    job = HydrationQueueRepository(db).due_jobs(9999999999, 1, kind=RICH_COMPOSITION_KIND)[0]
+
+    async def request(_handler: object, jobs: list[HydrationJob], **_kwargs: object) -> object:
+        return await handler.request(client, jobs)
+
+    with patch.object(worker, "_request_batch", side_effect=request):
+        outcome = await worker._process_batch(handler, [job], 20)
+    assert outcome.completed == 1
+    assert db.execute("SELECT text FROM messages WHERE dialog_id=1 AND message_id=7").fetchone() == ("recovered",)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE kind=?", (RICH_COMPOSITION_KIND,)).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_empty_queue_repair_demand_seeds_and_finishes_without_idle_writes(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1)
+    db.commit()
+    handler = RichCompositionHydrationHandler()
+    worker = MessageFactHydrationWorker(
+        _ScopeClient(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=60,
+        max_requests_per_cycle=3,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        clock=lambda: 100.0,
+        profile_owner_account_id=42,
+    )
+    adapter = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL, account_id=42)
+    changes = db.total_changes
+    status = adapter.status(100)
+    assert status is not None and status.selected is not None
+    assert status.selected.key.target == "rich-repair"
+    assert db.total_changes == changes
+    worker.next_repair_at = 200
+    with write_transaction(db):
+        HydrationQueueRepository(db).enqueue(
+            HydrationJob(RICH_COMPOSITION_KIND, 1, 1, 1, 0, 1, HydrationPriority.BACKFILL)
+        )
+    adapter._next_kind = 1
+    assert adapter.status(100).selected.key.target == "rich_composition:1:1"  # type: ignore[union-attr]
+    with write_transaction(db):
+        db.execute("DELETE FROM hydration_jobs")
+    worker.next_repair_at = 100
+    await adapter.run_slice(RpcAttemptBudget(limit=3, selected=status.selected))
+    assert db.execute("SELECT message_id FROM hydration_jobs WHERE kind=?", (RICH_COMPOSITION_KIND,)).fetchall() == [
+        (1,)
+    ]
+    db.execute("DELETE FROM hydration_jobs")
+    db.commit()
+    changes = db.total_changes
+    assert adapter.status(1000) is None
+    assert db.total_changes == changes
 
 
 @pytest.mark.asyncio

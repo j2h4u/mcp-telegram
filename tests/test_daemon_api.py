@@ -969,6 +969,8 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
         conn.execute(MESSAGES_FTS_DDL)
     install_dialog_directory_coverage_schema(conn)
     _install_message_observation_schema(conn)
+    conn.execute("ALTER TABLE messages ADD COLUMN rich_message TEXT")
+    conn.execute("ALTER TABLE messages ADD COLUMN formatting_text TEXT")
     conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)")
     _apply_migration_84(conn, 83)
     conn.commit()
@@ -3235,6 +3237,30 @@ async def test_handle_client_round_trip() -> None:
 # ---------------------------------------------------------------------------
 # mark_dialog_for_sync
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repair_message_enqueues_without_resetting_existing_attempts(tmp_path: Path) -> None:
+    db_path = tmp_path / "sync.db"
+    ensure_sync_schema(db_path)
+    conn = _register_sqlite_connection(sqlite3.connect(db_path))
+    server = make_server(conn)
+    server.self_id = 42
+    await server._publish_auth_scope(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99))
+    server.bind_demand_sink(MagicMock(offer=MagicMock(return_value=True)))
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(1,'synced')")
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES(1,1,1)")
+    conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at,text) VALUES(1,7,1,'text')")
+    conn.commit()
+    request = {"method": "repair_message", "dialog_id": 1, "message_id": 7}
+    response = await server._dispatch(request)
+    assert cast(dict[str, object], response["data"])["status"] == "queued"
+    conn.execute("UPDATE hydration_jobs SET attempts=3,terminal=1 WHERE kind='rich_composition'")
+    conn.commit()
+    response = await server._dispatch(request)
+    assert cast(dict[str, object], response["data"])["terminal"] is True
+    assert cast(dict[str, object], response["data"])["attempts"] == 3
 
 
 @pytest.mark.asyncio

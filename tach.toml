@@ -102,7 +102,7 @@ depends_on = ["mcp_telegram.telegram_rpc_recovery", "mcp_telegram.flood", "mcp_t
 [[modules]]
 path = "mcp_telegram.daemon_api"
 layer = "application"
-depends_on = ["mcp_telegram.contacts.arguments", "mcp_telegram.contacts.repository", "mcp_telegram.folders.arguments", "mcp_telegram.folders.commands", "mcp_telegram.entity_profile.repository", "mcp_telegram.telegram_demand_progress", "mcp_telegram.message_images.contracts", "mcp_telegram.chat_export",
+depends_on = ["mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.contacts.arguments", "mcp_telegram.contacts.repository", "mcp_telegram.folders.arguments", "mcp_telegram.folders.commands", "mcp_telegram.entity_profile.repository", "mcp_telegram.telegram_demand_progress", "mcp_telegram.message_images.contracts", "mcp_telegram.chat_export",
     "mcp_telegram.daemon_account_trace", "mcp_telegram.daemon_activity_stats",
     "mcp_telegram.daemon_dialog_queries", "mcp_telegram.daemon_entity_info", "mcp_telegram.dialog_selector",
     "mcp_telegram.demand_wiring", "mcp_telegram.dialog_directory", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.entity_profile.refresh",
@@ -129,7 +129,7 @@ cannot_depend_on = [
 [[modules]]
 path = "mcp_telegram.daemon_account_trace"
 layer = "application"
-depends_on = ["mcp_telegram.entity_profile.membership", "mcp_telegram.entity_profile.reader", "mcp_telegram.account_trace_sqlite", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_peer_sweep", "mcp_telegram.daemon_message", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.dialog_selector", "mcp_telegram.entity_store", "mcp_telegram.hydration_queue", "mcp_telegram.linked_chat_fact", "mcp_telegram.message_contracts", "mcp_telegram.message_content", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_dialog", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.sync_transactions", "mcp_telegram.observation_order", "mcp_telegram.sqlite_writer"]
+depends_on = ["mcp_telegram.budget", "mcp_telegram.message_composition", "mcp_telegram.rich_content", "mcp_telegram.entity_profile.membership", "mcp_telegram.entity_profile.reader", "mcp_telegram.account_trace_sqlite", "mcp_telegram.activity_peer_resolve", "mcp_telegram.activity_peer_sweep", "mcp_telegram.daemon_message", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.dialog_selector", "mcp_telegram.entity_store", "mcp_telegram.hydration_queue", "mcp_telegram.linked_chat_fact", "mcp_telegram.message_contracts", "mcp_telegram.message_content", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver", "mcp_telegram.telegram_access", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_dialog", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.dialog_identity", "mcp_telegram.dialog_identity_contracts", "mcp_telegram.sync_transactions", "mcp_telegram.observation_order", "mcp_telegram.sqlite_writer"]
 [[modules]]
 path = "mcp_telegram.feedback_service"
 layer = "application"
@@ -150,7 +150,7 @@ cannot_depend_on = ["mcp_telegram.folders.sqlite_repository", "mcp_telegram.mess
 [[modules]]
 path = "mcp_telegram.conversation_changes"
 layer = "application"
-depends_on = ["mcp_telegram.conversation_change_contracts", "mcp_telegram.dialog_identity"]
+depends_on = ["mcp_telegram.budget", "mcp_telegram.message_composition", "mcp_telegram.rich_content", "mcp_telegram.conversation_change_contracts", "mcp_telegram.dialog_identity"]
 
 [[modules]]
 path = "mcp_telegram.conversation_change_contracts"
@@ -191,7 +191,7 @@ depends_on = [
 [[modules]]
 path = "mcp_telegram.reading"
 layer = "application"
-depends_on = [
+depends_on = ["mcp_telegram.rich_content",
     "mcp_telegram.folders.read_repository",
     "mcp_telegram.sync_transactions",
     "mcp_telegram.budget", "mcp_telegram.daemon_message", "mcp_telegram.dialog_directory_coverage", "mcp_telegram.dialog_selector", "mcp_telegram.drafts.contracts", "mcp_telegram.fts",
@@ -229,7 +229,7 @@ depends_on = ["mcp_telegram.realtime_history_policy"]
 [[modules]]
 path = "mcp_telegram.reading.query_records"
 layer = "foundation"
-depends_on = ["mcp_telegram.message_composition", "mcp_telegram.media_fact", "mcp_telegram.models"]
+depends_on = ["mcp_telegram.rich_content", "mcp_telegram.message_composition", "mcp_telegram.media_fact", "mcp_telegram.models"]
 
 [[modules]]
 path = "mcp_telegram.reading.scheduled_projection"
@@ -239,7 +239,7 @@ depends_on = ["mcp_telegram.daemon_message", "mcp_telegram.reading.query_records
 [[modules]]
 path = "mcp_telegram.scheduled_messages"
 layer = "application"
-depends_on = ["mcp_telegram.telegram_rpc_error", "mcp_telegram.entity_profile.membership", "mcp_telegram.observation_order", "mcp_telegram.access_lifecycle", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_demand_progress", "mcp_telegram.scheduled_write_fence"]
+depends_on = ["mcp_telegram.messages.sqlite_bundle", "mcp_telegram.telegram_rpc_error", "mcp_telegram.entity_profile.membership", "mcp_telegram.observation_order", "mcp_telegram.access_lifecycle", "mcp_telegram.fts", "mcp_telegram.message_contracts", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.telegram_access", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_gateway", "mcp_telegram.flood", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.sync_transactions", "mcp_telegram.sqlite_writer", "mcp_telegram.telegram_demand_progress", "mcp_telegram.scheduled_write_fence"]
 
 [[modules]]
 path = "mcp_telegram.drafts"
@@ -254,7 +254,7 @@ depends_on = ["mcp_telegram.telegram_rpc_error", "mcp_telegram.sqlite_writer", "
 [[modules]]
 path = "mcp_telegram.drafts.read_service"
 layer = "application"
-depends_on = ["mcp_telegram.drafts.history", "mcp_telegram.drafts.contracts"]
+depends_on = ["mcp_telegram.budget", "mcp_telegram.rich_content", "mcp_telegram.drafts.history", "mcp_telegram.drafts.contracts"]
 
 [[modules]]
 path = "mcp_telegram.drafts.history"
@@ -264,7 +264,12 @@ depends_on = ["mcp_telegram.sync_transactions", "mcp_telegram.drafts.contracts"]
 [[modules]]
 path = "mcp_telegram.drafts.snapshot"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.drafts.contracts"]
+depends_on = ["mcp_telegram.drafts.snapshot_codec", "mcp_telegram.drafts.contracts"]
+
+[[modules]]
+path = "mcp_telegram.drafts.snapshot_codec"
+layer = "foundation"
+depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.rich_content"]
 
 [[modules]]
 path = "mcp_telegram.drafts.owner"
@@ -295,7 +300,7 @@ depends_on = ["mcp_telegram.entity_profile.repository", "mcp_telegram.image_auth
 [[modules]]
 path = "mcp_telegram.transcription_hydration"
 layer = "application"
-depends_on = [
+depends_on = ["mcp_telegram.observation_order",
     "mcp_telegram.fact_hydration", "mcp_telegram.hydration_queue", "mcp_telegram.messages.sqlite_hydration", "mcp_telegram.messages.sqlite_hydration_jobs",
     "mcp_telegram.telegram_rpc_error",
 ]
@@ -554,12 +559,12 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.drafts.telethon_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.drafts.snapshot"]
+depends_on = ["mcp_telegram.rich_content", "mcp_telegram.drafts.contracts", "mcp_telegram.drafts.ports", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.drafts.snapshot"]
 
 [[modules]]
 path = "mcp_telegram.telegram_message_projection"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.message_composition", "mcp_telegram.formatter", "mcp_telegram.media_fact", "mcp_telegram.message_content", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.projection", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+depends_on = ["mcp_telegram.rich_content", "mcp_telegram.message_composition", "mcp_telegram.formatter", "mcp_telegram.media_fact", "mcp_telegram.message_content", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.projection", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
 
 [[modules]]
 path = "mcp_telegram.telegram_read_receipts"
@@ -584,7 +589,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.messages.telegram_adapter"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.reactions.projection", "mcp_telegram.message_composition", "mcp_telegram.flood", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
+depends_on = ["mcp_telegram.rich_content", "mcp_telegram.reactions.projection", "mcp_telegram.message_composition", "mcp_telegram.flood", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.telegram_demand", "mcp_telegram.telethon_media", "mcp_telegram.telethon_message"]
 
 [[modules]]
 path = "mcp_telegram.message_history.telegram_adapter"
@@ -635,7 +640,7 @@ depends_on = ["mcp_telegram.entity_profile.output_schema", "mcp_telegram.entity_
 [[modules]]
 path = "mcp_telegram.sync_db"
 layer = "persistence"
-depends_on = ["mcp_telegram.contacts.schema", "mcp_telegram.contact_notes.schema", "mcp_telegram.folders.command_schema", "mcp_telegram.models", "mcp_telegram.sqlite_values", "mcp_telegram.alert_policy", "mcp_telegram.dialog_classification", "mcp_telegram.fts", "mcp_telegram.sync_transactions", "mcp_telegram.scheduled_receipts_schema"]
+depends_on = ["mcp_telegram.drafts.snapshot_codec", "mcp_telegram.drafts.contracts", "mcp_telegram.contacts.schema", "mcp_telegram.contact_notes.schema", "mcp_telegram.folders.command_schema", "mcp_telegram.models", "mcp_telegram.sqlite_values", "mcp_telegram.alert_policy", "mcp_telegram.dialog_classification", "mcp_telegram.fts", "mcp_telegram.sync_transactions", "mcp_telegram.scheduled_receipts_schema"]
 
 [[modules]]
 path = "mcp_telegram.runtime_observations"
@@ -696,7 +701,7 @@ depends_on = ["mcp_telegram.dialog_identity", "mcp_telegram.entity_profile.repos
 [[modules]]
 path = "mcp_telegram.messages.sqlite_bundle"
 layer = "persistence"
-depends_on = ["mcp_telegram.sync_transactions", "mcp_telegram.image_authorization", "mcp_telegram.delivered_update", "mcp_telegram.alert_policy", "mcp_telegram.entity_profile.membership", "mcp_telegram.entity_profile.repository", "mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.observation_order", "mcp_telegram.own_only_contracts"]
+depends_on = ["mcp_telegram.rich_content", "mcp_telegram.sync_transactions", "mcp_telegram.image_authorization", "mcp_telegram.delivered_update", "mcp_telegram.alert_policy", "mcp_telegram.entity_profile.membership", "mcp_telegram.entity_profile.repository", "mcp_telegram.fts", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts", "mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.reactions.contracts", "mcp_telegram.reactions.persistence", "mcp_telegram.observation_order", "mcp_telegram.own_only_contracts"]
 
 [[modules]]
 path = "mcp_telegram.messages.sqlite_hydration"
@@ -706,7 +711,7 @@ depends_on = ["mcp_telegram.observation_order", "mcp_telegram.hydration_queue", 
 [[modules]]
 path = "mcp_telegram.messages.sqlite_hydration_jobs"
 layer = "persistence"
-depends_on = ["mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts"]
+depends_on = ["mcp_telegram.observation_order", "mcp_telegram.hydration_queue", "mcp_telegram.media_fact", "mcp_telegram.message_contracts"]
 
 [[modules]]
 path = "mcp_telegram.folders.sqlite_repository"
@@ -1065,7 +1070,7 @@ depends_on = ["mcp_telegram.entity_identity", "mcp_telegram.budget", "mcp_telegr
 [[modules]]
 path = "mcp_telegram.message_view"
 layer = "foundation"
-depends_on = ["mcp_telegram.structured", "mcp_telegram.entity_identity", "mcp_telegram.topic_identity", "mcp_telegram.models", "mcp_telegram.formatter"]
+depends_on = ["mcp_telegram.rich_content", "mcp_telegram.structured", "mcp_telegram.entity_identity", "mcp_telegram.topic_identity", "mcp_telegram.models", "mcp_telegram.formatter"]
 
 [[modules]]
 path = "mcp_telegram.structured"
@@ -1075,7 +1080,7 @@ depends_on = ["mcp_telegram.media_fact", "mcp_telegram.message_content"]
 [[modules]]
 path = "mcp_telegram.observation_order"
 layer = "persistence"
-depends_on = ["mcp_telegram.delivered_update", "mcp_telegram.sync_transactions", "mcp_telegram.sync_db"]
+depends_on = ["mcp_telegram.own_only_contracts", "mcp_telegram.delivered_update", "mcp_telegram.sync_transactions", "mcp_telegram.sync_db"]
 
 [[modules]]
 path = "mcp_telegram.sqlite_values"
@@ -1213,7 +1218,7 @@ depends_on = ["mcp_telegram.entity_profile.repository", "mcp_telegram.image_auth
 [[modules]]
 path = "mcp_telegram.message_images.repository"
 layer = "persistence"
-depends_on = ["mcp_telegram.message_images.limits", "mcp_telegram.media_fact", "mcp_telegram.messages.sqlite_bundle"]
+depends_on = ["mcp_telegram.observation_order", "mcp_telegram.message_images.limits", "mcp_telegram.media_fact"]
 
 [[modules]]
 path = "mcp_telegram.message_images.service"
@@ -1393,3 +1398,8 @@ depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_prog
 path = "mcp_telegram.message_delivery_observations"
 layer = "foundation"
 depends_on = []
+
+[[modules]]
+path = "mcp_telegram.rich_content"
+layer = "foundation"
+depends_on = ["mcp_telegram.message_composition"]

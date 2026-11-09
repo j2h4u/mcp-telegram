@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from copy import copy
-from hashlib import sha256
 from typing import cast, get_args
 
-from telethon.extensions import BinaryReader  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import SaveDraftRequest  # type: ignore[import-untyped]
 from telethon.tl.tlobject import TLObject  # type: ignore[import-untyped]
@@ -18,9 +16,20 @@ from mcp_telegram.drafts.contracts import (
     DraftScope,
     RestoreSnapshot,
 )
+from mcp_telegram.drafts.snapshot_codec import (
+    MAX_RESTORE_SNAPSHOT_BYTES as MAX_RESTORE_SNAPSHOT_BYTES,
+)
+from mcp_telegram.drafts.snapshot_codec import (
+    SNAPSHOT_PREFIX,
+    snapshot_fingerprint,
+)
+from mcp_telegram.drafts.snapshot_codec import (
+    DraftSnapshotError as DraftSnapshotError,
+)
+from mcp_telegram.drafts.snapshot_codec import (
+    decode_restore_snapshot as decode_restore_snapshot,
+)
 
-MAX_RESTORE_SNAPSHOT_BYTES = 1_048_576
-_SNAPSHOT_PREFIX = b"TGDR\x01"
 _MAX_RICH_NODES = 4096
 _REPLAY_FIELDS = frozenset(
     {
@@ -100,51 +109,17 @@ _RICH_VALUE_TYPES = (
 )
 
 
-class DraftSnapshotError(ValueError):
-    """Content-free reason why a retained composition cannot be used."""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
-
-
-def _fingerprint(draft: types.DraftMessage | types.DraftMessageEmpty) -> str:
-    composition = copy(draft)
-    composition.date = None
-    return sha256(bytes(composition)).hexdigest()
-
-
 def capture_restore_snapshot(draft: object) -> RestoreSnapshot | None:
     """Capture complete provider data without changing the ordinary read projection."""
     if not isinstance(draft, (types.DraftMessage, types.DraftMessageEmpty)):
         return None
     try:
-        payload = _SNAPSHOT_PREFIX + bytes(draft)
+        payload = SNAPSHOT_PREFIX + bytes(draft)
         if len(payload) > MAX_RESTORE_SNAPSHOT_BYTES:
             return None
-        return RestoreSnapshot(payload, _fingerprint(draft), _restore_reason(draft))
+        return RestoreSnapshot(payload, snapshot_fingerprint(draft), _restore_reason(draft))
     except Exception:  # noqa: BLE001 - vendor serialization may embed private payloads in exceptions.
         return None
-
-
-def decode_restore_snapshot(snapshot: RestoreSnapshot) -> types.DraftMessage | types.DraftMessageEmpty:
-    """Decode the one supported envelope and validate its exact content fingerprint."""
-    try:
-        payload = snapshot.payload
-        if len(payload) > MAX_RESTORE_SNAPSHOT_BYTES or not payload.startswith(_SNAPSHOT_PREFIX):
-            raise ValueError("invalid envelope")
-        raw = payload[len(_SNAPSHOT_PREFIX) :]
-        with BinaryReader(raw) as reader:
-            draft = reader.tgread_object()
-            if not isinstance(draft, (types.DraftMessage, types.DraftMessageEmpty)) or reader.tell_position() != len(
-                raw
-            ):
-                raise ValueError("invalid draft")
-        if _fingerprint(draft) != snapshot.semantic_fingerprint:
-            raise ValueError("invalid fingerprint")
-        return draft
-    except Exception:  # noqa: BLE001 - do not leak retained text or capabilities through parser errors.
-        raise DraftSnapshotError("invalid_restore_snapshot") from None
 
 
 def _rich_restore_reason(rich: object) -> str | None:

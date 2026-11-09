@@ -64,6 +64,8 @@ SEARCH_HIT_SCHEMA: dict[str, object] = {
         },
         "reaction_events_status": {"type": "string"},
         "read_at": {"type": ["integer", "null"]},
+        "rich_message_status": {"type": "string", "enum": ["unknown", "absent", "complete", "partial"]},
+        "rich_text_status": {"type": ["string", "null"], "enum": ["complete", "unsupported", None]},
     },
     "required": [
         "dialog_id",
@@ -203,6 +205,8 @@ def project_search_hit(
         ],
         "reaction_events_status": row.get("reaction_events_status", "unavailable"),
         "read_at": row.get("read_at"),
+        "rich_message_status": row.get("rich_message_status", "unknown"),
+        "rich_text_status": row.get("rich_text_status"),
     }
     result.update(_optional_search_facts(row, snippet))
     return result

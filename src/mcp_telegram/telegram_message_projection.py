@@ -18,6 +18,7 @@ from .messages.telegram_adapter import (
     extract_reply_and_topic,
 )
 from .reactions.projection import project_reaction_aggregates, project_reaction_event, project_reaction_visibility
+from .rich_content import capture_rich_message, decode_rich_message
 from .telethon_media import extract_media_fact
 from .telethon_message import is_service_message
 
@@ -180,9 +181,13 @@ def message_to_dict(  # noqa: PLR0914
     )
     entities_json, action_json = extract_message_composition(msg)
     entities = decode_formatting_entities(entities_json)
+    rich, rich_status, rich_text_status = decode_rich_message(capture_rich_message(getattr(msg, "rich_message", None)))
     return {
+        "rich_message": rich,
+        "rich_message_status": rich_status,
+        "rich_text_status": rich_text_status,
         "formatting_entities": None if entities is None else tuple(entities),
-        "formatting_text": extract_message_text(msg) if entities is not None else None,
+        "formatting_text": msg.message if entities is not None else None,
         "service_action": decode_service_action(action_json),
         "message_id": msg.id,
         "sent_at": sent_at,

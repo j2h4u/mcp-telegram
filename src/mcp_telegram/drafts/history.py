@@ -51,6 +51,7 @@ class DraftState:
     text: str | None
     observed_at: int | None
     uncertain: bool
+    rich_message_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,9 @@ class DraftHistoryEntry:
     restore_snapshot: RestoreSnapshot | None
     text: str | None
     archived_at: int
+    rich_message_json: str | None = None
+    source_observed_at: int | None = None
+    source_order_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +175,7 @@ def _current_row_state(scope: DraftScope, row: Mapping[str, object], *, uncertai
         cast(str | None, row["text"]),
         cast(int, row["source_observed_at"]),
         uncertain,
+        cast(str | None, row["rich_message_json"]),
     )
 
 
@@ -183,6 +188,9 @@ def _history_entry(scope: DraftScope, row: Mapping[str, object]) -> DraftHistory
         _snapshot(row),
         cast(str | None, row["text"]),
         cast(int, row["archived_at"]),
+        cast(str | None, row["rich_message_json"]),
+        cast(int | None, row["source_observed_at"]),
+        cast(int | None, row["source_order_at"]),
     )
 
 
@@ -227,8 +235,8 @@ def archive_current_draft(conn: sqlite3.Connection, scope: DraftScope, *, now: i
         return None
     cursor = conn.execute(
         "INSERT INTO draft_versions(account_id,dialog_id,top_message_id,subdialog_peer_id,source_revision,"
-        "state,text,restore_payload,semantic_fingerprint,restore_reason,source_observed_at,source_order_at,archived_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "state,text,restore_payload,semantic_fingerprint,restore_reason,source_observed_at,source_order_at,archived_at,rich_message_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(account_id,dialog_id,top_message_id,subdialog_peer_id,source_revision) "
         "DO UPDATE SET archived_at=excluded.archived_at RETURNING history_id",
         (
@@ -242,6 +250,7 @@ def archive_current_draft(conn: sqlite3.Connection, scope: DraftScope, *, now: i
             row["source_observed_at"],
             row["source_order_at"],
             _now(now),
+            row["rich_message_json"],
         ),
     )
     history = cast(tuple[int] | None, cursor.fetchone())

@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 101
+_CURRENT_SCHEMA_VERSION = 102
+_RICH_COMPOSITION_MIGRATION = 102
 _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION = 101
 _RAW_TELEGRAM_UPDATES_MIGRATION = 100
 _PARTIAL_CANONICAL_INTAKE_MIGRATION = 99
@@ -5107,7 +5108,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migration_60(conn, current)
     current = _apply_late_migrations(conn, current)
     current = _apply_migrations_85_to_92(conn, current)
-    _apply_migrations_93_to_100(conn, current)
+    current = _apply_migrations_93_to_100(conn, current)
+    _apply_migrations_101_to_102(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
 
@@ -5147,6 +5149,11 @@ def _apply_migrations_93_to_100(conn: sqlite3.Connection, current: int) -> int:
         current = _apply_migration_99(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _RAW_TELEGRAM_UPDATES_MIGRATION:
         current = _apply_migration_100(conn, current)
+    return current
+
+
+def _apply_migrations_101_to_102(conn: sqlite3.Connection, current: int) -> int:
+    """Apply current topic and rich composition migrations."""
     if _CURRENT_SCHEMA_VERSION >= _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION:
         current = _apply_migration(
             conn,
@@ -5162,7 +5169,91 @@ def _apply_migrations_93_to_100(conn: sqlite3.Connection, current: int) -> int:
                 "ALTER TABLE synced_dialogs DROP COLUMN topic_attribution_no_topic_count",
             ],
         )
+    if _CURRENT_SCHEMA_VERSION >= _RICH_COMPOSITION_MIGRATION:
+        current = _apply_migration_102(conn, current)
     return current
+
+
+def _apply_migration_102(conn: sqlite3.Connection, current: int) -> int:
+    """Retain rich composition and expand the existing bounded draft fact."""
+    if current >= _RICH_COMPOSITION_MIGRATION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table in ("messages", "scheduled_messages"):
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN rich_message TEXT CHECK(rich_message IS NULL OR json_valid(rich_message))"
+            )
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN formatting_text TEXT")
+        conn.execute(
+            "UPDATE messages SET formatting_text=text WHERE json_valid(formatting_entities) AND json_array_length(formatting_entities)>0 AND NOT EXISTS "
+            "(SELECT 1 FROM message_transcriptions t WHERE t.dialog_id=messages.dialog_id AND t.message_id=messages.message_id)"
+        )
+        conn.execute(
+            "UPDATE scheduled_messages SET formatting_text=text WHERE json_valid(formatting_entities) AND json_array_length(formatting_entities)>0"
+        )
+        conn.execute(
+            "CREATE INDEX idx_messages_rich_unknown ON messages(sent_at,dialog_id,message_id) "
+            "WHERE rich_message IS NULL AND is_deleted=0"
+        )
+        conn.execute(
+            "ALTER TABLE draft_versions ADD COLUMN rich_message_json TEXT CHECK(rich_message_json IS NULL OR json_valid(rich_message_json))"
+        )
+        for column in ("old_rich_message", "old_formatting_text", "old_formatting_entities"):
+            conn.execute(f"ALTER TABLE message_versions ADD COLUMN {column} TEXT")
+        schema = cast(
+            tuple[str],
+            conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='draft_current'").fetchone(),
+        )[0]
+        indexes = cast(
+            list[tuple[str]],
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='draft_current' AND sql IS NOT NULL"
+            ).fetchall(),
+        )
+        replacement = schema.replace("CREATE TABLE draft_current", "CREATE TABLE draft_current_v102", 1).replace(
+            "length(rich_message_json) <= 4096 AND ", ""
+        )
+        conn.execute(replacement)
+        conn.execute("INSERT INTO draft_current_v102 SELECT * FROM draft_current")
+        conn.execute("DROP TABLE draft_current")
+        conn.execute("ALTER TABLE draft_current_v102 RENAME TO draft_current")
+        for (sql,) in indexes:
+            conn.execute(sql)
+        conn.execute("UPDATE draft_current SET rich_message_json=NULL")
+        from .drafts.contracts import RestoreSnapshot
+        from .drafts.snapshot_codec import snapshot_rich_message
+
+        for table in ("draft_current", "draft_versions"):
+            if table == "draft_current":
+                current_rows = cast(
+                    list[tuple[int, int, int, int, bytes, str, str | None]],
+                    conn.execute(
+                        "SELECT account_id,dialog_id,top_message_id,subdialog_peer_id,restore_payload,semantic_fingerprint,restore_reason FROM draft_current WHERE restore_payload IS NOT NULL AND semantic_fingerprint IS NOT NULL"
+                    ).fetchall(),
+                )
+                for account, dialog, top, peer, payload, fingerprint, reason in current_rows:
+                    rich = snapshot_rich_message(RestoreSnapshot(payload, fingerprint, reason))
+                    conn.execute(
+                        "UPDATE draft_current SET rich_message_json=? WHERE account_id=? AND dialog_id=? AND top_message_id=? AND subdialog_peer_id=?",
+                        (rich, account, dialog, top, peer),
+                    )
+            else:
+                history_rows = cast(
+                    list[tuple[int, bytes, str, str | None]],
+                    conn.execute(
+                        "SELECT history_id,restore_payload,semantic_fingerprint,restore_reason FROM draft_versions WHERE restore_payload IS NOT NULL AND semantic_fingerprint IS NOT NULL"
+                    ).fetchall(),
+                )
+                for history_id, payload, fingerprint, reason in history_rows:
+                    rich = snapshot_rich_message(RestoreSnapshot(payload, fingerprint, reason))
+                    conn.execute("UPDATE draft_versions SET rich_message_json=? WHERE history_id=?", (rich, history_id))
+        conn.execute("INSERT INTO schema_version VALUES (102, strftime('%s', 'now'))")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return _RICH_COMPOSITION_MIGRATION
 
 
 def _apply_migration_100(conn: sqlite3.Connection, current: int) -> int:

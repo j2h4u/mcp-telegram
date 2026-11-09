@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from ..media_fact import decode_media_fact
-from ..messages.sqlite_bundle import has_nonchannel_deletion
+from ..observation_order import has_nonchannel_deletion
 from .limits import PHOTO_MAX_ATTEMPTS, PHOTO_MAX_SETUP_ATTEMPTS
 
 

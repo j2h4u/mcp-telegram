@@ -4,12 +4,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import cast
 
+import jsonschema
 import pytest
 from pydantic import ValidationError
 
 from mcp_telegram.dialog_selector import SELF_DIALOG_ALIASES, required_dialog_selector
 from mcp_telegram.resolver import Candidates, MatchInfo, Resolved
-from mcp_telegram.tools import drafts
+from mcp_telegram.tools import TOOL_REGISTRY, drafts
 from tests.test_daemon_api import _make_db_with_dialogs, _seed_dialog_row, make_server
 from tests.test_draft_commands import _Harness
 from tests.test_draft_commands import harness as harness
@@ -70,6 +71,47 @@ async def test_public_selector_maps_to_internal_ipc_fields(
     assert "dialog" not in received or expected == "dialog"
     assert "dialog_id" not in received or expected == "dialog_id"
     assert "exact_dialog_id" not in received
+
+
+@pytest.mark.asyncio
+async def test_get_draft_budget_markers_survive_mcp_output_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Connection:
+        async def request(self, payload: dict[str, object]) -> dict[str, object]:
+            return {
+                "ok": True,
+                "current": {
+                    "presence": "present",
+                    "uncertain": False,
+                    "content_included": False,
+                    "content_omission_reason": "response_budget",
+                    "rich_text_status": None,
+                },
+                "history": [
+                    {
+                        "history_id": 1,
+                        "presence": "present",
+                        "archived_at": 1,
+                        "restorable": True,
+                        "content_included": False,
+                        "content_omission_reason": "selected_history",
+                    }
+                ],
+                "acquisition_status": "ready",
+                "coverage_status": "complete",
+                "next_action": "Review.",
+            }
+
+    @asynccontextmanager
+    async def connection() -> AsyncIterator[Connection]:
+        yield Connection()
+
+    monkeypatch.setattr(drafts, "daemon_connection", connection)
+    result = await drafts.get_draft(drafts.GetDraft(exact_dialog_id=42))
+    output = cast(dict[str, object], result.structured_content)
+    jsonschema.validate(output, cast(dict[str, object], TOOL_REGISTRY["get_draft"].output_schema))
+    current = cast(dict[str, object], output["current"])
+    assert current["content_omission_reason"] == "response_budget"
+    assert "rich_text_status" not in current
 
 
 @pytest.mark.parametrize("alias", sorted(SELF_DIALOG_ALIASES))

@@ -25,6 +25,7 @@ from ._base import (
     structured_result,
 )
 from .dialog_resolution import project_dialog_resolution_error
+from .message_view import RICH_MEDIA_REFERENCE_GAPS_SCHEMA
 from .structured import (
     MEDIA_OUTPUT_SCHEMA,
     StructuredWarning,
@@ -122,6 +123,18 @@ TRACE_ACCOUNT_MESSAGES_OUTPUT_SCHEMA = {
                                 },
                                 "author_signature": {"type": ["string", "null"]},
                                 "text": {"type": ["string", "null"]},
+                                "rich_message": {"type": ["object", "null"]},
+                                "rich_media_reference_gaps": RICH_MEDIA_REFERENCE_GAPS_SCHEMA,
+                                "rich_message_status": {
+                                    "type": "string",
+                                    "enum": ["unknown", "absent", "complete", "partial"],
+                                },
+                                "rich_text_status": {
+                                    "type": ["string", "null"],
+                                    "enum": ["complete", "unsupported", None],
+                                },
+                                "formatting_text": {"type": ["string", "null"]},
+                                "formatting_entities": {"type": ["array", "null"], "items": {"type": "object"}},
                                 "media_description": {"type": ["string", "null"]},
                                 "content": {"type": "object", "additionalProperties": True},
                                 "media_content": MEDIA_OUTPUT_SCHEMA,
@@ -375,6 +388,15 @@ def _trace_preview(data: dict, *, evidence_count: int) -> dict[str, object]:
 
 def _trace_warnings(data: dict) -> list[StructuredWarning]:
     warnings: list[StructuredWarning] = []
+    provenance = data.get("provenance")
+    if isinstance(provenance, dict) and provenance.get("response_budget_truncated"):
+        warnings.append(
+            structured_warning(
+                "response_budget",
+                "The page was shortened to fit the response budget.",
+                action="Continue with next_navigation to read the remaining evidence.",
+            )
+        )
     gaps = data.get("gaps", [])
     if not isinstance(gaps, list):
         return warnings

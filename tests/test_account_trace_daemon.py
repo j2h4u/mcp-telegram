@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
+import json
 import logging
 import sqlite3
 import time
@@ -124,6 +126,49 @@ def _forbid_trace_acquisition(client: AsyncMock) -> None:
     client.side_effect = AssertionError("Observed trace must not acquire Telegram facts")
     cast(AsyncMock, client.get_entity).side_effect = AssertionError("Observed trace must not resolve peers")
     cast(AsyncMock, client.iter_messages).side_effect = AssertionError("Observed trace must not fetch messages")
+
+
+@pytest.mark.asyncio
+async def test_rich_evidence_budget_continues_after_last_emitted_message(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _, conn, client = trace_server
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=101, name="Alice")
+    seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    rich = {
+        "_": "RichMessage",
+        "blocks": [
+            {"_": "PageBlockParagraph", "text": {"_": "TextPlain", "text": "x" * 140_000}},
+            {"_": "PageBlockPhoto", "photo_id": 123},
+        ],
+    }
+    for message_id in (1, 2, 3):
+        seed_message(conn, dialog_id=-100123, message_id=message_id, sent_at=message_id, sender_id=101)
+        conn.execute(
+            "UPDATE messages SET rich_message=? WHERE dialog_id=-100123 AND message_id=?",
+            (json.dumps(rich), message_id),
+        )
+    conn.commit()
+    request: dict[str, object] = {"exact_account_id": 101, "exact_dialog_id": -100123, "limit": 3}
+    seen = []
+    for _ in range(3):
+        page = _dict((await trace_service._trace_account_messages(request))["data"])
+        evidence = [item for group in cast(list[dict], page["groups"]) for item in group["evidence"]]
+        seen.extend(item["message_id"] for item in evidence)
+        assert all(item["rich_message"] == rich for item in evidence)
+        assert all(item["rich_media_reference_gaps"]["missing_photo_ids"] == [123] for item in evidence)
+        if not page["next_navigation"]:
+            break
+        assert _dict(page["provenance"])["response_budget_truncated"] is True
+        rendered = _trace_structured_content(
+            copy.deepcopy(page), TraceAccountMessages(exact_account_id=101, exact_dialog_id=-100123, limit=3)
+        )
+        assert any(warning["kind"] == "response_budget" for warning in cast(list[dict], rendered["warnings"]))
+        request["navigation"] = page["next_navigation"]
+    assert seen == [3, 2, 1]
 
 
 @pytest.mark.asyncio

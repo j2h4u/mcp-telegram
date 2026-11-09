@@ -7,8 +7,8 @@ from typing import cast
 
 from ..hydration_queue import TRANSCRIPTION_HYDRATION_KIND, HydrationJob, HydrationPriority, HydrationQueueRepository
 from ..media_fact import decode_media_fact, is_transcribable_telegram_media
-from ..observation_order import delivered_observation_order
-from .sqlite_bundle import has_nonchannel_deletion, persist_transcribed_text, read_message_text
+from ..observation_order import delivered_observation_order, hydration_observation_current
+from .sqlite_bundle import persist_transcribed_text, read_message_text
 from .sqlite_hydration_jobs import (
     _TRANSCRIBABLE_MEDIA_SQL,
     _is_canonical_media_pair,
@@ -36,21 +36,6 @@ def hydration_work_revision(conn: sqlite3.Connection, job: HydrationJob) -> str:
         ).fetchone(),
     )
     return repr(None if row is None else tuple(row))
-
-
-def hydration_observation_current(
-    conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int | None
-) -> bool:
-    if has_nonchannel_deletion(conn, dialog_id, message_id):
-        return False
-    row = cast(
-        tuple[int, int] | None,
-        conn.execute(
-            "SELECT observation_order,is_deleted FROM message_observations WHERE dialog_id=? AND message_id=?",
-            (dialog_id, message_id),
-        ).fetchone(),
-    )
-    return row is None or (not row[1] and (observation_order is None or observation_order >= row[0]))
 
 
 def upsert_message_transcription(  # noqa: PLR0913

@@ -26,6 +26,7 @@ from ._base import (
     structured_result,
 )
 from .dialog_resolution import project_dialog_resolution_error
+from .message_view import RICH_MEDIA_REFERENCE_GAPS_SCHEMA
 
 
 class GetDraft(ToolArgs):
@@ -103,6 +104,12 @@ DRAFT_CURRENT_SCHEMA = {
         "presence": {"enum": ["present", "absent", "unknown"]},
         "expected_version": {"type": "string"},
         "text": {"type": "string"},
+        "rich_message": {"type": ["object", "null"]},
+        "rich_media_reference_gaps": RICH_MEDIA_REFERENCE_GAPS_SCHEMA,
+        "rich_content_status": {"enum": ["unknown", "absent", "complete", "partial"]},
+        "rich_text_status": {"enum": ["complete", "unsupported", None]},
+        "content_included": {"type": "boolean", "const": False},
+        "content_omission_reason": {"enum": ["response_budget"]},
         "observed_at": {"type": "integer"},
         "uncertain": {"type": "boolean"},
     },
@@ -115,6 +122,14 @@ _HISTORY_ENTRY_SCHEMA = {
         "history_id": {"type": "integer"},
         "presence": {"enum": ["present", "absent"]},
         "text": {"type": "string"},
+        "rich_message": {"type": ["object", "null"]},
+        "rich_media_reference_gaps": RICH_MEDIA_REFERENCE_GAPS_SCHEMA,
+        "rich_content_status": {"enum": ["unknown", "absent", "complete", "partial"]},
+        "rich_text_status": {"enum": ["complete", "unsupported", None]},
+        "content_included": {"type": "boolean", "const": False},
+        "content_omission_reason": {"enum": ["response_budget", "selected_history"]},
+        "observed_at": {"type": ["integer", "null"]},
+        "source_order_at": {"type": ["integer", "null"]},
         "archived_at": {"type": "integer"},
         "restorable": {"type": "boolean"},
         "restore_reason": {"type": "string"},

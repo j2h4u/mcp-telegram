@@ -26,6 +26,7 @@ from .entity_profile.membership import MembershipSignalCounts
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
+from .messages.sqlite_bundle import preserve_rich_observation
 from .messages.telegram_adapter import extract_message_row
 from .observation_order import allocate_observation_order, delivered_observation_order
 from .scheduled_write_fence import ScheduledMutationFence
@@ -253,6 +254,8 @@ def _scheduled_params(dialog_id: int, extracted: ExtractedMessage, source: objec
         "media_kind": message.media_kind,
         "media_payload": message.media_payload,
         "formatting_entities": message.formatting_entities,
+        "rich_message": message.rich_message,
+        "formatting_text": message.formatting_text,
         "service_action": message.service_action,
         "reply_to_msg_id": message.reply_to_msg_id,
         "forum_topic_id": message.forum_topic_id,
@@ -273,7 +276,7 @@ def _scheduled_params(dialog_id: int, extracted: ExtractedMessage, source: objec
 _UPSERT_SCHEDULED_SQL = """
 INSERT INTO scheduled_messages (
     dialog_id, message_id, scheduled_at, text, sender_id, sender_first_name,
-    media_kind, media_payload, formatting_entities, service_action, reply_to_msg_id,
+    media_kind, media_payload, formatting_entities, rich_message, formatting_text, service_action, reply_to_msg_id,
     forum_topic_id, edit_date, grouped_id,
     reply_to_peer_id, out, is_service, post_author, schedule_repeat_period,
     message_state, visibility, unpublished, unseen, publication_hint_message_id,
@@ -281,7 +284,7 @@ INSERT INTO scheduled_messages (
     first_seen_at, updated_at, has_rich_message, invert_media, video_processing_pending
 ) VALUES (
     :dialog_id, :message_id, :scheduled_at, :text, :sender_id, :sender_first_name,
-    :media_kind, :media_payload, :formatting_entities, :service_action, :reply_to_msg_id,
+    :media_kind, :media_payload, :formatting_entities, :rich_message, :formatting_text, :service_action, :reply_to_msg_id,
     :forum_topic_id, :edit_date, :grouped_id,
     :reply_to_peer_id, :out, :is_service, :post_author, :schedule_repeat_period,
     'scheduled', 'author_only', 1, 1, NULL, NULL, NULL, NULL, NULL,
@@ -295,6 +298,8 @@ ON CONFLICT(dialog_id, message_id) DO UPDATE SET
     media_kind = excluded.media_kind,
     media_payload = excluded.media_payload,
     formatting_entities = excluded.formatting_entities,
+    rich_message = excluded.rich_message,
+    formatting_text = excluded.formatting_text,
     service_action = excluded.service_action,
     reply_to_msg_id = excluded.reply_to_msg_id,
     forum_topic_id = excluded.forum_topic_id,
@@ -345,6 +350,7 @@ def upsert_scheduled_message(  # noqa: PLR0913 - shared queue projection with re
     *,
     now: int | None = None,
     mark_dirty: bool = True,
+    authoritative_update: bool = False,
     observation_order: int | None = None,
     mutation_fence: ScheduledMutationFence | None = None,
     account_id: int | None = None,
@@ -360,6 +366,15 @@ def upsert_scheduled_message(  # noqa: PLR0913 - shared queue projection with re
     if not _scheduled_observation_current(conn, dialog_id, extracted.message.message_id, order):
         return
     _invalidate_scheduled_target(mutation_fence, account_id, dialog_id, extracted.message.message_id)
+    previous = cast(
+        tuple[str | None, str | None, str | None, int | None, str | None] | None,
+        conn.execute(
+            "SELECT rich_message,formatting_text,formatting_entities,edit_date,text FROM scheduled_messages WHERE dialog_id=? AND message_id=?",
+            (dialog_id, extracted.message.message_id),
+        ).fetchone(),
+    )
+    if previous is not None and not authoritative_update:
+        extracted = preserve_rich_observation(extracted, previous[:4], previous[4])
     cursor = conn.execute(_UPSERT_SCHEDULED_SQL, _scheduled_params(dialog_id, extracted, message, timestamp))
     if not cursor.rowcount:
         return
@@ -370,7 +385,19 @@ def upsert_scheduled_message(  # noqa: PLR0913 - shared queue projection with re
     conn.execute(_DELETE_SCHEDULED_FTS_SQL, (dialog_id, extracted.message.message_id))
     conn.execute(
         _INSERT_SCHEDULED_FTS_SQL,
-        (dialog_id, extracted.message.message_id, stem_text(extracted.message.text)),
+        (
+            dialog_id,
+            extracted.message.message_id,
+            stem_text(
+                cast(
+                    str | None,
+                    conn.execute(
+                        "SELECT text FROM scheduled_messages WHERE dialog_id=? AND message_id=?",
+                        (dialog_id, extracted.message.message_id),
+                    ).fetchone()[0],
+                )
+            ),
+        ),
     )
     if mark_dirty:
         _mark_scheduled_dialog_dirty(conn, dialog_id, timestamp, mutation_fence=mutation_fence, account_id=account_id)

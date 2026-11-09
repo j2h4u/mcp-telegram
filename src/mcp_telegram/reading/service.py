@@ -44,6 +44,7 @@ from ..pagination import (
 from ..reactions.contracts import ReactionFreshness
 from ..request_timing import current_timing, timing_phase
 from ..resolver import latinize
+from ..rich_content import rich_message_text
 from ..sync_db import open_sync_db_reader
 from ..sync_read_model import (
     LocalHistoryCoverage,
@@ -848,6 +849,7 @@ class ReadingService:
             until_utc=request.until_utc,
         )
         result = await self._list_messages_from_db(db_request)
+        result = self._bound_history_result(result, db_request, "sent")
         with timing_phase("local_projection"):
             access_metadata = _build_access_metadata(self._conn, dialog_id, status)
         result["data"].update(access_metadata)
@@ -1479,7 +1481,7 @@ class ReadingService:
         assert anchor is not None
         return anchor[0]
 
-    async def _list_messages_context_window(
+    async def _list_messages_context_window(  # noqa: PLR0914
         self,
         dialog_id: int,
         anchor_message_id: int,
@@ -1537,6 +1539,7 @@ class ReadingService:
                 selected_before.extend(before_rows[before_count + 1 : before_count + 1 + remaining])
             rows = list(reversed(selected_before)) + list(selected_after)
         messages, freshness = await self._build_read_messages_from_rows(dialog_id, rows, log_rendered=True)
+        wire_rows, truncation = self._bound_context_messages(messages, anchor_message_id)
         with timing_phase("local_projection"):
             identity = read_dialog_identities(self._conn, [dialog_id])[dialog_id]
             dialog_type = identity.dialog_type.value
@@ -1545,7 +1548,8 @@ class ReadingService:
             return {
                 "ok": True,
                 "data": {
-                    "messages": [dataclasses.asdict(m) for m in messages],
+                    "messages": wire_rows,
+                    "truncation": truncation,
                     "source": "sync_db",
                     "anchor_message_id": anchor_message_id,
                     "selection_state": "present",
@@ -1958,12 +1962,57 @@ class ReadingService:
         budget_truncated = False
         for row in rows:
             row_bytes = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode())
+            if row.get("message_state") == "draft" and isinstance(row.get("rich_message"), dict):
+                row_bytes += len(json.dumps(rich_message_text(row["rich_message"]), ensure_ascii=False).encode())
             if bounded_rows and payload_bytes + row_bytes > self._deps.draft_response_budget_bytes:
                 budget_truncated = True
                 break
             bounded_rows.append(row)
             payload_bytes += row_bytes
         return bounded_rows, budget_truncated
+
+    def _bound_history_result(self, result: dict, req: _ListMessagesDbRequest, state: str) -> dict:
+        rows = result["data"]["messages"]
+        bounded, truncated = self._bound_scheduled_queue_rows(rows)
+        if not truncated:
+            return result
+        result["data"]["messages"] = bounded
+        result["data"]["next_navigation"] = self._maybe_encode_next_nav(
+            _NextNavContext(
+                messages=bounded,
+                limit=len(bounded),
+                dialog_id=req.dialog_id,
+                direction=req.direction,
+                direction_enum=req.direction_enum,
+                topic_id=req.topic_id,
+                logger=self._logger,
+                request_id=self._deps.rid,
+                message_state=state,
+                unread=req.unread,
+                since_utc=req.since_utc,
+                until_utc=req.until_utc,
+            )
+        )
+        result["data"]["truncation"] = {
+            "is_truncated": True,
+            "shown_count": len(bounded),
+            "hidden_count": len(rows) - len(bounded),
+            "reason": "response_budget",
+        }
+        return result
+
+    def _bound_context_messages(self, messages: list[ReadMessage], anchor: int) -> tuple[list[dict], dict]:
+        rows = [dataclasses.asdict(message) for message in messages]
+        ranked = sorted(rows, key=lambda row: abs(cast(int, row["message_id"]) - anchor))
+        bounded, truncated = self._bound_scheduled_queue_rows(ranked)
+        included = {row["message_id"] for row in bounded}
+        page = [row for row in rows if row["message_id"] in included]
+        return page, {
+            "is_truncated": truncated,
+            "shown_count": len(page),
+            "hidden_count": len(rows) - len(page),
+            "reason": "response_budget" if truncated else None,
+        }
 
     @staticmethod
     def _scheduled_queue_next_navigation(  # noqa: PLR0913
@@ -2225,9 +2274,10 @@ class ReadingService:
         page: list[DraftReadRecord] = []
         payload_bytes = 0
         for record in candidates:
-            row_bytes = len(
-                json.dumps(ReadingService._draft_wire_row(record), ensure_ascii=False, separators=(",", ":")).encode()
-            )
+            wire = ReadingService._draft_wire_row(record)
+            row_bytes = len(json.dumps(wire, ensure_ascii=False, separators=(",", ":")).encode())
+            if record.rich_message is not None:
+                row_bytes += len(json.dumps(rich_message_text(record.rich_message), ensure_ascii=False).encode())
             if page and payload_bytes + row_bytes > self._deps.draft_response_budget_bytes:
                 return page, True
             page.append(record)
@@ -2281,7 +2331,10 @@ class ReadingService:
         if request.message_state == "draft":
             return self._list_draft_messages_from_db(db_request, navigation=request.navigation)
         if request.message_state == "scheduled":
-            return self._scheduled_local_state_result(dialog_id, self._list_scheduled_messages_from_db(db_request))
+            result = self._list_scheduled_messages_from_db(db_request)
+            return self._scheduled_local_state_result(
+                dialog_id, self._bound_history_result(result, db_request, "scheduled")
+            )
         all_request = _AllLocalStateRequest(
             dialog_id,
             request,
@@ -2429,6 +2482,8 @@ class ReadingService:
                 draft_result is not None and draft_result["data"]["next_navigation"] is not None
             )
             page = combined[: request.limit]
+            page, budget_truncated = self._bound_scheduled_queue_rows(page)
+            has_more = has_more or budget_truncated
             history_coverage = local_history_coverage(
                 state.request.status,
                 cast(int | None, access_metadata.get("last_synced_at")),
@@ -2459,6 +2514,13 @@ class ReadingService:
                 projection_metadata = {
                     "draft_coverage": draft_result["data"]["draft_coverage"],
                     "truncation": draft_result["data"]["truncation"],
+                }
+            if budget_truncated:
+                projection_metadata["truncation"] = {
+                    "is_truncated": True,
+                    "shown_count": len(page),
+                    "hidden_count": min(len(combined), request.limit) - len(page),
+                    "reason": "response_budget",
                 }
             return {
                 "ok": True,

@@ -35,6 +35,8 @@ class StoredMessage:
     media_payload: str | None = None
     formatting_entities: str | None = None
     service_action: str | None = None
+    rich_message: str | None = None
+    formatting_text: str | None = None
 
     def __post_init__(self) -> None:
         """Reject non-canonical media pairs before they reach SQLite."""

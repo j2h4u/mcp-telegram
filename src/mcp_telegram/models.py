@@ -188,6 +188,9 @@ class ReadMessage:
     service_action: dict[str, object] | None = None
     formatting_entities: tuple[dict[str, object], ...] | None = None
     formatting_text: str | None = None
+    rich_message: dict[str, object] | None = None
+    rich_message_status: Literal["unknown", "absent", "complete", "partial"] = "unknown"
+    rich_text_status: Literal["complete", "unsupported"] | None = None
     out: int = 0
     fwd_from_name: str | None = None
     post_author: str | None = None
