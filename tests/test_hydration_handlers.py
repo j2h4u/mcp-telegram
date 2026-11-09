@@ -1069,3 +1069,66 @@ def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
         (2, "access_lost", 20),
     ]
     assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE terminal = 0").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_todo_delivered_during_refresh_fences_late_snapshot_and_indexes_retry(db: sqlite3.Connection) -> None:
+    from unittest.mock import MagicMock
+
+    from tests.sqlite_writer_helpers import event_manager
+
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="todo", media_payload='{"retained":true}')
+    job = _enqueue(db, MEDIA_METADATA_KIND, 1)
+    handler = MediaFactHydrationHandler(batch_size=1)
+    worker = MessageFactHydrationWorker(
+        _ScopeClient(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        clock=lambda: 100.0,
+        profile_owner_account_id=42,
+    )
+    manager = event_manager(MagicMock(), db, asyncio.Event())
+    manager.bind_demand_sink(MagicMock())
+
+    def snapshot(title: str) -> types.Message:
+        return types.Message(
+            id=1,
+            peer_id=types.PeerUser(1),
+            date=datetime.fromtimestamp(1, UTC),
+            message="",
+            edit_date=datetime.fromtimestamp(999, UTC),
+            media=types.MessageMediaToDo(types.TodoList(types.TextWithEntities(title, []), [])),
+        )
+
+    async def delayed(*args: object, **kwargs: object) -> object:
+        event = types.MessageService(
+            id=2,
+            peer_id=types.PeerUser(1),
+            from_id=types.PeerUser(3),
+            date=datetime.fromtimestamp(2, UTC),
+            action=types.MessageActionTodoCompletions([1], []),
+            reply_to=types.MessageReplyHeader(reply_to_msg_id=1),
+        )
+        await manager.on_raw_topic_message(types.UpdateNewMessage(event, 1, 1))
+        return [snapshot("stale")]
+
+    with patch.object(worker, "_request_batch", side_effect=delayed):
+        await worker._process_batch(handler, [job], 20)
+    assert db.execute("SELECT media_payload FROM messages WHERE message_id=1").fetchone() == ('{"retained":true}',)
+    queued = HydrationQueueRepository(db).due_jobs(2**31, 10, kind=MEDIA_METADATA_KIND)
+    assert len(queued) == 1 and queued[0].attempts == 0
+    with patch.object(worker, "_request_batch", return_value=[snapshot("fresh checklist")]):
+        await worker._process_batch(handler, queued, 30)
+    assert db.execute("SELECT text FROM messages WHERE message_id=1").fetchone() == ("fresh checklist",)
+    assert db.execute("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'fresh'").fetchone() == (1,)

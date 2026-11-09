@@ -153,12 +153,16 @@ def _optional_search_facts(row: dict[str, object], snippet: str) -> dict[str, ob
     )
     media_description = row.get("media_description")
     media_kind = row.get("media_kind")
+    media_payload = row.get("media_payload")
     projected = serialize_message_content(
         snippet,
         media_description if isinstance(media_description, str) else None,
         "snippet",
         media_kind if isinstance(media_kind, str) else None,
+        media_payload if isinstance(media_payload, dict) else None,
     )
+    if projected["media"] is not None and media_kind == "todo":
+        projected["media"].pop("todo", None)
     if projected["content"] is not None:
         facts["content"] = projected["content"]
     if projected["media"] is not None:

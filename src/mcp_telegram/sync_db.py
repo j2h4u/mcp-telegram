@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 102
+_CURRENT_SCHEMA_VERSION = 103
+_TODO_MEDIA_MIGRATION = 103
 _RICH_COMPOSITION_MIGRATION = 102
 _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION = 101
 _RAW_TELEGRAM_UPDATES_MIGRATION = 100
@@ -5109,7 +5110,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_late_migrations(conn, current)
     current = _apply_migrations_85_to_92(conn, current)
     current = _apply_migrations_93_to_100(conn, current)
-    _apply_migrations_101_to_102(conn, current)
+    current = _apply_migrations_101_to_102(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _TODO_MEDIA_MIGRATION:
+        _apply_migration_103(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
 
@@ -5172,6 +5175,48 @@ def _apply_migrations_101_to_102(conn: sqlite3.Connection, current: int) -> int:
     if _CURRENT_SCHEMA_VERSION >= _RICH_COMPOSITION_MIGRATION:
         current = _apply_migration_102(conn, current)
     return current
+
+
+def _apply_migration_103(conn: sqlite3.Connection, current: int) -> int:
+    """Add ToDo media while retaining all table facts and dependent objects."""
+    if current >= _TODO_MEDIA_MIGRATION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table in ("messages", "scheduled_messages"):
+            schema = cast(
+                tuple[str],
+                conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone(),
+            )[0]
+            objects = cast(
+                list[tuple[str]],
+                conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL",
+                    (table,),
+                ).fetchall(),
+            )
+            replacement = schema.replace(f'CREATE TABLE "{table}"', f"CREATE TABLE {table}_v103", 1)
+            replacement = replacement.replace("'story', 'other'", "'story', 'todo', 'other'")
+            if replacement == schema or "'todo'" not in replacement:
+                raise RuntimeError(f"unexpected media schema for {table}")
+            conn.execute(replacement)
+            conn.execute(f"INSERT INTO {table}_v103 SELECT * FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {table}_v103 RENAME TO {table}")
+            for (sql,) in objects:
+                if "idx_messages_media_unresolved_contact_other" in sql:
+                    sql = sql.replace("'contact', 'other'", "'contact', 'other', 'todo'")
+                conn.execute(sql)
+            conn.execute(
+                f"UPDATE {table} SET media_kind='todo', media_payload='{{}}' "
+                "WHERE media_kind='other' AND json_extract(media_payload,'$.type')='MessageMediaToDo'"
+            )
+        conn.execute("INSERT INTO schema_version VALUES (103, strftime('%s', 'now'))")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return 103
 
 
 def _apply_migration_102(conn: sqlite3.Connection, current: int) -> int:

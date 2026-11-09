@@ -146,7 +146,11 @@ def omit_none_mapping_values(value: object) -> object:
     ``ToolResult`` paths share one wire contract.
     """
     if isinstance(value, Mapping):
-        return {key: omit_none_mapping_values(item) for key, item in value.items() if item is not None}
+        return {
+            key: item if key == "todo" and value.get("type") == "todo" else omit_none_mapping_values(item)
+            for key, item in value.items()
+            if item is not None
+        }
     if isinstance(value, list):
         return [omit_none_mapping_values(item) for item in value]
     if isinstance(value, tuple):

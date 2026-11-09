@@ -9,6 +9,8 @@ type Facts = dict[str, object]
 def omit_empty_fields(value: object) -> object:
     """Drop empty object properties recursively while preserving every array slot."""
     if isinstance(value, Mapping):
+        if value.get("_") == "MessageMediaToDo":
+            return value
         result = {}
         for key, item in value.items():
             normalized = omit_empty_fields(item)

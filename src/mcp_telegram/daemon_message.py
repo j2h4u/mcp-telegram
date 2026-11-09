@@ -13,6 +13,7 @@ from .reactions.contracts import ReactionFreshness
 from .telegram_fact_queries import enrich_reaction_events, reaction_event_projection_by_message, read_at_map
 from .telegram_message_projection import MessageLike as _MessageLike
 from .telegram_message_projection import message_to_dict
+from .todo_content import todo_content
 
 __all__ = [
     "_MessageLike",
@@ -131,6 +132,8 @@ def project_read_message_content(
 ) -> ReadMessage:
     """Project one read-model message through canonical content semantics."""
     rendered_text = project_message_text(message.text, tuple(text_links))
+    if rendered_text is None and message.media_kind == "todo":
+        rendered_text = todo_content(message.media_payload).text or None
     content_kind: ContentKind = (
         "message_text" if rendered_text is not None else ("media_description" if message.media_description else "none")
     )

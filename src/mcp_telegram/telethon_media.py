@@ -8,6 +8,7 @@ from typing import cast
 import telethon.tl.types as tl  # type: ignore[import-untyped]
 
 from .media_fact import MediaFact
+from .message_composition import normalize_telegram_fact
 
 
 def _attr(obj: object, name: str, default: object | None = None) -> object | None:
@@ -241,7 +242,9 @@ def _extract_location_or_poll(media: object) -> MediaFact | None:
 
 def _extract_rich_media(media: object) -> MediaFact | None:
     fact: MediaFact | None = None
-    if isinstance(media, tl.MessageMediaWebPage):
+    if isinstance(media, tl.MessageMediaToDo):
+        fact = MediaFact("todo", cast(dict[str, object], normalize_telegram_fact(media.to_dict())))
+    elif isinstance(media, tl.MessageMediaWebPage):
         webpage = _attr(media, "webpage") or media
         fact = MediaFact(
             "link_preview", _text_payload(webpage, ("url", "display_url", "title", "description", "site_name"))

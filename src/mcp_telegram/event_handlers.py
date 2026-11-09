@@ -34,6 +34,8 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
     Channel,
     ChannelParticipantBanned,
     ChannelParticipantLeft,
+    MessageActionTodoAppendTasks,
+    MessageActionTodoCompletions,
     MessageActionTopicCreate,
     MessageActionTopicEdit,
     MessageService,
@@ -151,6 +153,7 @@ from .messages.sqlite_hydration import (
     apply_message_transcription,
     stage_message_transcription,
 )
+from .messages.sqlite_hydration_jobs import enqueue_todo_refresh
 from .messages.telegram_adapter import (
     extract_message_row,
     extract_received_messages,
@@ -1497,7 +1500,15 @@ class EventHandlerManager:
             if not isinstance(msg, MessageService):
                 return
             action = getattr(msg, "action", None)
-            if not isinstance(action, (MessageActionTopicCreate, MessageActionTopicEdit)):
+            if not isinstance(
+                action,
+                (
+                    MessageActionTopicCreate,
+                    MessageActionTopicEdit,
+                    MessageActionTodoAppendTasks,
+                    MessageActionTodoCompletions,
+                ),
+            ):
                 return
             peer = getattr(msg, "peer_id", None)
             if peer is None:
@@ -1514,11 +1525,31 @@ class EventHandlerManager:
                         realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id))
                     ):
                         return
-                    self._handle_topic_message_action(
-                        conn, dialog_id, cast(_MessageLike, msg), now, observation_order=observation_order
-                    )
+                    if isinstance(action, (MessageActionTodoAppendTasks, MessageActionTodoCompletions)):
+                        if not self._delivery_auth_available() or not allows_new_message(
+                            realtime_history_coverage(*_SQLiteRealtimeHistoryStatusReader(conn).read_status(dialog_id)),
+                            outgoing=bool(getattr(msg, "out", False)),
+                        ):
+                            return
+                        already_retained = read_message_text(conn, dialog_id, int(msg.id)).found
+                        extracted = extract_message_row(dialog_id, msg)
+                        actor = getattr(msg, "from_id", None)
+                        if actor is not None:
+                            extracted = replace(
+                                extracted, message=replace(extracted.message, sender_id=int(get_peer_id(actor)))
+                            )
+                        extracted = replace(extracted, observation_order=observation_order)
+                        insert_messages_with_fts(conn, [extracted], priority=HydrationPriority.FOREGROUND)
+                        if not already_retained:
+                            enqueue_todo_refresh(conn, dialog_id, msg, now, observation_order)
+                    else:
+                        self._handle_topic_message_action(
+                            conn, dialog_id, cast(_MessageLike, msg), now, observation_order=observation_order
+                        )
 
             await self._writer.run(_persist_event_0)
+            if isinstance(action, (MessageActionTodoAppendTasks, MessageActionTodoCompletions)):
+                self._offer_message_ingestion()
         except Exception:
             fail_delivered_update()
             logger.exception("event_raw_topic_message_failed update=%r", type(update).__name__)

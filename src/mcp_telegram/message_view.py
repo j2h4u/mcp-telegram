@@ -356,7 +356,7 @@ def _identity_facts(message: ReadMessage) -> dict[str, object]:
 
 def _content_facts(message: ReadMessage) -> dict[str, object]:
     projected = serialize_message_content(
-        message.text, message.media_description, message.content_kind, message.media_kind
+        message.text, message.media_description, message.content_kind, message.media_kind, message.media_payload
     )
     facts = {key: value for key, value in projected.items() if value is not None}
     facts["composition_is_telegram_content"] = True

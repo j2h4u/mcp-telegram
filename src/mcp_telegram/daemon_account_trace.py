@@ -49,6 +49,7 @@ from .flood import TelegramRpcThrottled, _raise_if_latched
 from .hydration_queue import HydrationPriority
 from .linked_chat_fact import LinkedChatState
 from .linked_chat_fact import read_fact as read_linked_chat_fact
+from .media_fact import decode_media_fact
 from .message_content import MessageSnapshot, project_message_content
 from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import MessageWriteResult, insert_messages_with_fts
@@ -607,6 +608,7 @@ class DaemonAccountTraceService:
             "formatting_entities": decode_formatting_entities(cast(str | None, row.get("formatting_entities"))),
             "media_description": row["media_description"],
             "media_kind": row["media_kind"],
+            "media_payload": row.get("media_payload"),
         }
 
     @staticmethod
@@ -1094,7 +1096,8 @@ def _project_trace_content_rows(
         projected_row["text"] = content.text
         projected_row["media_description"] = content.media_description
         projected_row["media_kind"] = content.media_kind
-        projected_row.pop("media_payload", None)
+        fact = decode_media_fact(_row_value(row, "media_kind"), _row_value(row, "media_payload"))
+        projected_row["media_payload"] = None if fact is None else fact.payload
         projected.append(projected_row)
     return projected
 

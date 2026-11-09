@@ -913,7 +913,11 @@ class MessageFactHydrationWorker:
         reaction_boundary: ReactionObservationBoundary | None,
     ) -> MediaPublication:
         values = result if isinstance(result, (list, tuple)) else [result]
-        ids = {job.message_id for job in jobs}
+        ids = {
+            job.message_id
+            for job in jobs
+            if hydration_observation_current(conn, job.dialog_id, job.message_id, observation_order)
+        }
         received = extract_received_messages([value for value in values if getattr(value, "id", None) in ids])
         accepted: set[int] = set()
         for message in received:

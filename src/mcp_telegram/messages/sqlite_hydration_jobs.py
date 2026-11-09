@@ -21,7 +21,7 @@ from ..media_fact import MediaFact, decode_media_fact, encode_media_payload, is_
 from ..observation_order import hydration_observation_current
 
 _EMPTY_MEDIA_PAYLOAD = "{}"
-_FACT_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other"))
+_FACT_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other", "todo"))
 _FACT_HYDRATION_ELIGIBILITY_SQL = (
     "SELECT 1 FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
@@ -127,7 +127,7 @@ def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, mess
     return (
         conn.execute(
             "SELECT 1 FROM messages m WHERE m.dialog_id = ? AND m.message_id = ? "
-            "AND m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other') AND m.media_payload = '{}') "
+            "AND m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other', 'todo') AND m.media_payload = '{}') OR (m.media_kind='todo' AND EXISTS (SELECT 1 FROM hydration_jobs h WHERE h.kind='media_metadata' AND h.dialog_id=m.dialog_id AND h.message_id=m.message_id AND h.terminal=0)) "
             "OR (m.media_kind = 'video' AND json_valid(m.media_payload) "
             "AND json_type(m.media_payload) = 'object' "
             "AND json_type(m.media_payload, '$.round_message') IS NULL)) "
@@ -290,14 +290,14 @@ _REPAIR_TRANSCRIPTION_CANDIDATES_FROM_SQL = (
     "WHERE m.is_deleted = 0 AND " + _TRANSCRIBABLE_MEDIA_SQL
 )
 _MEDIA_METADATA_HYDRATION_ELIGIBILITY_SQL = (
-    "m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other') AND m.media_payload = '{}') "
+    "m.is_deleted = 0 AND ((m.media_kind IN ('contact', 'other', 'todo') AND m.media_payload = '{}') "
     "OR (m.media_kind = 'video' AND json_valid(m.media_payload) "
     "AND json_type(m.media_payload) = 'object' "
     "AND json_type(m.media_payload, '$.round_message') IS NULL))"
 )
 _REPAIR_MEDIA_METADATA_CONTACT_OTHER_SQL = (
     "FROM messages m INDEXED BY idx_messages_media_unresolved_contact_other "
-    "WHERE m.is_deleted = 0 AND m.media_kind IN ('contact', 'other') AND m.media_payload = '{}'"
+    "WHERE m.is_deleted = 0 AND m.media_kind IN ('contact', 'other', 'todo') AND m.media_payload = '{}'"
 )
 _REPAIR_MEDIA_METADATA_VIDEO_SQL = (
     "FROM messages m INDEXED BY idx_messages_media_unresolved_video "
@@ -481,7 +481,11 @@ def _reconcile_media_hydration_job(
         queue.enqueue(job)
     elif unresolved and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds):
         queue.remove_active(job)
-    elif not unresolved and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds):
+    elif (
+        not unresolved
+        and message.media_kind != "todo"
+        and (existing_kinds is None or MEDIA_METADATA_KIND in existing_kinds)
+    ):
         queue.remove(job)
 
 
@@ -532,7 +536,7 @@ def reconcile_fact_hydration_jobs_for_dialog(
         Sequence[tuple[int, int]],
         conn.execute(
             "SELECT message_id, sent_at FROM messages WHERE dialog_id = ? AND is_deleted = 0 "
-            "AND media_kind IN ('contact', 'other') AND media_payload = '{}' UNION ALL "
+            "AND media_kind IN ('contact', 'other', 'todo') AND media_payload = '{}' UNION ALL "
             "SELECT message_id, sent_at FROM messages WHERE dialog_id = ? AND is_deleted = 0 AND media_kind = 'video' "
             "AND json_valid(media_payload) AND json_type(media_payload) = 'object' "
             "AND json_type(media_payload, '$.round_message') IS NULL",
@@ -558,3 +562,42 @@ def reconcile_fact_hydration_jobs_for_dialog(
         queue.enqueue(
             HydrationJob(TRANSCRIPTION_HYDRATION_KIND, dialog_id, int(message_id), due_at, 0, int(sent_at), priority)
         )
+
+
+def enqueue_todo_refresh(
+    conn: sqlite3.Connection, dialog_id: int, msg: object, now: int, observation_order: int
+) -> None:
+    reply = getattr(msg, "reply_to", None)
+    parent = getattr(reply, "reply_to_msg_id", None)
+    if (
+        not isinstance(parent, int)
+        or parent <= 0
+        or getattr(reply, "reply_to_peer_id", None) is not None
+        or bool(getattr(reply, "reply_to_scheduled", False))
+    ):
+        return
+    row = conn.execute(
+        "SELECT m.sent_at FROM messages m JOIN synced_dialogs d USING(dialog_id) "
+        "JOIN full_history_enrollment e USING(dialog_id) "
+        "WHERE m.dialog_id=? AND m.message_id=? AND m.is_deleted=0 AND m.media_kind='todo' "
+        "AND d.status IN ('syncing','synced') AND e.enabled=1",
+        (dialog_id, parent),
+    ).fetchone()
+    if row is None or not hydration_observation_current(conn, dialog_id, parent, None):
+        return
+    advanced = conn.execute(
+        "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted,source_rank) "
+        "VALUES(?,?,?,0,0) ON CONFLICT(dialog_id,message_id) DO UPDATE SET "
+        "observation_order=excluded.observation_order "
+        "WHERE message_observations.observation_order < excluded.observation_order RETURNING observation_order",
+        (dialog_id, parent, observation_order),
+    ).fetchone()
+    if advanced is None:
+        return
+    conn.execute(
+        "INSERT INTO hydration_jobs(kind,dialog_id,message_id,due_at,attempts,priority,message_sent_at,terminal) "
+        "VALUES('media_metadata',?,?,?,0,1,?,0) ON CONFLICT(kind,dialog_id,message_id) DO UPDATE SET "
+        "attempts=CASE WHEN terminal=0 AND last_outcome='processing' THEN MAX(attempts-1,0) ELSE attempts END, "
+        "last_outcome=CASE WHEN terminal=0 AND last_outcome='processing' THEN 'queued' ELSE last_outcome END",
+        (dialog_id, parent, now, row[0]),
+    )
