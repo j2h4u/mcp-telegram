@@ -164,6 +164,8 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "media_kind",
             "media_payload",
             "formatting_entities",
+            "formatting_text",
+            "rich_message",
             "service_action",
             "reply_to_msg_id",
             "reply_count",
@@ -178,6 +180,8 @@ def test_messages_schema(tmp_sync_db_path: Path) -> None:
             "post_author",
         }
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
+        assert columns["rich_message"][2] == "TEXT"
+        assert columns["formatting_text"][2] == "TEXT"
         # Both dialog_id and message_id are part of composite PK (pk > 0)
         assert columns["dialog_id"][5] > 0, "dialog_id must be part of PRIMARY KEY"
         assert columns["message_id"][5] > 0, "message_id must be part of PRIMARY KEY"
@@ -197,8 +201,22 @@ def test_message_versions_schema(tmp_sync_db_path: Path) -> None:
     try:
         rows = _table_info(conn, "message_versions")
         columns = {row[1]: row for row in rows}
-        expected = {"dialog_id", "message_id", "version", "old_text", "edit_date", "origin"}
+        expected = {
+            "dialog_id",
+            "message_id",
+            "version",
+            "old_text",
+            "edit_date",
+            "origin",
+            "old_rich_message",
+            "old_formatting_text",
+            "old_formatting_entities",
+        }
         assert expected == set(columns.keys()), f"Unexpected columns. Got: {set(columns.keys())}, expected: {expected}"
+        assert all(
+            columns[name][2] == "TEXT"
+            for name in ("old_rich_message", "old_formatting_text", "old_formatting_entities")
+        )
         # dialog_id, message_id, version are all part of composite PK
         assert columns["dialog_id"][5] > 0, "dialog_id must be part of PRIMARY KEY"
         assert columns["message_id"][5] > 0, "message_id must be part of PRIMARY KEY"
