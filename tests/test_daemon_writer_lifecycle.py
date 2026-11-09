@@ -109,9 +109,9 @@ async def test_shutdown_preserves_finalizer_commit_loss_boundary_and_final_marke
         await daemon._shutdown_sync_main_context(ctx)
         assert ctx.shutdown_event.is_set()
         assert stages == [
-            "api_stopped",
             "disconnect",
             "receipts_drained",
+            "api_stopped",
             "observer_detached",
             "recovery_observer_detached",
             "observer_flushed",

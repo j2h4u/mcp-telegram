@@ -38,7 +38,9 @@ class _Delivery:
 
 
 @pytest.fixture
-async def delivery(wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Delivery]:
+async def delivery(  # noqa: PLR0915 - fixture owns the complete delivery lifecycle
+    wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_Delivery]:
     gate, sender, _, _ = wire
     path = tmp_path / "delivery.sqlite"
     ensure_sync_schema(path)
@@ -81,8 +83,14 @@ async def delivery(wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.Monke
         monkeypatch.setattr(gate, "_restore_delivery_message_box", restore_with_gap)
         yield _Delivery(wire, path, reader, writer, now, box, extra_channels)
     finally:
-        await writer.aclose()
-        reader.close()
+        try:
+            gate.close_update_delivery()
+            await gate.disconnect()
+        finally:
+            try:
+                await writer.aclose()
+            finally:
+                reader.close()
 
 
 def _update(now: datetime, message_id: int, pts: int, *, channel: bool = False) -> types.UpdateShort:
@@ -105,6 +113,41 @@ async def _wait_message(reader: sqlite3.Connection, dialog_id: int, message_id: 
 async def _stop(loop: asyncio.Task[None]) -> None:
     loop.cancel()
     await loop
+
+
+async def test_delivery_fixture_drains_pending_dispatch_before_closing_writer(
+    delivery: _Delivery, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = delivery.wire[0]
+    entered = asyncio.Event()
+    finalized = False
+
+    async def dispatch() -> None:
+        nonlocal finalized
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+
+            def check_writer(conn: sqlite3.Connection) -> None:
+                conn.execute("SELECT 1").fetchone()
+
+            await delivery.writer.run(check_writer)
+            finalized = True
+
+    task = asyncio.create_task(dispatch())
+    gate._event_handler_tasks.add(task)
+    task.add_done_callback(gate._event_handler_tasks.discard)
+    await entered.wait()
+    original_close = delivery.writer.aclose
+
+    async def close_writer() -> None:
+        try:
+            assert task.done() and finalized
+        finally:
+            await original_close()
+
+    monkeypatch.setattr(delivery.writer, "aclose", close_writer)
 
 
 async def test_dm_input_commits_before_unsent_channel_and_local_read_uses_no_rpc(delivery: _Delivery) -> None:
