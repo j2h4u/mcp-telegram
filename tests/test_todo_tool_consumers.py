@@ -9,6 +9,11 @@ def test_trace_and_activity_keep_complete_todo_fact() -> None:
     trace = {"groups": [{"evidence": [dict(item)]}]}
     _attach_trace_content_metadata(trace)
     evidence = trace["groups"][0]["evidence"][0]
-    assert omit_none_mapping_values(evidence)["media_content"]["todo"] == payload
+    cleaned = cast(dict[str, object], omit_none_mapping_values(evidence))
+    assert cast(dict[str, object], cleaned["media_content"])["todo"] == payload
     activity = _structured_comment({**item, "dialog_id": 1, "message_id": 2})
-    assert omit_none_mapping_values(activity)["media"]["todo"] == payload
+    cleaned_activity = cast(dict[str, object], omit_none_mapping_values(activity))
+    assert cast(dict[str, object], cleaned_activity["media"])["todo"] == payload
+
+
+from typing import cast

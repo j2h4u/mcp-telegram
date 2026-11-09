@@ -2,13 +2,14 @@ import fcntl
 import json
 import sqlite3
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 from devtools import migration_backup
 
 
 @pytest.fixture
-def state(tmp_path):
+def state(tmp_path: Path) -> Path:
     state = tmp_path / "state"
     state.mkdir()
     with closing(sqlite3.connect(state / "sync.db")) as db:
@@ -24,13 +25,13 @@ def state(tmp_path):
     return state
 
 
-def run_backup(state, out):
+def run_backup(state: Path, out: Path) -> None:
     migration_backup.backup(
         state, out, 102, {"release": "release", "image": "sha256:old", "config": "config-reference"}
     )
 
 
-def test_pair_and_manifest(state, tmp_path):
+def test_pair_and_manifest(state: Path, tmp_path: Path) -> None:
     out = tmp_path / "backup"
     run_backup(state, out)
     assert json.loads((out / "manifest.json").read_text())["schema"] == 102
@@ -42,7 +43,9 @@ def test_pair_and_manifest(state, tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["second", "session", "messages", "lease"])
-def test_failure_never_publishes_manifest(state, tmp_path, monkeypatch, failure):
+def test_failure_never_publishes_manifest(
+    state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     paths = [state / "sync.db", state / "mcp_telegram_session.session"]
     if failure == "session":
         with closing(sqlite3.connect(paths[1])) as db:
@@ -59,7 +62,7 @@ def test_failure_never_publishes_manifest(state, tmp_path, monkeypatch, failure)
     if failure == "second":
         real = migration_backup.snapshot
 
-        def fail_second(source, target):
+        def fail_second(source: Path, target: Path) -> None:
             if source == paths[1]:
                 raise OSError("injected failure")
             real(source, target)
@@ -75,7 +78,7 @@ def test_failure_never_publishes_manifest(state, tmp_path, monkeypatch, failure)
     assert lock.stat().st_ino == inode
 
 
-def test_backup_includes_committed_wal_data_without_modifying_source(state, tmp_path):
+def test_backup_includes_committed_wal_data_without_modifying_source(state: Path, tmp_path: Path) -> None:
     source = state / "sync.db"
     with closing(sqlite3.connect(source)) as writer:
         assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)

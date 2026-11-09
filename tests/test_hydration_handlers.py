@@ -194,7 +194,7 @@ async def test_rich_partial_fetch_uses_full_message_response() -> None:
             return SimpleNamespace(messages=[full])
 
     job = HydrationJob(RICH_COMPOSITION_KIND, 1, 1, due_at=1, attempts=0)
-    assert await RichCompositionHydrationHandler().request(Client(), [job]) == [full]
+    assert await RichCompositionHydrationHandler(batch_size=1).request(Client(), [job]) == [full]
 
 
 @pytest.mark.asyncio
@@ -207,7 +207,7 @@ async def test_rich_expansion_rejects_another_peer() -> None:
 
     job = HydrationJob(RICH_COMPOSITION_KIND, 1, 1, due_at=1, attempts=0)
     with pytest.raises(ValueError, match="different peer"):
-        await RichCompositionHydrationHandler().request(Client(), [job])
+        await RichCompositionHydrationHandler(batch_size=1).request(Client(), [job])
 
 
 def test_ingested_partial_rich_message_enqueues_existing_hydration_owner(db: sqlite3.Connection) -> None:
@@ -251,7 +251,7 @@ async def test_partial_rich_owner_publishes_full_response_to_canonical_message(d
             return SimpleNamespace(messages=[full])
 
     client = Client()
-    handler = RichCompositionHydrationHandler()
+    handler = RichCompositionHydrationHandler(batch_size=1)
     worker = MessageFactHydrationWorker(
         client,
         db,
@@ -473,7 +473,7 @@ async def test_empty_queue_repair_demand_seeds_and_finishes_without_idle_writes(
     _seed_dialog(db)
     _seed_message(db, 1)
     db.commit()
-    handler = RichCompositionHydrationHandler()
+    handler = RichCompositionHydrationHandler(batch_size=1)
     worker = MessageFactHydrationWorker(
         _ScopeClient(),
         db,

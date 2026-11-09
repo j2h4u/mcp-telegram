@@ -1,7 +1,10 @@
+from collections.abc import Mapping
+from typing import cast
+
 import pytest
 from telethon.tl import types
 
-from mcp_telegram.rich_authoring import AuthoredBody, native_rich_input, parse_authored_body
+from mcp_telegram.rich_authoring import AuthoredBody, BodyFormat, native_rich_input, parse_authored_body
 
 
 def test_body_presence_and_native_sources():
@@ -13,7 +16,7 @@ def test_body_presence_and_native_sources():
 
 
 @pytest.mark.parametrize("payload", [{"format": "plain"}, {"text": "x", "format": None}, {"text": None}])
-def test_invalid_body_presence(payload):
+def test_invalid_body_presence(payload: dict[str, object]):
     with pytest.raises(ValueError):
         parse_authored_body(payload)
 
@@ -31,7 +34,7 @@ def test_invalid_body_presence(payload):
         ("<tg-slideshow></tg-slideshow>", "rich_html"),
     ],
 )
-def test_embedded_media_rejected(text, format):
+def test_embedded_media_rejected(text: str, format: BodyFormat):
     with pytest.raises(ValueError, match="media"):
         parse_authored_body({"text": text, "format": format})
 
@@ -46,7 +49,7 @@ def test_native_tree_survives_structured_wire_compaction():
 
     tree = {"blocks": [{"type": "paragraph", "caption": None, "nested": {"value": None}}]}
     value = {"current": {"rich_message": tree, "other": None}, "wrapper": None}
-    result = structured_result(omit_none_mapping_values(value))
+    result = structured_result(cast(Mapping[str, object], omit_none_mapping_values(value)))
     assert result.structured_content == {"current": {"rich_message": tree}}
 
 

@@ -1,11 +1,12 @@
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
 
 @pytest.mark.parametrize("failure", ["none", "build", "backup", "promotion", "up", "identity"])
-def test_migration_recipe_order(tmp_path, failure):
+def test_migration_recipe_order(tmp_path: Path, failure: str) -> None:
     bindir = tmp_path / "bin"
     bindir.mkdir()
     trace = tmp_path / "trace"

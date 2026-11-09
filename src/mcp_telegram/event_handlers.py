@@ -1533,7 +1533,7 @@ class EventHandlerManager:
                             return
                         already_retained = read_message_text(conn, dialog_id, int(msg.id)).found
                         extracted = extract_message_row(dialog_id, msg)
-                        actor = getattr(msg, "from_id", None)
+                        actor = cast(TypePeer | None, getattr(msg, "from_id", None))
                         if actor is not None:
                             extracted = replace(
                                 extracted, message=replace(extracted.message, sender_id=int(get_peer_id(actor)))

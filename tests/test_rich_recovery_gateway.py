@@ -57,7 +57,7 @@ async def test_rich_recovery_uses_guarded_wire_and_three_attempt_limit(  # noqa:
         async def __call__(self, request: object) -> object:
             return await sender.send_owned(request, scope)
 
-    handler = RichCompositionHydrationHandler()
+    handler = RichCompositionHydrationHandler(batch_size=1)
     assert handler.request_cost == 3 and handler.batch_size == 1
     task = asyncio.create_task(handler.request(WireClient(), [HydrationJob(handler.kind, 100, 7, 0, 0)]))
     partial = types.RichMessage([types.PageBlockParagraph(types.TextPlain("partial"))], [], [], part=True)
@@ -162,7 +162,7 @@ async def test_wrong_peer_response_stops_before_expansion(wire: _WireHarness, mo
         async def get_messages(self, **_kwargs: object) -> object:
             return await sender.send_owned(functions.messages.GetMessagesRequest([types.InputMessageID(7)]), scope)
 
-    handler = RichCompositionHydrationHandler()
+    handler = RichCompositionHydrationHandler(batch_size=1)
     task = asyncio.create_task(handler.request(WireClient(), [HydrationJob(handler.kind, 100, 7, 0, 0)]))
     state = await asyncio.wait_for(sender._send_queue.next_state(), 3)
     await sender._prepare_state(state)

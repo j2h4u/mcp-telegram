@@ -115,7 +115,7 @@ class RichCompositionHydrationHandler(MediaFactHydrationHandler):
     kind = RICH_COMPOSITION_KIND
     request_cost = 3
 
-    def __init__(self, *, batch_size: int = 1) -> None:
+    def __init__(self, *, batch_size: int) -> None:
         super().__init__(batch_size=batch_size)
 
     def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool:

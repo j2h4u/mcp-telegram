@@ -23,7 +23,9 @@ def test_real_todo_message_preserves_full_fact_and_semantic_text() -> None:
     message = tl.Message(1, tl.PeerUser(5), date=datetime(2026, 1, 2, tzinfo=UTC), message="", media=media)
     stored = extract_message_row(5, message).message
     assert stored.media_kind == "todo"
-    assert json.loads(stored.media_payload) == {
+    assert isinstance(stored.media_payload, str)
+    payload = cast(dict[str, object], json.loads(stored.media_payload))
+    assert payload == {
         "_": "MessageMediaToDo",
         "todo": {
             "_": "TodoList",
@@ -50,7 +52,7 @@ def test_real_todo_message_preserves_full_fact_and_semantic_text() -> None:
     }
     assert stored.text == "😀 Plan\nFirst\nВторой"
     assert stored.formatting_text == ""
-    assert todo_content(json.loads(stored.media_payload)) == TodoContent(stored.text, "captured")
+    assert todo_content(payload) == TodoContent(stored.text, "captured")
     assert message_to_dict(cast(MessageLike, message), dialog_id=5)["text"] == stored.text
 
 
@@ -62,26 +64,32 @@ def test_real_todo_message_preserves_full_fact_and_semantic_text() -> None:
         (tl.PeerChannel(3), {"_": "PeerChannel", "channel_id": 3}),
     ],
 )
-def test_completion_peer_and_date_are_retained(peer: object, expected_peer: dict[str, object]) -> None:
+def test_completion_peer_and_date_are_retained(peer: tl.TypePeer, expected_peer: dict[str, object]) -> None:
     media = tl.MessageMediaToDo(
         tl.TodoList(tl.TextWithEntities("List", []), [tl.TodoItem(42, tl.TextWithEntities("Task", []))]),
         [tl.TodoCompletion(42, peer, datetime(2026, 1, 1, tzinfo=UTC))],
     )
-    stored = extract_message_row(5, tl.Message(1, tl.PeerUser(5), message="", media=media)).message
-    assert json.loads(stored.media_payload)["completions"] == [
+    stored = extract_message_row(
+        5, tl.Message(1, tl.PeerUser(5), date=datetime(2026, 1, 2, tzinfo=UTC), message="", media=media)
+    ).message
+    assert isinstance(stored.media_payload, str)
+    payload = cast(dict[str, object], json.loads(stored.media_payload))
+    assert payload["completions"] == [
         {"_": "TodoCompletion", "id": 42, "completed_by": expected_peer, "date": "2026-01-01T00:00:00+00:00"}
     ]
 
 
 def test_empty_and_unknown_checklists_are_distinct() -> None:
     media = tl.MessageMediaToDo(tl.TodoList(tl.TextWithEntities("List", []), []))
-    message = tl.Message(2, tl.PeerChat(5), message="", media=media)
+    message = tl.Message(2, tl.PeerChat(5), date=datetime(2026, 1, 2, tzinfo=UTC), message="", media=media)
     stored = extract_message_row(-5, message).message
-    payload = json.loads(stored.media_payload)
+    assert isinstance(stored.media_payload, str)
+    payload = cast(dict[str, object], json.loads(stored.media_payload))
     assert payload["completions"] == []
     assert todo_content(payload) == TodoContent("List", "captured")
     assert todo_content({}) == TodoContent("", "unknown")
-    payload["todo"]["list"] = [
+    todo = cast(dict[str, object], payload["todo"])
+    todo["list"] = [
         {"_": "FutureItem"},
         {"_": "TodoItem", "title": {"_": "TextWithEntities", "text": "kept"}},
     ]

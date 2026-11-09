@@ -109,7 +109,7 @@ async def test_drop_formatting_dispatches_even_when_text_is_unchanged(harness: _
 
 @pytest.mark.parametrize("unknown", [False, True])
 async def test_oversized_observation_keeps_durable_result_and_canonical_fact(harness: _Harness, unknown: bool) -> None:
-    blocks = [types.PageBlockParagraph(types.TextPlain("x" * 900)) for _ in range(600)]
+    blocks: list[types.TypePageBlock] = [types.PageBlockParagraph(types.TextPlain("x" * 900)) for _ in range(600)]
 
     async def postflight(deadline: float) -> bool:
         harness.set_remote("", rich_message=types.RichMessage(blocks, [], []))

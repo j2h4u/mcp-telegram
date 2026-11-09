@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,11 +55,14 @@ async def test_raw_todo_service_fences_inflight_snapshot_and_preserves_parent(tm
         reply_to=MessageReplyHeader(reply_to_msg_id=10, reply_to_top_id=99),
     )
     await manager.on_raw_topic_message(UpdateNewMessage(message, 1, 1))
-    row = conn.execute(
-        "SELECT sender_id,reply_to_msg_id,service_action FROM messages WHERE dialog_id=7 AND message_id=11"
-    ).fetchone()
+    row = cast(
+        tuple[int, int, str] | None,
+        conn.execute(
+            "SELECT sender_id,reply_to_msg_id,service_action FROM messages WHERE dialog_id=7 AND message_id=11"
+        ).fetchone(),
+    )
     assert row is not None and row[0:2] == (8, 10)
-    assert json.loads(row[2])["completed"] == [1]
+    assert cast(dict[str, list[int]], json.loads(row[2]))["completed"] == [1]
     assert (
         conn.execute("SELECT media_payload FROM messages WHERE dialog_id=7 AND message_id=10").fetchone()[0] == payload
     )
@@ -93,8 +97,11 @@ def test_migration_retains_rich_facts_and_only_normalizes_recognizable_todo(
     conn.commit()
     before = {
         row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE tbl_name IN ('messages','scheduled_messages') AND type IN ('index','trigger') AND sql IS NOT NULL"
+        for row in cast(
+            list[tuple[str]],
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE tbl_name IN ('messages','scheduled_messages') AND type IN ('index','trigger') AND sql IS NOT NULL"
+            ).fetchall(),
         )
     }
     conn.close()
@@ -112,8 +119,11 @@ def test_migration_retains_rich_facts_and_only_normalizes_recognizable_todo(
     ).fetchone() == ("scheduled", '{"_":"RichMessage"}', "", "todo", "{}")
     after = {
         row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE tbl_name IN ('messages','scheduled_messages') AND type IN ('index','trigger') AND sql IS NOT NULL"
+        for row in cast(
+            list[tuple[str]],
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE tbl_name IN ('messages','scheduled_messages') AND type IN ('index','trigger') AND sql IS NOT NULL"
+            ).fetchall(),
         )
     }
     assert before == after
@@ -249,10 +259,13 @@ async def test_duplicate_append_preserves_existing_queue_state(tmp_path: Path, o
         reply_to=MessageReplyHeader(reply_to_msg_id=10),
     )
     await manager.on_raw_topic_message(UpdateNewMessage(msg, 1, 1))
-    row = conn.execute(
-        "SELECT service_action,reply_to_msg_id FROM messages WHERE dialog_id=7 AND message_id=11"
-    ).fetchone()
-    assert json.loads(row[0])["list"][0]["id"] == 17 and row[1] == 10
+    row = cast(
+        tuple[str, int],
+        conn.execute(
+            "SELECT service_action,reply_to_msg_id FROM messages WHERE dialog_id=7 AND message_id=11"
+        ).fetchone(),
+    )
+    assert cast(dict[str, list[dict[str, int]]], json.loads(row[0]))["list"][0]["id"] == 17 and row[1] == 10
     conn.execute(
         "UPDATE hydration_jobs SET attempts=3,due_at=999,terminal=?,last_outcome=?,last_error_code='FLOOD' WHERE dialog_id=7 AND message_id=10",
         (terminal, outcome),
