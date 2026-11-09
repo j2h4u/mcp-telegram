@@ -111,6 +111,8 @@ def test_read_state_per_dialog_skips_non_dm_and_zero_dialogs() -> None:
             is_deleted INTEGER NOT NULL,
             is_service INTEGER NOT NULL,
             formatting_entities TEXT,
+            formatting_text TEXT,
+            rich_message TEXT,
             service_action TEXT
         );
         INSERT INTO entities (id, type) VALUES (7, 'User'), (8, 'Channel');
@@ -246,6 +248,8 @@ async def test_search_scoped_result_applies_time_bounds_and_keeps_cursor_context
             out INTEGER NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
             formatting_entities TEXT,
+            formatting_text TEXT,
+            rich_message TEXT,
             service_action TEXT
         );
         -- Keep this hand-built search fixture compatible with the canonical

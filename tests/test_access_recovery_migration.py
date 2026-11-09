@@ -66,7 +66,9 @@ def _seed_access_rows(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _preserved_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+def _preserved_rows(
+    conn: sqlite3.Connection, message_columns: tuple[str, ...] | None = None
+) -> dict[str, list[tuple[object, ...]]]:
     tables = (
         "messages",
         "entities",
@@ -79,7 +81,13 @@ def _preserved_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ..
         "scheduled_operation_receipts",
     )
     return {
-        table: cast(list[tuple[object, ...]], conn.execute(f"SELECT * FROM {table}").fetchall()) for table in tables
+        table: cast(
+            list[tuple[object, ...]],
+            conn.execute(
+                f"SELECT {', '.join(message_columns) if table == 'messages' and message_columns else '*'} FROM {table}"
+            ).fetchall(),
+        )
+        for table in tables
     }
 
 
@@ -90,7 +98,11 @@ def test_migration_rearms_unwitnessed_access_recovery_without_losing_facts(
     _v95_database(path, monkeypatch)
     conn = sync_db._open_sync_db(path)
     _seed_access_rows(conn)
-    preserved = _preserved_rows(conn)
+    message_info = cast(
+        list[tuple[int, str, object, object, object, object]], conn.execute("PRAGMA table_info(messages)").fetchall()
+    )
+    message_columns = tuple(row[1] for row in message_info)
+    preserved = _preserved_rows(conn, message_columns)
     original_synced = cast(
         list[tuple[object, ...]],
         conn.execute(
@@ -105,7 +117,10 @@ def test_migration_rearms_unwitnessed_access_recovery_without_losing_facts(
     sync_db.ensure_sync_schema(path)
     conn = sync_db._open_sync_db(path)
     try:
-        assert _preserved_rows(conn) == preserved
+        assert _preserved_rows(conn, message_columns) == preserved
+        assert conn.execute(
+            "SELECT rich_message,formatting_text FROM messages WHERE dialog_id=11 AND message_id=500"
+        ).fetchone() == (None, None)
         assert conn.execute("SELECT * FROM delta_access_recovery_state").fetchall() == [witnessed]
         after = conn.execute(
             "SELECT dialog_id,status,access_lost_at,access_next_revalidate_at,delta_message_id,delta_retry_at FROM synced_dialogs ORDER BY dialog_id"
@@ -127,7 +142,7 @@ def test_migration_rearms_unwitnessed_access_recovery_without_losing_facts(
         assert second is not None and second.selected is not None
         assert second.selected.key.target == "probe:16" and second.release_at == 200
         sync_db.ensure_sync_schema(path)
-        assert _preserved_rows(conn) == preserved
+        assert _preserved_rows(conn, message_columns) == preserved
         assert conn.execute("SELECT * FROM delta_access_recovery_state").fetchall() == [witnessed]
     finally:
         conn.close()

@@ -72,6 +72,7 @@ TL_CONSTRUCTOR_SCOPES = {
     "entity_profile/semantic_normalization.py": {"normalize_semantic_profile", "_field_authority"},
     "entity_profile/output_schema.py": {"_reachable_constructors", "_root_rules", "COLLECTION_CONSTRUCTORS"},
     "telegram_gateway.py": {"_item_identity"},
+    "rich_content.py": {"_FIELDS"},
 }
 
 

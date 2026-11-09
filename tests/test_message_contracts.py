@@ -61,6 +61,8 @@ def _stored_message() -> StoredMessage:
                 "media_payload",
                 "formatting_entities",
                 "service_action",
+                "rich_message",
+                "formatting_text",
             ),
         ),
         (ReactionRecord, ("dialog_id", "message_id", "emoji", "count")),

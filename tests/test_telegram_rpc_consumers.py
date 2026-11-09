@@ -6,7 +6,7 @@ from types import MappingProxyType
 
 import pytest
 
-from mcp_telegram.media_hydration import MediaFactHydrationHandler
+from mcp_telegram.media_hydration import MediaFactHydrationHandler, RichCompositionHydrationHandler
 from mcp_telegram.telegram_rpc_consumers import (
     DURABLE_DEMAND_ORDER,
     TELEGRAM_DEMAND_CONTRACTS,
@@ -230,7 +230,7 @@ def test_demand_contract_modes_and_policy_are_internally_consistent() -> None:
     assert demand_contract(DemandKind.COLD_PEER_PAGE).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.FOLDER_SNAPSHOT).max_rpc_attempts_per_slice == 2
     assert demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
-    assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 2
+    assert demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice == 3
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).execution_mode is ExecutionMode.DURABLE
     assert demand_contract(DemandKind.TOPIC_SNAPSHOT).max_rpc_attempts_per_slice == 4
     assert demand_contract(DemandKind.RECONNECT_DIFFERENCE).execution_mode is ExecutionMode.INLINE
@@ -280,7 +280,7 @@ def test_hydration_slice_bounds_cover_every_registered_handler_cost() -> None:
     live_bound = demand_contract(DemandKind.LIVE_HYDRATION_BATCH).max_rpc_attempts_per_slice
     backfill_bound = demand_contract(DemandKind.BACKFILL_HYDRATION_BATCH).max_rpc_attempts_per_slice
     assert live_bound is not None and live_bound >= max_handler_cost
-    assert backfill_bound is not None and backfill_bound >= max_handler_cost
+    assert backfill_bound is not None and backfill_bound >= RichCompositionHydrationHandler.request_cost
 
 
 def test_demand_registry_validation_rejects_missing_kind_and_contract_key_mismatch() -> None:

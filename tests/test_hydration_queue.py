@@ -10,6 +10,7 @@ from mcp_telegram.hydration_queue import (
     _REGISTERED_HYDRATION_KINDS,
     _SUMMARY_AGGREGATE_SQL,
     MEDIA_METADATA_KIND,
+    RICH_COMPOSITION_KIND,
     TRANSCRIPTION_HYDRATION_KIND,
     HydrationJob,
     HydrationPriority,
@@ -281,6 +282,9 @@ def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sq
     for message_id in (1, 2):
         with write_savepoint(db):
             repository.enqueue(_job(TRANSCRIPTION_HYDRATION_KIND, 42, message_id, 9_999, attempts=7))
+    for message_id in (3, 4):
+        with write_savepoint(db):
+            repository.enqueue(_job(RICH_COMPOSITION_KIND, 42, message_id, 9_999, attempts=5))
     with write_savepoint(db):
         repository.enqueue(_job(MEDIA_METADATA_KIND, 99, 1, 9_999, attempts=99))
 
@@ -291,13 +295,18 @@ def test_summarize_for_dialog_includes_future_jobs_and_bounds_message_ids(db: sq
     finally:
         db.set_trace_callback(None)
     media = summaries[0]
-    transcription = summaries[1]
+    rich = summaries[1]
+    transcription = summaries[2]
     assert media.kind == MEDIA_METADATA_KIND
     assert media.dialog_id == 42
     assert media.job_count == 40
     assert media.message_ids == tuple(range(1, 33))
     assert media.attempts_min == 0
     assert media.attempts_max == 3
+    assert rich.kind == RICH_COMPOSITION_KIND
+    assert rich.job_count == 2
+    assert rich.message_ids == (3, 4)
+    assert rich.attempts_min == rich.attempts_max == 5
     assert transcription.kind == TRANSCRIPTION_HYDRATION_KIND
     assert transcription.job_count == 2
     assert transcription.message_ids == (1, 2)
