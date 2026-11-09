@@ -145,6 +145,8 @@ runtime-migrate state output schema release config:
     set -uo pipefail
     old=$(docker inspect --format '{{{{.Id}}' {{container}}) || exit 1
     old_image=$(docker inspect --format '{{{{.Image}}' "$old") || exit 1
+    base_image=$(docker compose -f {{compose_file}} config --images {{container}}) || exit 1
+    [[ -n "$base_image" && "$base_image" != *$'\n'* ]] || exit 1
     override=$(mktemp "${TMPDIR:-/tmp}/mcp-telegram-migration.XXXXXXXX") || exit 1
     tag="mcp-telegram-migration:$(basename "$override" | tr '[:upper:]' '[:lower:]')"
     old_tag="${tag}-old"
@@ -162,6 +164,10 @@ runtime-migrate state output schema release config:
         exit 1
     fi
     printf 'Backup and validation completed %s seconds after stop began\n' "$SECONDS"
+    if ! docker tag "$candidate" "$base_image"; then
+        docker start "$old" || printf 'Failed to resume old container: %s\n' "$old" >&2
+        exit 1
+    fi
     docker compose -f {{compose_file}} -f "$override" up -d --no-build --pull never --timeout -1 {{container}} || exit 1
     running=$(docker inspect --format '{{{{.Image}}' {{container}}) || exit 1
     [[ "$running" == "$candidate" ]] || { printf 'Candidate image mismatch\n' >&2; exit 1; }
