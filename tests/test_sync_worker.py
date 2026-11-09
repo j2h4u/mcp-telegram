@@ -8,6 +8,7 @@ and DAEMON-06 (DM bootstrap) behaviors.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -1126,20 +1127,14 @@ async def test_extract_message_row_uses_rich_message_text_and_unsupported_placeh
     )
     sync_db.commit()
 
-    msg = SimpleNamespace(
+    rich = tl.RichMessage([tl.PageBlockParagraph(tl.TextPlain("speech to text"))], [], [], rtl=True)
+    msg = tl.Message(
         id=700,
+        peer_id=tl.PeerUser(dialog_id),
         date=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
         message="",
-        sender_id=10,
-        sender=SimpleNamespace(first_name="Bob"),
         media=tl.MessageMediaUnsupported(),
-        rich_message=SimpleNamespace(blocks=[SimpleNamespace(text="speech to text")]),
-        reply_to=None,
-        reactions=None,
-        edit_date=None,
-        out=False,
-        grouped_id=None,
-        post_author=None,
+        rich_message=rich,
     )
 
     extracted = extract_message_row(dialog_id, msg)
@@ -1147,6 +1142,9 @@ async def test_extract_message_row_uses_rich_message_text_and_unsupported_placeh
     assert extracted.message.text == "speech to text"
     assert extracted.message.media_kind == "other"
     assert extracted.message.media_payload == '{"type":"MessageMediaUnsupported"}'
+    assert extracted.message.rich_message is not None
+    assert json.loads(extracted.message.rich_message) == rich.to_dict()
+    assert extracted.message.formatting_text == ""
 
 
 @pytest.mark.asyncio
