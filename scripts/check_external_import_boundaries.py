@@ -85,6 +85,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "message_history/identity_intake.py",  # Account-fenced history identity transaction owner.
             "history_enrollment.py",
             "hydration_queue.py",
+            "hydration_progress.py",  # Read-only queue snapshots and scan-completion evidence.
             "image_authorization.py",  # Connection-bound active-target revocation registry.
             "peer_access.py",  # Connection-bound peer access revocation registry.
             "message_images/fence.py",  # Writer-owned account/source preflight and durable allowance.

@@ -88,7 +88,7 @@ class TranscriptionHydrationHandler:
             or not isinstance(transcription_id, int)
             or isinstance(transcription_id, bool)
         ):
-            queue.mark_terminal(job)
+            queue.mark_terminal(job, error_code="invalid_result")
             return AppliedFacts(
                 dropped=1,
                 drop_observations=(

@@ -162,7 +162,7 @@ def _drop_unavailable_media(
         queue.requeue_not_applied(job, job.due_at)
         reason = "not_applied"
     else:
-        queue.mark_terminal(job)
+        queue.mark_terminal(job, error_code=reason)
     return HydrationDropObservation(reason, job.message_id, job.kind, job.dialog_id, job.attempts)
 
 

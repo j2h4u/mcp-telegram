@@ -62,6 +62,7 @@ ALLOWED_KINDS = frozenset(
         "reaction.detail",
         "reaction.invalidation",
         "runtime.telemetry_loss",
+        "hydration.queue_snapshot",
         "draft.observed",
         "draft.recovery",
     }
@@ -842,6 +843,18 @@ def _plan_runtime_observations_batch(
     )
 
 
+def initialize_runtime_observation_coverage(conn: sqlite3.Connection, *, now_ms: int) -> None:
+    """Record the unknown historical retention boundary once in the caller's transaction."""
+    if conn.execute("SELECT 1 FROM daemon_state WHERE key='runtime_observations_coverage_initialized'").fetchone():
+        return
+    conn.execute(
+        "INSERT INTO daemon_state(key, value) SELECT 'runtime_observations_historical_unknown_through_ms', ? "
+        "WHERE EXISTS (SELECT 1 FROM daemon_state WHERE key='runtime_observations_history_started_at_ms')",
+        (str(now_ms),),
+    )
+    conn.execute("INSERT INTO daemon_state(key, value) VALUES ('runtime_observations_coverage_initialized', '1')")
+
+
 def _apply_runtime_observations_plan(
     conn: sqlite3.Connection,
     plan: _PrunePlan,
@@ -852,12 +865,25 @@ def _apply_runtime_observations_plan(
     if not plan.ids:
         return _PruneBatchResult(0, 0, plan.has_more)
     placeholders = ",".join("?" for _ in plan.ids)
-    cursor = conn.execute(
-        f"DELETE FROM runtime_observations WHERE id IN ({placeholders})",
-        plan.ids,
+    rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            f"DELETE FROM runtime_observations WHERE id IN ({placeholders}) RETURNING observed_at_ms",
+            plan.ids,
+        ).fetchall(),
     )
-    deleted = max(cursor.rowcount, 0)
+    deleted = len(rows)
     cap_deleted = deleted if plan.cap else 0
+    if deleted:
+        deleted_through = max(row[0] for row in rows)
+        key = (
+            "runtime_observations_cap_deleted_through_ms" if plan.cap else "runtime_observations_ttl_deleted_through_ms"
+        )
+        conn.execute(
+            "INSERT INTO daemon_state(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
+            (key, str(deleted_through)),
+        )
     if cap_deleted:
         conn.execute(
             "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_observations_last_cap_truncation_ms', ?)",
@@ -917,6 +943,7 @@ __all__ = [
     "RuntimeObservationPolicy",
     "RuntimeObservationSink",
     "encode_payload",
+    "initialize_runtime_observation_coverage",
     "prune_runtime_observations",
     "record_runtime_observation",
     "tool_telemetry_identity",

@@ -114,6 +114,7 @@ from .folders.refresh import FolderRefresher
 from .folders.sqlite_repository import SQLiteFolderSnapshotRepository
 from .folders.telegram_adapter import FolderClient, TelethonTelegramFolderGateway
 from .folders.worker import FolderProjectionWorker
+from .hydration_progress import progress_line, queue_snapshots
 from .hydration_queue import HydrationPriority
 from .image_authorization import ActiveSources, ScopeToken
 from .media_hydration import MediaFactHydrationHandler, RichCompositionHydrationHandler
@@ -150,6 +151,7 @@ from .runtime_observations import (
     RuntimeObservationSink,
     UpdateRingPort,
     _prune_runtime_observations_batch,
+    initialize_runtime_observation_coverage,
     record_runtime_observation,
 )
 from .scheduled_commands import ScheduledCommandError, ScheduledCommandOwner, settle_interrupted_scheduled_operations
@@ -218,7 +220,7 @@ def _operator_summary_row_factory(cursor: sqlite3.Cursor, row: tuple[object, ...
 
 
 def read_operator_summary_snapshot(
-    db_path: Path, since_ms: int
+    db_path: Path, since_ms: int, *, now_ms: int | None = None
 ) -> tuple[
     list[dict[str, object]],
     dict[str, object] | None,
@@ -234,6 +236,14 @@ def read_operator_summary_snapshot(
             conn.execute(
                 "SELECT * FROM runtime_observations WHERE observed_at_ms>=? ORDER BY observed_at_ms,id",
                 (since_ms,),
+            ).fetchall(),
+        )
+        hydration_rows = cast(
+            list[dict[str, object]],
+            conn.execute(
+                "SELECT * FROM runtime_observations WHERE kind='hydration.queue_snapshot' AND observed_at_ms>=? "
+                "ORDER BY id",
+                ((int(time.time() * 1000) if now_ms is None else now_ms) - 6 * 3600 * 1000,),
             ).fetchall(),
         )
         history_row = cast(
@@ -252,6 +262,9 @@ def read_operator_summary_snapshot(
                 "SELECT key,value FROM daemon_state "
                 "WHERE key IN ("
                 "'runtime_observations_last_cap_truncation_ms',"
+                "'runtime_observations_cap_deleted_through_ms',"
+                "'runtime_observations_ttl_deleted_through_ms',"
+                "'runtime_observations_historical_unknown_through_ms',"
                 "'runtime_observations_last_loss_ms',"
                 "'runtime_observations_last_queue_full_drops',"
                 "'runtime_observations_last_writer_failures'"
@@ -260,12 +273,28 @@ def read_operator_summary_snapshot(
         )
     finally:
         conn.close()
+    coverage_markers = _operator_coverage_markers(marker_rows, hydration_rows, since_ms)
+    return observations, history_row, dialog_rows, coverage_markers
+
+
+def _operator_coverage_markers(
+    marker_rows: list[dict[str, object]], hydration_rows: list[dict[str, object]], since_ms: int
+) -> dict[str, object]:
     persisted_markers = {str(row["key"]): row["value"] for row in marker_rows}
-    coverage_markers: dict[str, object] = {}
+    coverage_markers: dict[str, object] = {"hydration_rows": hydration_rows}
+    for key in (
+        "runtime_observations_cap_deleted_through_ms",
+        "runtime_observations_ttl_deleted_through_ms",
+        "runtime_observations_historical_unknown_through_ms",
+    ):
+        if key in persisted_markers:
+            coverage_markers[key] = persisted_markers[key]
     cap_ms = persisted_markers.get("runtime_observations_last_cap_truncation_ms")
     if cap_ms is not None:
         coverage_markers["last_cap_truncation_ms"] = cap_ms
     loss_ms = persisted_markers.get("runtime_observations_last_loss_ms")
+    if loss_ms is not None:
+        coverage_markers["last_loss_ms"] = loss_ms
     if loss_ms is not None and int(str(loss_ms)) >= since_ms:
         coverage_markers["loss_observed"] = True
         coverage_markers["telemetry_gap_ms"] = loss_ms
@@ -275,7 +304,7 @@ def read_operator_summary_snapshot(
             coverage_markers["queue_full_drops"] = int(str(queue_full_drops))
         if writer_failures is not None:
             coverage_markers["writer_failures"] = int(str(writer_failures))
-    return observations, history_row, dialog_rows, coverage_markers
+    return coverage_markers
 
 
 class _DaemonClient(Protocol):
@@ -1024,12 +1053,16 @@ async def _run_daemon_lifetime(ctx: _SyncMainContext) -> None:
     """Keep local refresh and heartbeat work alive beside the coordinator."""
     sync_start = time.monotonic()
     next_draft_prune = sync_start
+    next_hydration_snapshot = sync_start + 300
     await _reconcile_initial_profile_history(ctx)
     while not ctx.shutdown_event.is_set():
         _log_heartbeat(ctx.conn, ctx.client, sync_start)
         if time.monotonic() >= next_draft_prune:
             await ctx.writer.run(_prune_draft_retention)
             next_draft_prune = time.monotonic() + timedelta(hours=1).total_seconds()
+        if time.monotonic() >= next_hydration_snapshot:
+            await _record_hydration_progress(ctx)
+            next_hydration_snapshot = time.monotonic() + 300
         if ctx.handler_manager is not None:
             ctx.handler_manager.refresh_synced_dialogs()
         if ctx.coordinator is not None and not ctx.shutdown_event.is_set():
@@ -1042,6 +1075,21 @@ async def _run_daemon_lifetime(ctx: _SyncMainContext) -> None:
             for task in (shutdown_wait, heartbeat_wait):
                 if not task.done():
                     task.cancel()
+
+
+async def _record_hydration_progress(ctx: _SyncMainContext) -> None:
+    paused = ctx.client.account_safety_status() is not None
+    observed_ms, snapshots = await ctx.writer.run(partial(_read_hydration_progress, paused=paused))
+    for snapshot in snapshots:
+        _observe_runtime(
+            ctx, "hydration.queue_snapshot", "observed", None, payload=snapshot, observed_at_ms=observed_ms
+        )
+    logger.info("hydration_progress %s", "; ".join(progress_line(snapshot) for snapshot in snapshots))
+
+
+def _read_hydration_progress(conn: sqlite3.Connection, *, paused: bool) -> tuple[int, list[dict[str, object]]]:
+    observed_ms = int(time.time() * 1000)
+    return observed_ms, queue_snapshots(conn, observed_ms // 1000, paused=paused)
 
 
 def _prune_draft_retention(conn: sqlite3.Connection) -> None:
@@ -1336,6 +1384,8 @@ def _bootstrap_sync_database(db_path: Path, state_dir: Path, config: McpTelegram
         )
         enable_runtime_writes(conn)
         startup_now_ms = int(time.time() * 1000)
+        with write_transaction(conn):
+            initialize_runtime_observation_coverage(conn, now_ms=startup_now_ms)
         while True:
             result = _prune_runtime_observations_batch(
                 conn,
