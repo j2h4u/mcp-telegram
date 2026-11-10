@@ -11,10 +11,17 @@ from telethon.tl.types import TypeInputPeer  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
 from .fact_hydration import AppliedFacts, HydrationDropObservation, MediaPublication, _has_terminal_rpc_symbol
-from .hydration_queue import MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND, HydrationJob, HydrationQueueRepository
+from .hydration_queue import (
+    MEDIA_METADATA_KIND,
+    RICH_COMPOSITION_KIND,
+    HydrationJob,
+    HydrationPriority,
+    HydrationQueueRepository,
+)
 from .messages.sqlite_hydration import enqueue_transcription_for_hydrated_media
 from .messages.sqlite_hydration_jobs import (
     media_fact_hydration_eligible,
+    rich_composition_automatic_eligible,
     rich_composition_hydration_eligible,
 )
 from .peer_access import peer_target
@@ -119,7 +126,10 @@ class RichCompositionHydrationHandler(MediaFactHydrationHandler):
         super().__init__(batch_size=batch_size)
 
     def eligible(self, conn: sqlite3.Connection, job: HydrationJob) -> bool:
-        return rich_composition_hydration_eligible(conn, job.dialog_id, job.message_id)
+        return rich_composition_hydration_eligible(conn, job.dialog_id, job.message_id) and (
+            job.priority is HydrationPriority.FOREGROUND
+            or rich_composition_automatic_eligible(conn, job.dialog_id, job.message_id)
+        )
 
     async def request(self, client: object, jobs: Sequence[HydrationJob]) -> object:
         result = await super().request(client, jobs)

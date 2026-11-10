@@ -303,9 +303,9 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Return queued work or the next bounded backfill-repair time."""
-        kinds = list(self._worker._handlers)
-        if self._priority is HydrationPriority.BACKFILL and RICH_COMPOSITION_KIND in kinds:
-            kinds.append("rich-repair")
+        kinds, cleanup = self._repair_kinds(now, excluded)
+        if cleanup is not None:
+            return cleanup
         future_repair: DemandStatus | None = None
         for offset in range(len(kinds)):
             kind = kinds[(self._next_kind + offset) % len(kinds)]
@@ -327,6 +327,21 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
                 if selected not in excluded:
                     return DemandStatus(release_at=float(job.due_at), selected=selected)
         return future_repair
+
+    def _repair_kinds(self, now: float, excluded: frozenset[WorkRevision]) -> tuple[list[str], DemandStatus | None]:
+        kinds = list(self._worker._handlers)
+        if self._priority is HydrationPriority.BACKFILL and RICH_COMPOSITION_KIND in kinds:
+            kinds.append("rich-repair")
+            return kinds, self._ready_cleanup(now, excluded)
+        return kinds, None
+
+    def _ready_cleanup(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
+        revision = rich_composition_repair_revision(self._worker._conn)
+        if revision is None or not revision.startswith("cleanup:"):
+            return None
+        selected = WorkRevision(WorkKey(self.demand_kind, self._account_id, "rich-repair"), revision)
+        status = DemandStatus(release_at=self._worker.next_repair_at, selected=selected)
+        return status if selected not in excluded and status.is_ready(now) else None
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Seed and run one compatible queue batch within the attempt budget."""
@@ -1065,8 +1080,8 @@ class MessageFactHydrationWorker:
         return (
             conn.execute(
                 "SELECT 1 FROM hydration_jobs WHERE kind=? AND dialog_id=? AND message_id=? "
-                "AND attempts=? AND due_at=? AND terminal=0 AND last_outcome='processing'",
-                (job.kind, job.dialog_id, job.message_id, job.attempts, job.due_at),
+                "AND attempts=? AND due_at=? AND priority=? AND terminal=0 AND last_outcome='processing'",
+                (job.kind, job.dialog_id, job.message_id, job.attempts, job.due_at, int(job.priority)),
             ).fetchone()
             is not None
         )
@@ -1528,6 +1543,14 @@ class MessageFactHydrationWorker:
             started: list[HydrationJob] = []
             observations: list[HydrationDropObservation] = []
             for job in jobs:
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM hydration_jobs WHERE kind=? AND dialog_id=? AND message_id=? AND priority=?",
+                        (job.kind, job.dialog_id, job.message_id, int(job.priority)),
+                    ).fetchone()
+                    is None
+                ):
+                    continue
                 if not handler.eligible(conn, job):
                     HydrationQueueRepository(conn).remove(job)
                     observations.append(

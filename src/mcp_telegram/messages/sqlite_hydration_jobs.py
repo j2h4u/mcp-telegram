@@ -20,6 +20,8 @@ from ..hydration_queue import (
 from ..media_fact import MediaFact, decode_media_fact, encode_media_payload, is_transcribable_telegram_media
 from ..observation_order import hydration_observation_current
 
+# Automatic recovery is limited to messages sent or edited since May 2026.
+_RICH_AUTOMATIC_DATE_SQL = "(m.sent_at >= 1777593600 OR COALESCE(m.edit_date, 0) >= 1777593600)"
 _EMPTY_MEDIA_PAYLOAD = "{}"
 _FACT_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other", "todo"))
 _FACT_HYDRATION_ELIGIBILITY_SQL = (
@@ -162,6 +164,18 @@ def rich_composition_hydration_eligible(conn: sqlite3.Connection, dialog_id: int
     )
 
 
+def rich_composition_automatic_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
+    """Retain partial compositions of any age, and recent unknown compositions."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages m WHERE m.dialog_id=? AND m.message_id=? AND "
+            "(m.rich_message IS NOT NULL OR " + _RICH_AUTOMATIC_DATE_SQL + ")",
+            (dialog_id, message_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def request_rich_composition_repair(
     conn: sqlite3.Connection, dialog_id: int, message_id: int, *, now: int
 ) -> dict[str, object]:
@@ -182,7 +196,7 @@ def request_rich_composition_repair(
             return {"status": "already_known"}
         return {"status": "ineligible"}
     HydrationQueueRepository(conn).enqueue(
-        HydrationJob(RICH_COMPOSITION_KIND, dialog_id, message_id, now, 0, row[0], HydrationPriority.BACKFILL)
+        HydrationJob(RICH_COMPOSITION_KIND, dialog_id, message_id, now, 0, row[0], HydrationPriority.FOREGROUND)
     )
     job = cast(
         tuple[int, int, int, str | None] | None,
@@ -216,16 +230,44 @@ def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: 
         return False
     key = "rich_composition_hydration_cursor"
     stored = cast(tuple[str] | None, conn.execute("SELECT value FROM daemon_state WHERE key=?", (key,)).fetchone())
-    state = {"cursor": None, "done": False} if stored is None else cast(dict[str, object], json.loads(stored[0]))
+    state: dict[str, object] = {"cursor": None, "done": False} if stored is None else json.loads(stored[0])
+    if not state.get("cleanup_done", False):
+        cleanup_cursor = cast(list[int], state.get("cleanup_cursor") or [-9223372036854775808, -9223372036854775808])
+        cleanup_rows = cast(
+            list[tuple[int, int]],
+            conn.execute(
+                "SELECT dialog_id,message_id FROM hydration_jobs WHERE kind='rich_composition' "
+                "AND (dialog_id,message_id) > (?,?) ORDER BY dialog_id,message_id LIMIT ?",
+                (*cleanup_cursor, max_jobs),
+            ).fetchall(),
+        )
+        cleanup_examined = cleanup_rows
+        conn.executemany(
+            "DELETE FROM hydration_jobs WHERE kind='rich_composition' AND priority=0 AND dialog_id=? AND message_id=? "
+            "AND EXISTS (SELECT 1 FROM messages m WHERE m.dialog_id=hydration_jobs.dialog_id "
+            "AND m.message_id=hydration_jobs.message_id AND m.rich_message IS NULL AND NOT "
+            + _RICH_AUTOMATIC_DATE_SQL
+            + ")",
+            cleanup_examined,
+        )
+        state["cleanup_cursor"] = list(cleanup_examined[-1]) if cleanup_examined else cleanup_cursor
+        state["cleanup_done"] = len(cleanup_rows) < max_jobs
+        conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(state)),
+        )
+        if not state["cleanup_done"]:
+            return True
     if state["done"]:
         return False
     cursor = _rich_repair_cursor(state["cursor"])
     rows = cast(
         list[_RepairRow],
         conn.execute(
-            "SELECT sent_at,dialog_id,message_id FROM messages INDEXED BY idx_messages_rich_unknown "
-            "WHERE rich_message IS NULL AND is_deleted=0 AND (sent_at,dialog_id,message_id) < (?,?,?) "
-            "ORDER BY sent_at DESC,dialog_id DESC,message_id DESC LIMIT ?",
+            "SELECT m.sent_at,m.dialog_id,m.message_id FROM messages m INDEXED BY idx_messages_rich_unknown "
+            "WHERE m.rich_message IS NULL AND m.is_deleted=0 "
+            "AND (m.sent_at,m.dialog_id,m.message_id) < (?,?,?) "
+            "ORDER BY m.sent_at DESC,m.dialog_id DESC,m.message_id DESC LIMIT ?",
             (*cursor, max_jobs + 1),
         ).fetchall(),
     )
@@ -235,10 +277,10 @@ def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: 
         examined,
         kind=RICH_COMPOSITION_KIND,
         due_at=due_at,
-        eligibility="m.is_deleted=0 AND m.rich_message IS NULL",
+        eligibility="m.is_deleted=0 AND m.rich_message IS NULL AND " + _RICH_AUTOMATIC_DATE_SQL,
     )
     has_more = len(rows) > max_jobs
-    state = {"cursor": tuple(examined[-1]) if examined else state["cursor"], "done": not has_more}
+    state.update(cursor=tuple(examined[-1]) if examined else state["cursor"], done=not has_more)
     conn.execute(
         "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, json.dumps(state)),
@@ -253,15 +295,18 @@ def rich_composition_repair_revision(conn: sqlite3.Connection) -> str | None:
         conn.execute("SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'").fetchone(),
     )
     state = {"cursor": None, "done": False} if row is None else cast(dict[str, object], json.loads(row[0]))
+    if not state.get("cleanup_done", False):
+        return "cleanup:" + repr(state.get("cleanup_cursor"))
     if state["done"]:
         return None
     cursor = _rich_repair_cursor(state["cursor"])
     candidate = cast(
         tuple[int, int, int] | None,
         conn.execute(
-            "SELECT sent_at,dialog_id,message_id FROM messages INDEXED BY idx_messages_rich_unknown "
-            "WHERE rich_message IS NULL AND is_deleted=0 AND (sent_at,dialog_id,message_id) < (?,?,?) "
-            "ORDER BY sent_at DESC,dialog_id DESC,message_id DESC LIMIT 1",
+            "SELECT m.sent_at,m.dialog_id,m.message_id FROM messages m INDEXED BY idx_messages_rich_unknown "
+            "WHERE m.rich_message IS NULL AND m.is_deleted=0 "
+            "AND (m.sent_at,m.dialog_id,m.message_id) < (?,?,?) "
+            "ORDER BY m.sent_at DESC,m.dialog_id DESC,m.message_id DESC LIMIT 1",
             cursor,
         ).fetchone(),
     )

@@ -20,7 +20,8 @@ def queue_snapshots(conn: sqlite3.Connection, now: int, *, paused: bool) -> list
         tuple[str] | None,
         conn.execute("SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'").fetchone(),
     )
-    scan_complete = cast(dict[str, object], json.loads(row[0])).get("done") is True if row else False
+    state = cast(dict[str, object], json.loads(row[0])) if row else {}
+    scan_complete = state.get("done") is True and state.get("cleanup_done") is True
     result: list[dict[str, object]] = []
     for kind in KINDS:
         group = groups.get(kind)
