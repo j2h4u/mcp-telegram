@@ -224,6 +224,51 @@ def _rich_repair_cursor(value: object) -> tuple[int, ...]:
     return tuple(value)
 
 
+def rich_composition_cleanup_pending(conn: sqlite3.Connection) -> bool:
+    """Return whether the local queue scope still needs reconciliation."""
+    row = cast(
+        tuple[str] | None,
+        conn.execute("SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'").fetchone(),
+    )
+    return row is None or cast(dict[str, object], json.loads(row[0])).get("cleanup_done") is not True
+
+
+def cleanup_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, max_jobs: int) -> bool:
+    """Remove one bounded page of obsolete historical jobs in the caller transaction."""
+    if max_jobs <= 0:
+        return False
+    key = "rich_composition_hydration_cursor"
+    stored = cast(tuple[str] | None, conn.execute("SELECT value FROM daemon_state WHERE key=?", (key,)).fetchone())
+    state: dict[str, object] = {"cursor": None, "done": False} if stored is None else json.loads(stored[0])
+    if state.get("cleanup_done", False):
+        return False
+    cleanup_cursor = cast(list[int], state.get("cleanup_cursor") or [-9223372036854775808, -9223372036854775808])
+    cleanup_rows = cast(
+        list[tuple[int, int]],
+        conn.execute(
+            "SELECT dialog_id,message_id FROM hydration_jobs WHERE kind='rich_composition' "
+            "AND (dialog_id,message_id) > (?,?) ORDER BY dialog_id,message_id LIMIT ?",
+            (*cleanup_cursor, max_jobs),
+        ).fetchall(),
+    )
+    cleanup_examined = cleanup_rows
+    conn.executemany(
+        "DELETE FROM hydration_jobs WHERE kind='rich_composition' AND priority=0 AND dialog_id=? AND message_id=? "
+        "AND EXISTS (SELECT 1 FROM messages m WHERE m.dialog_id=hydration_jobs.dialog_id "
+        "AND m.message_id=hydration_jobs.message_id AND m.rich_message IS NULL AND NOT "
+        + _RICH_AUTOMATIC_DATE_SQL
+        + ")",
+        cleanup_examined,
+    )
+    state["cleanup_cursor"] = list(cleanup_examined[-1]) if cleanup_examined else cleanup_cursor
+    state["cleanup_done"] = len(cleanup_rows) < max_jobs
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, json.dumps(state)),
+    )
+    return not state["cleanup_done"]
+
+
 def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: int, max_jobs: int) -> bool:
     """Commit a bounded historical scan and its queue entries in the caller's transaction."""
     if max_jobs <= 0:
@@ -232,32 +277,7 @@ def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: 
     stored = cast(tuple[str] | None, conn.execute("SELECT value FROM daemon_state WHERE key=?", (key,)).fetchone())
     state: dict[str, object] = {"cursor": None, "done": False} if stored is None else json.loads(stored[0])
     if not state.get("cleanup_done", False):
-        cleanup_cursor = cast(list[int], state.get("cleanup_cursor") or [-9223372036854775808, -9223372036854775808])
-        cleanup_rows = cast(
-            list[tuple[int, int]],
-            conn.execute(
-                "SELECT dialog_id,message_id FROM hydration_jobs WHERE kind='rich_composition' "
-                "AND (dialog_id,message_id) > (?,?) ORDER BY dialog_id,message_id LIMIT ?",
-                (*cleanup_cursor, max_jobs),
-            ).fetchall(),
-        )
-        cleanup_examined = cleanup_rows
-        conn.executemany(
-            "DELETE FROM hydration_jobs WHERE kind='rich_composition' AND priority=0 AND dialog_id=? AND message_id=? "
-            "AND EXISTS (SELECT 1 FROM messages m WHERE m.dialog_id=hydration_jobs.dialog_id "
-            "AND m.message_id=hydration_jobs.message_id AND m.rich_message IS NULL AND NOT "
-            + _RICH_AUTOMATIC_DATE_SQL
-            + ")",
-            cleanup_examined,
-        )
-        state["cleanup_cursor"] = list(cleanup_examined[-1]) if cleanup_examined else cleanup_cursor
-        state["cleanup_done"] = len(cleanup_rows) < max_jobs
-        conn.execute(
-            "INSERT INTO daemon_state(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, json.dumps(state)),
-        )
-        if not state["cleanup_done"]:
-            return True
+        return False
     if state["done"]:
         return False
     cursor = _rich_repair_cursor(state["cursor"])
@@ -296,7 +316,7 @@ def rich_composition_repair_revision(conn: sqlite3.Connection) -> str | None:
     )
     state = {"cursor": None, "done": False} if row is None else cast(dict[str, object], json.loads(row[0]))
     if not state.get("cleanup_done", False):
-        return "cleanup:" + repr(state.get("cleanup_cursor"))
+        return None
     if state["done"]:
         return None
     cursor = _rich_repair_cursor(state["cursor"])

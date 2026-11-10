@@ -133,7 +133,10 @@ from .message_images.contracts import ImageScope
 from .message_images.service import MessageImageService
 from .message_images.worker import MessageImageWorker
 from .messages.sqlite_bundle import persist_received_messages
-from .messages.sqlite_hydration_jobs import reconcile_fact_hydration_jobs_for_dialog
+from .messages.sqlite_hydration_jobs import (
+    cleanup_rich_composition_hydration_jobs,
+    reconcile_fact_hydration_jobs_for_dialog,
+)
 from .messages.telegram_adapter import extract_received_messages
 from .models import DialogType
 from .native_write_fence import NativeWriteDomain, NativeWriteDomainOwner
@@ -1105,6 +1108,28 @@ async def _reconcile_initial_profile_history(ctx: _SyncMainContext) -> None:
         if not await ctx.api_server._get_entity_info_service().reconcile_history_profiles():
             return
         await asyncio.sleep(0)
+
+
+async def _cleanup_rich_history(ctx: _SyncMainContext, account_id: int) -> None:
+    def cleanup_page(conn: sqlite3.Connection) -> bool:
+        with write_transaction(conn):
+            if bound_profile_account(conn) != account_id:
+                return False
+            return cleanup_rich_composition_hydration_jobs(
+                conn, max_jobs=ctx.scheduling.fact_hydration.max_jobs_per_cycle
+            )
+
+    while not ctx.shutdown_event.is_set():
+        if not await ctx.writer.run(cleanup_page):
+            if ctx.coordinator is not None:
+                ctx.coordinator.offer(DemandKind.BACKFILL_HYDRATION_BATCH)
+            return
+        await asyncio.sleep(0)
+
+
+def _start_rich_history_cleanup(ctx: _SyncMainContext) -> None:
+    assert ctx.api_server.self_id is not None
+    _create_tracked_task(ctx, _cleanup_rich_history(ctx, ctx.api_server.self_id), name="rich_history_cleanup")
 
 
 def _create_tracked_task(
@@ -2976,6 +3001,7 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
         )
 
         await _prime_runtime(ctx)
+        _start_rich_history_cleanup(ctx)
         _offer_startup_demands(ctx)
         await _run_daemon_lifetime(ctx)
     except BaseException as exc:

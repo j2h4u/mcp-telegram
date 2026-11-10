@@ -46,6 +46,10 @@ async def test_rich_repair_persists_cursor_through_real_writer(tmp_path: Path) -
         with write_transaction(db):
             db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
             db.execute("INSERT INTO full_history_enrollment VALUES (1,1,1)")
+            db.execute(
+                "INSERT INTO daemon_state(key,value) VALUES('rich_composition_hydration_cursor',?)",
+                ('{"cursor":null,"done":false,"cleanup_done":true}',),
+            )
             db.executemany(
                 "INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,?,1777593600)", [(1,), (2,), (3,)]
             )
