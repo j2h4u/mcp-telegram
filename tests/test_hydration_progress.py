@@ -53,7 +53,7 @@ def test_snapshot_to_summary_with_narrow_window(tmp_path: Path) -> None:
         with write_transaction(conn):
             conn.execute(
                 "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('rich_composition_hydration_cursor', ?)",
-                (json.dumps({"done": True}),),
+                (json.dumps({"done": True, "cleanup_done": True}),),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO daemon_state(key,value) VALUES ('runtime_observations_history_started_at_ms', ?)",
@@ -145,3 +145,43 @@ async def test_lifetime_records_snapshots_every_five_minutes(tmp_path: Path, mon
         conn.close()
     assert len(captured) == 6
     assert [event["observed_at_ms"] for event in captured] == [310000] * 3 + [610000] * 3
+
+
+def test_estimate_waits_for_complete_scope_and_fresh_samples(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = _open_sync_db(path)
+    try:
+        conn.execute(
+            "INSERT INTO daemon_state(key,value) VALUES ('rich_composition_hydration_cursor', ?)",
+            (json.dumps({"done": True, "cleanup_done": False}),),
+        )
+        incomplete = queue_snapshots(conn, 0, paused=False)[0]
+        assert incomplete["scan_complete"] is False
+        rows = [
+            {
+                "observed_at_ms": i * 300_000,
+                "runtime_instance_id": "one",
+                "payload": {**incomplete, "active": 100 - i * 10},
+            }
+            for i in range(7)
+        ]
+        assert "incomplete" in clearance_estimate(rows, 1_800_000, None)
+        conn.execute(
+            "UPDATE daemon_state SET value=? WHERE key='rich_composition_hydration_cursor'",
+            (json.dumps({"done": True, "cleanup_done": True}),),
+        )
+        complete = queue_snapshots(conn, 0, paused=False)[0]
+        assert complete["scan_complete"] is True
+        rows += [
+            {
+                "observed_at_ms": 1_800_000 + i * 300_000,
+                "runtime_instance_id": "one",
+                "payload": {**complete, "active": 40 - i},
+            }
+            for i in range(1, 8)
+        ]
+        assert "incomplete" in clearance_estimate(rows[:-1], 3_600_000, None)
+        assert "conditional on net drain" in clearance_estimate(rows, 3_900_000, None)
+    finally:
+        conn.close()

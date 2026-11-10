@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import threading
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -45,7 +46,9 @@ async def test_rich_repair_persists_cursor_through_real_writer(tmp_path: Path) -
         with write_transaction(db):
             db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
             db.execute("INSERT INTO full_history_enrollment VALUES (1,1,1)")
-            db.executemany("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,?,1)", [(1,), (2,), (3,)])
+            db.executemany(
+                "INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (1,?,1777593600)", [(1,), (2,), (3,)]
+            )
 
     try:
         await writer.run(seed)
@@ -71,9 +74,15 @@ async def test_rich_repair_persists_cursor_through_real_writer(tmp_path: Path) -
         outcome = await adapter.run_slice(RpcAttemptBudget(3, selected=status.selected))
         assert outcome.kind is SliceOutcomeKind.PROGRESSED
         assert conn.execute("SELECT message_id FROM hydration_jobs ORDER BY message_id").fetchall() == [(2,), (3,)]
-        assert conn.execute(
-            "SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'"
-        ).fetchone() == ('{"cursor": [1, 1, 2], "done": false}',)
+        state = cast(
+            tuple[str] | None,
+            conn.execute("SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'").fetchone(),
+        )
+        assert state is not None
+        import json
+
+        assert json.loads(state[0])["cursor"] == [1777593600, 1, 2]
+        assert json.loads(state[0])["done"] is False
         jobs = worker._queue.due_jobs(100, 2, kind="rich_composition", priority=HydrationPriority.BACKFILL)
         status = adapter.status(100, excluded=frozenset(adapter._revision(job) for job in jobs))
         assert status is not None and status.selected is not None
