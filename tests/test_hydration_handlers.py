@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.peer_access import current_peer_target
 from mcp_telegram.reactions.contracts import ReactionAggregateSource
 from mcp_telegram.reactions.persistence import allocate_observation_boundary
+from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.sync_transactions import write_transaction
 from mcp_telegram.telegram_demand import RpcAttemptBudget, RpcReadTimeoutError
@@ -839,9 +841,11 @@ def test_media_apply_marks_missing_and_invalid_results_terminal(db: sqlite3.Conn
     assert missing.drop_observations[0].reason == "missing_response"
     assert invalid.dropped == 1
     assert invalid.drop_observations[0].reason == "invalid_result"
-    assert db.execute("SELECT terminal, last_outcome FROM hydration_jobs ORDER BY message_id").fetchall() == [
-        (1, "terminal_error"),
-        (1, "terminal_error"),
+    assert db.execute(
+        "SELECT terminal, last_outcome, last_error_code FROM hydration_jobs ORDER BY message_id"
+    ).fetchall() == [
+        (1, "terminal_error", "missing_response"),
+        (1, "terminal_error", "invalid_result"),
     ]
 
 
@@ -1132,3 +1136,168 @@ async def test_todo_delivered_during_refresh_fences_late_snapshot_and_indexes_re
         await worker._process_batch(handler, queued, 30)
     assert db.execute("SELECT text FROM messages WHERE message_id=1").fetchone() == ("fresh checklist",)
     assert db.execute("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'fresh'").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["start", "request", "account", "apply", "failure", "flood"])
+async def test_cancelled_hydration_settles_owned_writer_transaction(  # noqa: PLR0915
+    db: sqlite3.Connection, phase: str
+) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="voice")
+    job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
+    db.commit()
+    database_entry = cast(tuple[int, str, str], db.execute("PRAGMA database_list").fetchone())
+    path = Path(database_entry[2])
+    writer = await SQLiteWriter.open(path)
+    entered = threading.Event()
+    release = threading.Event()
+    handler = TranscriptionHydrationHandler(recheck_delay_seconds=30)
+    worker = MessageFactHydrationWorker(
+        object(),
+        db,
+        asyncio.Event(),
+        writer=writer,
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        profile_owner_account_id=42,
+        clock=lambda: 100.0,
+    )
+    budget = RpcAttemptBudget(limit=2)
+    original_start = worker._start_batch
+    original_apply = worker._apply_batch_result
+    original_error = worker._handle_batch_error
+
+    def pause(callback: object, *args: object, **kwargs: object) -> object:
+        entered.set()
+        assert release.wait(10)
+        return callback(*args, **kwargs)  # type: ignore[operator]
+
+    async def request(*args: object, **kwargs: object) -> object:
+        if phase in {"request", "account"}:
+            if phase == "account":
+                db.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+                db.commit()
+            entered.set()
+            await asyncio.Event().wait()
+        if phase == "failure":
+            raise ValueError("private text")
+        if phase == "flood":
+            budget.debit()
+            raise TelegramRpcThrottled(retry_after_seconds=17)
+        return SimpleNamespace(text="speech", transcription_id=7)
+
+    try:
+        with (
+            patch.object(worker, "_request_batch", side_effect=request),
+            patch.object(
+                worker,
+                "_start_batch",
+                side_effect=lambda *a, **k: (
+                    pause(original_start, *a, **k) if phase == "start" else original_start(*a, **k)
+                ),
+            ),
+            patch.object(
+                worker,
+                "_apply_batch_result",
+                side_effect=lambda *a, **k: (
+                    pause(original_apply, *a, **k) if phase == "apply" else original_apply(*a, **k)
+                ),
+            ),
+            patch.object(
+                worker,
+                "_handle_batch_error",
+                side_effect=lambda *a, **k: (
+                    pause(original_error, *a, **k) if phase in {"failure", "flood"} else original_error(*a, **k)
+                ),
+            ),
+        ):
+            task = asyncio.create_task(worker._process_batch(handler, [job], 100, attempt_budget=budget))
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        row = cast(
+            tuple[object, ...] | None,
+            db.execute("SELECT attempts, last_outcome, last_error_code FROM hydration_jobs").fetchone(),
+        )
+        if phase in {"start", "request"}:
+            assert row == (0, "interrupted", None)
+            reopened = _open_sync_db(path)
+            try:
+                assert reopened.execute("SELECT attempts,last_outcome FROM hydration_jobs").fetchone() == (
+                    0,
+                    "interrupted",
+                )
+            finally:
+                reopened.close()
+            with patch.object(
+                worker, "_request_batch", return_value=SimpleNamespace(text="speech", transcription_id=7)
+            ):
+                await worker._process_batch(handler, [job], 100)
+            assert db.execute("SELECT text FROM message_transcriptions").fetchone() == ("speech",)
+        elif phase == "account":
+            assert row == (1, "processing", None)
+        elif phase == "failure":
+            assert row == (1, "temporary_failure", "ValueError")
+        elif phase == "flood":
+            assert row == (1, "temporary_failure", "TelegramRpcThrottled")
+        else:
+            assert row is None
+            assert db.execute("SELECT text FROM message_transcriptions WHERE message_id=1").fetchone() == ("speech",)
+    finally:
+        release.set()
+        await writer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_current_transient_failures_exhaust_attempt_budget(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="voice")
+    job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
+    handler = TranscriptionHydrationHandler(recheck_delay_seconds=30)
+    worker = MessageFactHydrationWorker(
+        object(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(handler,),
+        interval_seconds=1,
+        max_requests_per_cycle=2,
+        max_jobs_per_cycle=1,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        clock=lambda: 100.0,
+    )
+    with patch.object(worker, "_request_batch", side_effect=ValueError("private")):
+        for attempt in range(1, 4):
+            await worker._process_batch(handler, [job], 100)
+            assert db.execute("SELECT attempts,terminal,last_error_code FROM hydration_jobs").fetchone() == (
+                attempt,
+                int(attempt == 3),
+                "ValueError",
+            )
+
+
+def test_invalid_transcription_result_persists_safe_reason(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    _seed_message(db, 1, media_kind="voice")
+    job = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 1)
+    with write_transaction(db):
+        result = TranscriptionHydrationHandler(recheck_delay_seconds=30).apply(
+            db, HydrationQueueRepository(db), [job], None, now=100
+        )
+    assert result.dropped == 1
+    assert db.execute("SELECT last_error_code FROM hydration_jobs").fetchone() == ("invalid_result",)
+    assert db.execute("SELECT COUNT(*) FROM messages WHERE is_deleted=0").fetchone() == (1,)

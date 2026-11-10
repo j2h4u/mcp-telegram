@@ -14,6 +14,7 @@ from mcp_telegram.runtime_observations import (
     _plan_runtime_observations_batch,
     _prune_runtime_observations_batch,
     encode_payload,
+    initialize_runtime_observation_coverage,
     prune_runtime_observations,
     record_runtime_observation,
 )
@@ -54,8 +55,77 @@ def test_runtime_event_pruning_applies_ttl_and_cap(tmp_path: Path) -> None:
         assert conn.execute(
             "SELECT value FROM daemon_state WHERE key='runtime_observations_last_cap_truncation_ms'"
         ).fetchone() == ("10000",)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='runtime_observations_cap_deleted_through_ms'"
+        ).fetchone() == ("9000",)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("previous_cap", [None, "8000"])
+def test_coverage_initialization_is_one_time(tmp_path: Path, previous_cap: str | None) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(_open_sync_db(path)) as conn:
+        if previous_cap is not None:
+            conn.execute(
+                "INSERT INTO daemon_state(key, value) VALUES ('runtime_observations_last_cap_truncation_ms', ?)",
+                (previous_cap,),
+            )
+        initialize_runtime_observation_coverage(conn, now_ms=10_000)
+        conn.execute(
+            "INSERT OR REPLACE INTO daemon_state(key, value) VALUES ('runtime_observations_last_cap_truncation_ms', '12000')"
+        )
+        initialize_runtime_observation_coverage(conn, now_ms=12_000)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='runtime_observations_historical_unknown_through_ms'"
+        ).fetchone() == ("10000",)
+
+
+def test_coverage_initialization_without_prior_history(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(_open_sync_db(path)) as conn:
+        conn.execute("DELETE FROM daemon_state WHERE key='runtime_observations_history_started_at_ms'")
+        initialize_runtime_observation_coverage(conn, now_ms=10_000)
+        assert (
+            conn.execute(
+                "SELECT value FROM daemon_state WHERE key='runtime_observations_historical_unknown_through_ms'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_cap_coverage_uses_deleted_event_times_and_rolls_back(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(_open_sync_db(path)) as conn:
+        for observed_at in (9_500, 8_000, 9_000, 8_500):
+            record_runtime_observation(conn, kind="mcp.call", observed_at_ms=observed_at)
+        conn.commit()
+        plan = _plan_runtime_observations_batch(conn, ttl_seconds=20, row_cap=2, now_ms=10_000)
+        with pytest.raises(RuntimeError), write_transaction(conn):
+            _apply_runtime_observations_plan(conn, plan, now_ms=10_000)
+            raise RuntimeError("rollback")
+        assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone() == (4,)
+        assert (
+            conn.execute(
+                "SELECT value FROM daemon_state WHERE key='runtime_observations_cap_deleted_through_ms'"
+            ).fetchone()
+            is None
+        )
+        with write_transaction(conn):
+            _apply_runtime_observations_plan(conn, plan, now_ms=10_000)
+            _apply_runtime_observations_plan(conn, plan, now_ms=11_000)
+        record_runtime_observation(conn, kind="mcp.call", observed_at_ms=8_200)
+        conn.commit()
+        prune_runtime_observations(conn, ttl_seconds=20, row_cap=1, now_ms=12_000)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='runtime_observations_cap_deleted_through_ms'"
+        ).fetchone() == ("9500",)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='runtime_observations_last_cap_truncation_ms'"
+        ).fetchone() == ("12000",)
 
 
 def test_runtime_event_pruning_batches_ttl_and_cap_without_overdeleting(tmp_path: Path) -> None:
@@ -126,6 +196,41 @@ def test_runtime_event_pruning_does_not_mark_ttl_only_cleanup_as_cap_truncation(
         )
     finally:
         conn.close()
+
+
+def test_ttl_coverage_tracks_deleted_events_atomically(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    with closing(_open_sync_db(path)) as conn:
+        for observed_at in (1_000, 4_000, 8_000):
+            record_runtime_observation(conn, kind="mcp.call", observed_at_ms=observed_at)
+        conn.commit()
+        plan = _plan_runtime_observations_batch(conn, ttl_seconds=5, row_cap=100, now_ms=10_000)
+        with pytest.raises(RuntimeError), write_transaction(conn):
+            _apply_runtime_observations_plan(conn, plan, now_ms=10_000)
+            raise RuntimeError("rollback")
+        assert conn.execute("SELECT COUNT(*) FROM runtime_observations").fetchone() == (3,)
+        assert (
+            conn.execute(
+                "SELECT value FROM daemon_state WHERE key='runtime_observations_ttl_deleted_through_ms'"
+            ).fetchone()
+            is None
+        )
+        with write_transaction(conn):
+            _apply_runtime_observations_plan(conn, plan, now_ms=10_000)
+            _apply_runtime_observations_plan(conn, plan, now_ms=11_000)
+        record_runtime_observation(conn, kind="mcp.call", observed_at_ms=2_000)
+        conn.commit()
+        prune_runtime_observations(conn, ttl_seconds=5, row_cap=100, now_ms=10_000)
+        assert conn.execute(
+            "SELECT value FROM daemon_state WHERE key='runtime_observations_ttl_deleted_through_ms'"
+        ).fetchone() == ("4000",)
+        assert (
+            conn.execute(
+                "SELECT value FROM daemon_state WHERE key='runtime_observations_last_cap_truncation_ms'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_runtime_event_prune_planning_does_not_block_competing_writer(

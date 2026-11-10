@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import cast
 
 from .daemon import read_operator_summary_snapshot
+from .hydration_progress import KINDS, clearance_estimate, progress_line
 from .request_timing import (
     TIMING_NESTED_LEAF_PHASES,
     TIMING_NESTED_PARENTS,
@@ -124,8 +125,8 @@ def _as_int(value: object) -> int:
     return int(cast(float | int | str, value))
 
 
-def _load_snapshot(db_path: Path, since_ms: int) -> SummarySnapshot:
-    snapshot_result = cast(tuple[object, ...], read_operator_summary_snapshot(db_path, since_ms))
+def _load_snapshot(db_path: Path, since_ms: int, now_ms: int) -> SummarySnapshot:
+    snapshot_result = cast(tuple[object, ...], read_operator_summary_snapshot(db_path, since_ms, now_ms=now_ms))
     observations = cast(list[Observation], snapshot_result[0])
     history_row = cast(dict[str, object] | None, snapshot_result[1])
     dialog_rows = cast(list[dict[str, object]], snapshot_result[2])
@@ -619,17 +620,55 @@ def _demand_kind_lines(summary: DemandSummary, labels: tuple[str, ...]) -> list[
     return lines
 
 
+def _hydration_lines(snapshot: SummarySnapshot, now_ms: int) -> list[str]:
+    markers = snapshot.coverage_markers
+    boundaries = [
+        markers.get(key)
+        for key in (
+            "runtime_observations_cap_deleted_through_ms",
+            "runtime_observations_ttl_deleted_through_ms",
+            "runtime_observations_historical_unknown_through_ms",
+            "last_loss_ms",
+        )
+    ]
+    boundary = max((_as_int(value) for value in boundaries if value is not None), default=None)
+    if snapshot.history_started_ms is not None:
+        boundary = max(boundary or 0, snapshot.history_started_ms - 1)
+    rows = cast(list[Observation], markers.get("hydration_rows", []))
+    return ["Hydration queue:", *(_hydration_kind_line(rows, kind, now_ms, boundary) for kind in KINDS)]
+
+
+def _hydration_kind_line(rows: list[Observation], kind: str, now_ms: int, boundary: int | None) -> str:
+    samples: list[Observation] = []
+    for row in rows:
+        payload = _timing_payload(row)
+        if payload is not None and payload.get("kind") == kind:
+            samples.append({**row, "payload": payload})
+    if not samples:
+        return f"  {kind}: no samples"
+    payload = cast(dict[str, object], samples[-1]["payload"])
+    observed_ms = _as_int(samples[-1]["observed_at_ms"])
+    return (
+        "  "
+        + progress_line(payload, clearance_estimate(samples, now_ms, boundary))
+        + f"; sampled {_utc(observed_ms / 1000)}, age {(now_ms - observed_ms) / 60000:.1f}min"
+    )
+
+
 def _coverage_complete(snapshot: SummarySnapshot, since_ms: int) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if snapshot.history_started_ms is None or snapshot.history_started_ms > since_ms:
         reasons.append("history boundary")
     markers = snapshot.coverage_markers
-    cap_ms = markers.get("last_cap_truncation_ms")
-    if cap_ms is not None and _as_int(cap_ms) >= since_ms:
-        reasons.append("retention cap truncation")
-    gap_ms = markers.get("telemetry_gap_ms")
-    if gap_ms is not None and _as_int(gap_ms) >= since_ms:
-        reasons.append("telemetry gap")
+    for key, reason in (
+        ("runtime_observations_cap_deleted_through_ms", "retention cap truncation"),
+        ("runtime_observations_historical_unknown_through_ms", "historical retention coverage unknown"),
+        ("runtime_observations_ttl_deleted_through_ms", "retention TTL truncation"),
+        ("telemetry_gap_ms", "telemetry gap"),
+    ):
+        marker = markers.get(key)
+        if marker is not None and _as_int(marker) >= since_ms:
+            reasons.append(reason)
     if markers.get("loss_observed") or markers.get("queue_full_drops") or markers.get("writer_failures"):
         reasons.append("telemetry loss")
     return not reasons, reasons
@@ -669,7 +708,7 @@ def build_operator_summary(  # noqa: PLR0914
     """Build a content-free operational report from one read-only DB connection."""
     effective_now = time.time() if now is None else now
     since_ms = int((effective_now - since_seconds) * 1000)
-    snapshot = _load_snapshot(db_path, since_ms)
+    snapshot = _load_snapshot(db_path, since_ms, int(effective_now * 1000))
     observations = snapshot.observations
     window_complete, coverage_reasons = _coverage_complete(snapshot, since_ms)
     last_ms = max((_as_int(row["observed_at_ms"]) for row in observations), default=None)
@@ -688,6 +727,7 @@ def build_operator_summary(  # noqa: PLR0914
         *_rpc_lines(rpc_count, rpc_cancelled, rpc_sources, rpc_buckets),
         *_linked_chat_rpc_lines(observations),
         *_demand_lines(demand_summary),
+        *_hydration_lines(snapshot, int(effective_now * 1000)),
     ]
     sync_counts = _sync_counts(observations)
     lines.append("Sync observations:")

@@ -660,8 +660,8 @@ class MessageFactHydrationWorker:
         attempt_budget: RpcAttemptBudget | None = None,
     ) -> _BatchOutcome:
         scope = self._capture_media_scope(handler)
-        started, preflight_observations, observation_order, reaction_boundary = await self._writer.run(
-            lambda conn: self._start_batch(conn, handler, batch, scope=scope)
+        started, preflight_observations, observation_order, reaction_boundary = await self._start_owned_batch(
+            handler, batch, scope
         )
         if not started:
             self._log_drops(batch, preflight_observations)
@@ -675,11 +675,104 @@ class MessageFactHydrationWorker:
         result: object = None
         try:
             result = await self._request_batch(handler, started, attempt_budget=attempt_budget)
+        except asyncio.CancelledError:
+            try:
+                await self._refund_interrupted(started, scope)
+            except Exception as exc:  # noqa: BLE001 - settlement errors must not suppress cancellation
+                logger.warning("message_fact_hydration interruption_failed error_type=%s", type(exc).__name__)
+            raise
         except Exception as exc:  # noqa: BLE001 - route Telegram and admission failures by their existing policies
             failure = exc
         finally:
             effective_now = int(self._clock())
 
+        settlement = asyncio.create_task(
+            self._settle_batch(
+                handler,
+                batch,
+                started,
+                preflight_observations,
+                result,
+                failure,
+                effective_now,
+                observation_order,
+                attempt_budget,
+                attempts_before_request,
+                owner,
+                scope,
+                reaction_boundary,
+            )
+        )
+        return await self._await_settlement(settlement)
+
+    async def _await_settlement(self, settlement: asyncio.Task[_BatchOutcome]) -> _BatchOutcome:
+        try:
+            return await asyncio.shield(settlement)
+        except asyncio.CancelledError:
+            try:
+                await self._finish_cancelled_task(settlement)
+            except Exception as exc:  # noqa: BLE001 - settlement errors must not suppress cancellation
+                logger.warning("message_fact_hydration settlement_failed error_type=%s", type(exc).__name__)
+            raise
+
+    async def _start_owned_batch(
+        self, handler: HydrationHandler, batch: Sequence[HydrationJob], scope: ScopeToken | None
+    ) -> tuple[
+        list[HydrationJob], tuple[HydrationDropObservation, ...], int | None, ReactionObservationBoundary | None
+    ]:
+        start = asyncio.create_task(self._writer.run(lambda conn: self._start_batch(conn, handler, batch, scope=scope)))
+        try:
+            started, preflight_observations, observation_order, reaction_boundary = await asyncio.shield(start)
+        except asyncio.CancelledError:
+            try:
+                started, _, _, _ = await self._finish_cancelled_task(start)
+                await self._refund_interrupted(started, scope)
+            except Exception as exc:  # noqa: BLE001 - settlement errors must not suppress cancellation
+                logger.warning("message_fact_hydration interruption_failed error_type=%s", type(exc).__name__)
+            raise
+        return started, preflight_observations, observation_order, reaction_boundary
+
+    @staticmethod
+    async def _finish_cancelled_task[T](task: asyncio.Task[T]) -> T:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
+
+    async def _refund_interrupted(self, jobs: Sequence[HydrationJob], scope: ScopeToken | None) -> None:
+        def refund(conn: sqlite3.Connection) -> None:
+            with write_transaction(conn):
+                if (
+                    self._profile_owner_account_id is not None
+                    and bound_profile_account(conn) != self._profile_owner_account_id
+                ):
+                    return
+                if scope is not None and not self._media_scope_current(conn, scope):
+                    return
+                for job in jobs:
+                    HydrationQueueRepository(conn).requeue_interrupted(job)
+
+        task = asyncio.create_task(self._writer.run(refund))
+        await self._finish_cancelled_task(task)
+
+    async def _settle_batch(  # noqa: PLR0913, PLR0917 - settle the complete owned request
+        self,
+        handler: HydrationHandler,
+        batch: Sequence[HydrationJob],
+        started: Sequence[HydrationJob],
+        preflight_observations: Sequence[HydrationDropObservation],
+        result: object,
+        failure: Exception | None,
+        effective_now: int,
+        observation_order: int,
+        attempt_budget: RpcAttemptBudget | None,
+        attempts_before_request: int | None,
+        owner: int | None,
+        scope: ScopeToken | None,
+        reaction_boundary: ReactionObservationBoundary | None,
+    ) -> _BatchOutcome:
         if scope is not None and not cast(_ScopeClient, self._client).claim_image_scope(scope):
             raise ReceivedMessageScopeChangedError
 
@@ -1122,6 +1215,17 @@ class MessageFactHydrationWorker:
         scope: ScopeToken | None = None,
     ) -> _BatchOutcome:
         """Preserve domain state, then select coordinator or standalone recovery."""
+        dispatched = (
+            attempt_budget is not None
+            and attempts_before_request is not None
+            and attempt_budget.attempts > attempts_before_request
+        ) or (attempt_budget is None and exc.retry_after_seconds is not None)
+        if dispatched:
+            with write_transaction(conn):
+                self._require_media_scope(conn, scope)
+                for job in self._current_jobs(conn, started, observation_order):
+                    HydrationQueueRepository(conn).reschedule(job, job.due_at, error_code=type(exc).__name__)
+                self._require_media_scope(conn, scope)
         if attempt_budget is not None:
             assert attempts_before_request is not None
             self._handle_coordinator_throttle(
@@ -1292,7 +1396,9 @@ class MessageFactHydrationWorker:
                 current = self._current_jobs(conn, started, observation_order)
                 for job in current:
                     HydrationQueueRepository(conn).mark_terminal(
-                        job, outcome=HydrationOutcome.TERMINAL_ERROR, error_code=descriptor.symbol
+                        job,
+                        outcome=HydrationOutcome.TERMINAL_ERROR,
+                        error_code=descriptor.symbol or descriptor.error_type,
                     )
                 if current and any(job.message_id == batch[0].message_id for job in current):
                     committed_revision = self._revision_for_conn(conn, batch[0])
@@ -1308,11 +1414,16 @@ class MessageFactHydrationWorker:
         with write_transaction(conn):
             self._require_media_scope(conn, scope)
             current = self._current_jobs(conn, started, observation_order)
-            for job in current:
-                HydrationQueueRepository(conn).requeue_not_applied(job, job.due_at)
+            retried, dropped, observations = self._reschedule_or_drop(
+                conn,
+                handler,
+                current,
+                effective_now,
+                outcome=HydrationOutcome.TEMPORARY_FAILURE,
+                error_code=descriptor.symbol or descriptor.error_type,
+            )
             self._require_media_scope(conn, scope)
-        self._log_drops(batch, preflight_observations)
-        self._log_drops(started, self._observations("not_applied", current), descriptor=descriptor)
+        self._log_drops(batch, (*preflight_observations, *observations), descriptor=descriptor)
         logger.warning(
             "message_fact_hydration transient kind=%s dialog_id=%d jobs=%d error_type=%s",
             handler.kind,
@@ -1321,8 +1432,8 @@ class MessageFactHydrationWorker:
             descriptor.error_type,
         )
         return _BatchOutcome(
-            retried=len(current),
-            dropped=len(preflight_observations),
+            retried=retried,
+            dropped=len(preflight_observations) + dropped,
         )
 
     def _finish_applied(  # noqa: PLR0913, PLR0917

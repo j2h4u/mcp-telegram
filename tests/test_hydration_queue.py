@@ -346,3 +346,31 @@ def test_repository_never_commits_callers_transaction(db: sqlite3.Connection) ->
 def test_job_rejects_invalid_boundary_identity(kind: str, dialog_id: int, message_id: int) -> None:
     with pytest.raises(ValueError):
         _job(kind, dialog_id, message_id, 1)
+
+
+@pytest.mark.parametrize("change", ["none", "reschedule", "recreate", "terminal"])
+def test_interrupted_refund_only_owned_lease(db: sqlite3.Connection, change: str) -> None:
+    repository = HydrationQueueRepository(db)
+    job = _job(TRANSCRIPTION_HYDRATION_KIND, 1, 1, 10)
+    with write_savepoint(db):
+        repository.enqueue(job)
+        started = repository.start(job)
+        assert started is not None
+        if change == "reschedule":
+            repository.reschedule(started, 100)
+        elif change == "recreate":
+            repository.remove(started)
+            repository.enqueue(job)
+        elif change == "terminal":
+            repository.mark_terminal(started)
+        before = cast(tuple[object, ...] | None, db.execute("SELECT * FROM hydration_jobs").fetchone())
+        assert repository.requeue_interrupted(started) is (change == "none")
+        if change == "none":
+            assert db.execute("SELECT due_at,attempts,last_outcome FROM hydration_jobs").fetchone() == (
+                10,
+                0,
+                "interrupted",
+            )
+            assert not repository.requeue_interrupted(started)
+        else:
+            assert db.execute("SELECT * FROM hydration_jobs").fetchone() == before

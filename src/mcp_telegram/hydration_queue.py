@@ -30,6 +30,7 @@ class HydrationOutcome(StrEnum):
 
     PROCESSING = "processing"
     NOT_APPLIED = "not_applied"
+    INTERRUPTED = "interrupted"
     TELEGRAM_PENDING = "telegram_pending"
     TEMPORARY_FAILURE = "temporary_failure"
     TERMINAL_ERROR = "terminal_error"
@@ -341,6 +342,13 @@ class HydrationQueueRepository:
 
     def requeue_not_applied(self, job: HydrationJob, due_at: int) -> bool:
         """Refund an obsolete observation only while its started row is unchanged."""
+        return self._refund_lease(job, due_at, HydrationOutcome.NOT_APPLIED)
+
+    def requeue_interrupted(self, job: HydrationJob) -> bool:
+        """Refund a cancelled attempt only while its started row is unchanged."""
+        return self._refund_lease(job, job.due_at, HydrationOutcome.INTERRUPTED)
+
+    def _refund_lease(self, job: HydrationJob, due_at: int, outcome: HydrationOutcome) -> bool:
         require_write_transaction(self._conn)
         cursor = self._conn.execute(
             f"UPDATE {HYDRATION_QUEUE_TABLE} SET attempts = attempts - 1, due_at = ?, "
@@ -349,7 +357,7 @@ class HydrationQueueRepository:
             "AND attempts = ? AND attempts > 0 AND due_at = ? AND last_outcome = ?",
             (
                 due_at,
-                HydrationOutcome.NOT_APPLIED,
+                outcome,
                 *_identity(job),
                 job.attempts,
                 job.due_at,
