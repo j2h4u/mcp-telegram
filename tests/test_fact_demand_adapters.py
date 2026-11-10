@@ -688,20 +688,21 @@ async def test_hydration_finite_throttle_reschedules_and_defers_through_coordina
     observer = _DemandObserver()
     coordinator = _hydration_coordinator(adapter, observer=observer)
 
-    await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
-
-    assert conn.execute(
-        "SELECT due_at, attempts, terminal, last_outcome FROM hydration_jobs WHERE message_id=1"
-    ).fetchone() == (1, 1, 0, "processing")
-    assert observer.events[-1] == {
-        "outcome": "deferred",
-        "demand_kind": DemandKind.LIVE_HYDRATION_BATCH,
-        "actual_attempts": 1,
-        "queue_age_seconds": None,
-        "freshness_debt_seconds": None,
-        "reason": "flood_wait",
-    }
-    conn.close()
+    try:
+        await coordinator._execute_slice(DemandKind.LIVE_HYDRATION_BATCH)
+        assert conn.execute(
+            "SELECT due_at, attempts, terminal, last_outcome, last_error_code FROM hydration_jobs WHERE message_id=1"
+        ).fetchone() == (1, 1, 0, "temporary_failure", "TelegramRpcThrottled")
+        assert observer.events[-1] == {
+            "outcome": "deferred",
+            "demand_kind": DemandKind.LIVE_HYDRATION_BATCH,
+            "actual_attempts": 1,
+            "queue_age_seconds": None,
+            "freshness_debt_seconds": None,
+            "reason": "flood_wait",
+        }
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio
@@ -768,7 +769,7 @@ def _repair_hydration_worker(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("outcome", "expected_due", "expected_attempts"),
-    [("transient", 1, 1), ("admission", 1, 1), ("flood_wait", 1, 2), ("pending", 480, 2)],
+    [("transient", 400, 2), ("admission", 1, 1), ("flood_wait", 1, 2), ("pending", 480, 2)],
 )
 async def test_hydration_reschedules_from_slow_request_completion(
     outcome: str, expected_due: int, expected_attempts: int
