@@ -33,6 +33,7 @@ from .messages.sqlite_hydration_jobs import (
     repair_media_metadata_hydration_jobs,
     repair_rich_composition_hydration_jobs,
     repair_transcription_hydration_jobs,
+    rich_composition_cleanup_pending,
     rich_composition_is_unknown,
     rich_composition_repair_revision,
 )
@@ -303,9 +304,7 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
 
     def status(self, now: float, *, excluded: frozenset[WorkRevision] = frozenset()) -> DemandStatus | None:
         """Return queued work or the next bounded backfill-repair time."""
-        kinds, cleanup = self._repair_kinds(now, excluded)
-        if cleanup is not None:
-            return cleanup
+        kinds = self._status_kinds()
         future_repair: DemandStatus | None = None
         for offset in range(len(kinds)):
             kind = kinds[(self._next_kind + offset) % len(kinds)]
@@ -328,20 +327,14 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
                     return DemandStatus(release_at=float(job.due_at), selected=selected)
         return future_repair
 
-    def _repair_kinds(self, now: float, excluded: frozenset[WorkRevision]) -> tuple[list[str], DemandStatus | None]:
+    def _status_kinds(self) -> list[str]:
         kinds = list(self._worker._handlers)
         if self._priority is HydrationPriority.BACKFILL and RICH_COMPOSITION_KIND in kinds:
-            kinds.append("rich-repair")
-            return kinds, self._ready_cleanup(now, excluded)
-        return kinds, None
-
-    def _ready_cleanup(self, now: float, excluded: frozenset[WorkRevision]) -> DemandStatus | None:
-        revision = rich_composition_repair_revision(self._worker._conn)
-        if revision is None or not revision.startswith("cleanup:"):
-            return None
-        selected = WorkRevision(WorkKey(self.demand_kind, self._account_id, "rich-repair"), revision)
-        status = DemandStatus(release_at=self._worker.next_repair_at, selected=selected)
-        return status if selected not in excluded and status.is_ready(now) else None
+            if rich_composition_cleanup_pending(self._worker._conn):
+                kinds.remove(RICH_COMPOSITION_KIND)
+            else:
+                kinds.append("rich-repair")
+        return kinds
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Seed and run one compatible queue batch within the attempt budget."""

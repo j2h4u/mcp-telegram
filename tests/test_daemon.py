@@ -899,6 +899,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         "task:telegram_demand_coordinator",
         "task:reconnect_catch_up_loop",
         "prime",
+        "task:rich_history_cleanup",
         "offers",
         "lifetime",
         "shutdown",

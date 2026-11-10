@@ -36,7 +36,10 @@ from mcp_telegram.image_authorization import ScopeCell, ScopeToken
 from mcp_telegram.media_hydration import MediaFactHydrationHandler, RichCompositionHydrationHandler
 from mcp_telegram.messages.sqlite_bundle import mark_message_deleted, persist_received_messages
 from mcp_telegram.messages.sqlite_hydration import apply_message_transcription
-from mcp_telegram.messages.sqlite_hydration_jobs import repair_rich_composition_hydration_jobs
+from mcp_telegram.messages.sqlite_hydration_jobs import (
+    cleanup_rich_composition_hydration_jobs,
+    repair_rich_composition_hydration_jobs,
+)
 from mcp_telegram.messages.telegram_adapter import extract_received_messages
 from mcp_telegram.observation_order import allocate_observation_order
 from mcp_telegram.peer_access import current_peer_target
@@ -152,6 +155,10 @@ def test_rich_repair_resumes_bounded_scan_and_skips_ineligible(db: sqlite3.Conne
         _seed_message(db, message_id)
     db.execute("UPDATE messages SET sent_at=1777593600")
     db.execute("UPDATE messages SET is_deleted=1 WHERE message_id=2")
+    db.execute(
+        "INSERT INTO daemon_state(key,value) VALUES('rich_composition_hydration_cursor',?)",
+        ('{"cursor":null,"done":false,"cleanup_done":true}',),
+    )
     db.commit()
     with write_transaction(db):
         assert repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
@@ -173,7 +180,7 @@ def test_rich_repair_resumes_bounded_scan_and_skips_ineligible(db: sqlite3.Conne
 def test_rich_repair_rejects_invalid_saved_cursor(db: sqlite3.Connection) -> None:
     db.execute(
         "INSERT INTO daemon_state(key,value) VALUES('rich_composition_hydration_cursor',?)",
-        ('{"cursor":false,"done":false}',),
+        ('{"cursor":false,"done":false,"cleanup_done":true}',),
     )
     db.commit()
     with pytest.raises(ValueError, match="invalid rich composition repair cursor"), write_transaction(db):
@@ -491,6 +498,10 @@ async def test_empty_queue_repair_demand_seeds_and_finishes_without_idle_writes(
     _seed_dialog(db)
     _seed_message(db, 1)
     db.execute("UPDATE messages SET sent_at=1777593600 WHERE message_id=1")
+    db.execute(
+        "INSERT INTO daemon_state(key,value) VALUES('rich_composition_hydration_cursor',?)",
+        ('{"cursor":null,"done":false,"cleanup_done":true}',),
+    )
     db.commit()
     handler = RichCompositionHydrationHandler(batch_size=1)
     worker = MessageFactHydrationWorker(
@@ -1339,12 +1350,12 @@ def test_rich_history_cutoff_and_bounded_obsolete_cleanup(db: sqlite3.Connection
         for message_id in range(1, 7):
             queue.enqueue(HydrationJob(RICH_COMPOSITION_KIND, 1, message_id, 10, 0, 1, HydrationPriority.BACKFILL))
         db.execute("UPDATE hydration_jobs SET terminal=1 WHERE message_id IN (2,3)")
-    assert rich_composition_repair_revision(db) is not None
+    assert rich_composition_repair_revision(db) is None
     for _ in range(6):
         with write_transaction(db):
-            assert repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
+            assert cleanup_rich_composition_hydration_jobs(db, max_jobs=1)
     with write_transaction(db):
-        assert not repair_rich_composition_hydration_jobs(db, due_at=10, max_jobs=1)
+        assert not cleanup_rich_composition_hydration_jobs(db, max_jobs=1)
     assert db.execute("SELECT message_id,terminal FROM hydration_jobs ORDER BY message_id").fetchall() == [
         (3, 1),
         (4, 0),
@@ -1386,6 +1397,10 @@ def test_rich_scan_pages_raw_history_and_only_enqueues_recent_or_recently_edited
     db.execute("UPDATE messages SET sent_at=1777593600 WHERE message_id=4")
     db.execute("UPDATE messages SET sent_at=1777593599 WHERE message_id=3")
     db.execute("UPDATE messages SET edit_date=1777593600 WHERE message_id=2")
+    db.execute(
+        "INSERT INTO daemon_state(key,value) VALUES('rich_composition_hydration_cursor',?)",
+        ('{"cursor":null,"done":false,"cleanup_done":true}',),
+    )
     db.commit()
     statements: list[str] = []
     db.set_trace_callback(statements.append)
@@ -1535,3 +1550,37 @@ async def test_promotion_before_writer_start_routes_only_through_foreground(db: 
     assert selected is not None and selected.selected is not None
     await foreground.run_slice(RpcAttemptBudget(3, selected=selected.selected))
     assert client.calls == [(TelegramRpcSource.FACT_HYDRATION_LIVE, DemandKind.LIVE_HYDRATION_BATCH)]
+
+
+def test_pending_local_cleanup_holds_only_rich_backfill(db: sqlite3.Connection) -> None:
+    _seed_dialog(db)
+    for message_id in (1, 2, 3):
+        _seed_message(db, message_id)
+    db.commit()
+    with write_transaction(db):
+        queue = HydrationQueueRepository(db)
+        queue.enqueue(HydrationJob(RICH_COMPOSITION_KIND, 1, 1, 1, 0, 1, HydrationPriority.BACKFILL))
+        queue.enqueue(HydrationJob(RICH_COMPOSITION_KIND, 1, 2, 1, 0, 1, HydrationPriority.FOREGROUND))
+        queue.enqueue(HydrationJob(MEDIA_METADATA_KIND, 1, 3, 1, 0, 1, HydrationPriority.BACKFILL))
+    worker = MessageFactHydrationWorker(
+        _ScopeClient(),
+        db,
+        asyncio.Event(),
+        writer=inline_writer(db),
+        handlers=(RichCompositionHydrationHandler(batch_size=1), MediaFactHydrationHandler(batch_size=1)),
+        interval_seconds=60,
+        max_requests_per_cycle=3,
+        max_jobs_per_cycle=2,
+        retry_delay_seconds=1,
+        circuit_retry_seconds=1,
+        max_attempts=3,
+        pause_between_requests_seconds=0,
+        backfill_debt_limit=1,
+        clock=lambda: 100.0,
+    )
+    backfill = FactHydrationDemandAdapter(worker, HydrationPriority.BACKFILL, account_id=42).status(100)
+    foreground = FactHydrationDemandAdapter(worker, HydrationPriority.FOREGROUND, account_id=42).status(100)
+    assert backfill is not None and backfill.selected is not None
+    assert backfill.selected.key.target == "media_metadata:1:3"
+    assert foreground is not None and foreground.selected is not None
+    assert foreground.selected.key.target == "rich_composition:1:2"
