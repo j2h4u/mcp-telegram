@@ -19,6 +19,7 @@ from telethon.network.connection.tcpfull import FullPacketCodec
 from telethon.network.requeststate import RequestState
 from telethon.sessions import MemorySession
 from telethon.tl import functions, types
+from telethon.tl.core import RpcResult, TLMessage
 from telethon.tl.functions import channels, messages
 from telethon.tl.functions.updates import GetStateRequest
 from telethon.tl.tlobject import TLObject
@@ -41,6 +42,7 @@ from mcp_telegram.telegram_demand import (
     RpcAttemptBudget,
     RpcAttemptBudgetExhaustedError,
     RpcAttemptEvidence,
+    RpcReadTimeoutError,
 )
 from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc import (
@@ -343,6 +345,67 @@ async def test_raw_flood_revokes_a_pregranted_write_before_any_receipt_task_runs
     with pytest.raises(FloodWaitError):
         await futures[0]
     assert gate._ensure_safety_ledger().floor_deadline > now[0]
+
+
+async def test_late_flood_after_read_timeout_blocks_pregranted_write(  # noqa: PLR0914 - real gate and wire
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, sink = wire
+    now = [time.monotonic()]
+    monkeypatch.setattr(telegram_rpc, "time", SimpleNamespace(monotonic=lambda: now[0], time=time.time))
+    gate._admission_scheduler._clock = lambda: now[0]
+    kind = DemandKind.DELTA_GAP_FILL
+    selected = WorkRevision(WorkKey(kind, 42, "dialog:11"), "revision")
+    scope = TelegramRpcScope(
+        TelegramRpcSource.DELTA_SYNC,
+        demand_contract(kind).service_class,
+        now[0] + 100,
+        asyncio.current_task(),
+        demand_kind=kind,
+        acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+        attempt_budget=RpcAttemptBudget(2, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+    result = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    first = connection._send_queue.get_nowait()
+    assert sender.write_packet(first, connection._send)
+    now[0] += 2
+    second_result = sender.send_owned(GetStateRequest(), replace(scope, attempt_budget=RpcAttemptBudget(2)))
+    second_state = await sender._send_queue.next_state()
+    await sender._prepare_state(second_state)
+    second = connection._send_queue.get_nowait()
+    entered, release = asyncio.Event(), asyncio.Event()
+    observe = gate.observe_result
+
+    async def hold(owner: object, error: BaseException | None, value: object = None) -> BaseException | None:
+        entered.set()
+        await release.wait()
+        return await observe(owner, error, value)
+
+    monkeypatch.setattr(gate, "observe_result", hold)
+    owner = sender.require_owned(state).owner
+    sender.retire_read_timeout(result, owner)
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        await sender._handle_rpc_result(
+            TLMessage(123, 0, RpcResult(state.msg_id, None, types.RpcError(420, "FLOOD_WAIT_60")))
+        )
+        assert now[0] + 60 == telegram_rpc._COOLDOWN_DEADLINE
+        assert not sender.write_packet(second, connection._send)
+        assert len(sink.frames) == 1
+        release.set()
+        with pytest.raises(RpcReadTimeoutError):
+            await result
+        await gate._drain_cooldown_saves()
+        assert gate._ensure_safety_ledger().floor_deadline > now[0] + 59
+    finally:
+        release.set()
+        if not second_result.done():
+            second_state.future.cancel()
+        await asyncio.gather(result, second_result, return_exceptions=True)
 
 
 async def test_cancelled_logical_owner_cannot_revive_after_task_uncancel(wire: _WireHarness) -> None:

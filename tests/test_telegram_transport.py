@@ -951,6 +951,29 @@ async def test_late_rpc_during_timeout_receipt_keeps_timeout_and_processes_respo
     assert state not in wire.sender._pending_state.values()
 
 
+async def test_late_rpc_handler_failure_restores_retired_state(wire: _Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from telethon.network.mtprotosender import MTProtoSender
+
+    state = wire.enqueue()
+    packet = await wire.prepare(state)
+    assert wire.sender.write_packet(packet, wire.connection._send)
+    owner = wire.sender.require_owned(state).owner
+    wire.authority.receipt_ready.clear()
+    wire.sender.retire_read_timeout(wire.futures[-1], owner)
+    await asyncio.wait_for(wire.authority.receipt_started.wait(), 1)
+
+    async def fail(_sender: object, _message: object) -> None:
+        raise RuntimeError("handler failure")
+
+    monkeypatch.setattr(MTProtoSender, "_handle_rpc_result", fail)
+    with pytest.raises(RuntimeError, match="handler failure"):
+        await wire.sender._handle_rpc_result(TLMessage(123, 0, RpcResult(state.msg_id, None, RpcError(400, "BAD"))))
+    assert state.future.cancelled()
+    wire.authority.receipt_ready.set()
+    with pytest.raises(RpcReadTimeoutError):
+        await wire.futures[-1]
+
+
 async def test_known_result_policy_rejection_is_published_without_transport_protection(wire: _Harness) -> None:
     state = wire.enqueue()
     result = ResPQ(1, 2, b"known result", [])
