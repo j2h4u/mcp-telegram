@@ -13,7 +13,7 @@ from itertools import islice
 from typing import Literal, Never, Protocol, cast
 
 from telethon import version  # type: ignore[import-untyped]
-from telethon.errors import RPCError, SecurityError  # type: ignore[import-untyped]
+from telethon.errors import RPCError, SecurityError, rpc_message_to_error  # type: ignore[import-untyped]
 from telethon.extensions.messagepacker import MessagePacker  # type: ignore[import-untyped]
 from telethon.network import authenticator  # type: ignore[import-untyped]
 from telethon.network.connection.tcpfull import ConnectionTcpFull  # type: ignore[import-untyped]
@@ -88,6 +88,8 @@ class TransportAuthority(Protocol):
     def transport_terminated(self, error: BaseException | None) -> BaseException | None: ...
 
     def observe_error_now(self, owner: object, error: BaseException) -> None: ...
+
+    def observe_orphan_error_now(self, sender: GuardedMTProtoSender, error: BaseException) -> None: ...
 
     def observe_shutdown_cancel(self, owner: object) -> None: ...
 
@@ -846,6 +848,9 @@ class GuardedMTProtoSender(MTProtoSender):
         result = getattr(message, "obj", None)
         pending = self._pending_state.get(getattr(result, "req_msg_id", None))
         owned = self._owned_states.get(pending) if pending is not None else None
+        if pending is None and (error := getattr(result, "error", None)) is not None:
+            convert = cast(Callable[[object, object], BaseException], rpc_message_to_error)
+            self._authority.observe_orphan_error_now(self, convert(cast(object, error), None))
         late = pending.future if pending is not None and isinstance(pending.future, _LateResponseFuture) else None
         late_result = None
         if late is not None and owned is not None and pending is not None:

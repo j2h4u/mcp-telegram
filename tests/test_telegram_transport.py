@@ -141,6 +141,9 @@ class _Authority:
             self.floor = True
             self.generation += 1
 
+    def observe_orphan_error_now(self, sender: GuardedMTProtoSender, error: BaseException) -> None:
+        del sender, error
+
     def observe_shutdown_cancel(self, owner: object) -> None:
         del owner
 

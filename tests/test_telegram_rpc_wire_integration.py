@@ -48,8 +48,11 @@ from mcp_telegram.telegram_demand_progress import WorkKey, WorkRevision
 from mcp_telegram.telegram_rpc import (
     TelegramRpcBudget,
     TelegramRpcGate,
+    TelegramRpcSafetyLedger,
     TelegramRpcSafetyStore,
     _AdmissionAwareSender,
+    _AuxPhotoAuthority,
+    _AuxPhotoLease,
     _TransportBoundaryState,
 )
 from mcp_telegram.telegram_rpc_consumers import DemandKind, demand_contract
@@ -345,6 +348,125 @@ async def test_raw_flood_revokes_a_pregranted_write_before_any_receipt_task_runs
     with pytest.raises(FloodWaitError):
         await futures[0]
     assert gate._ensure_safety_ledger().floor_deadline > now[0]
+
+
+@pytest.mark.parametrize(
+    "error_name", ["FLOOD_WAIT", "FLOOD_PREMIUM_WAIT", "FLOOD_TEST_PHONE_WAIT", "success", "save_failure"]
+)
+async def test_flood_after_finished_timeout_blocks_pregranted_write(  # noqa: PLR0914, PLR0915 - real wire and storage
+    wire: _WireHarness, error_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, sink = wire
+    kind = DemandKind.DELTA_GAP_FILL
+    selected = WorkRevision(WorkKey(kind, 42, "dialog:11"), "revision")
+    scope = TelegramRpcScope(
+        TelegramRpcSource.DELTA_SYNC,
+        demand_contract(kind).service_class,
+        time.monotonic() + 100,
+        asyncio.current_task(),
+        demand_kind=kind,
+        acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+        attempt_budget=RpcAttemptBudget(2, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
+    result = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    owner = sender.require_owned(state).owner
+    sender.retire_read_timeout(result, owner)
+    with pytest.raises(RpcReadTimeoutError):
+        await result
+    assert state not in sender._owned_states and state.msg_id not in sender._pending_state
+    second_result = sender.send_owned(GetStateRequest(), replace(scope, attempt_budget=RpcAttemptBudget(2)))
+    second_state = await sender._send_queue.next_state()
+    await sender._prepare_state(second_state)
+    packet = connection._send_queue.get_nowait()
+    before = cast(dict[str, object], json.loads(cast(str, gate._safety_store.load_record())))
+    baseline = telegram_rpc._COOLDOWN_DEADLINE
+    if error_name == "save_failure":
+
+        async def fail_save(expected: str | None, encoded: str) -> None:
+            raise OSError("receipt storage failed")
+
+        monkeypatch.setattr(gate._ensure_safety_ledger(), "_store", replace(gate._safety_store, save_record=fail_save))
+    response = (
+        RpcResult(state.msg_id, bytes.fromhex("b5757299"), None)
+        if error_name == "success"
+        else RpcResult(
+            state.msg_id,
+            None,
+            types.RpcError(420, f"{error_name if error_name != 'save_failure' else 'FLOOD_WAIT'}_60"),
+        )
+    )
+    await sender._handle_rpc_result(TLMessage(123, 0, response))
+    assert state not in sender._owned_states and state.msg_id not in sender._pending_state
+    assert isinstance(result.exception(), RpcReadTimeoutError)
+    if error_name == "success":
+        assert baseline == telegram_rpc._COOLDOWN_DEADLINE
+        assert sender.write_packet(packet, connection._send)
+        second_state.future.set_result("complete")
+        assert await second_result == "complete"
+        return
+    assert time.monotonic() + 59 < telegram_rpc._COOLDOWN_DEADLINE
+    assert not sender.write_packet(packet, connection._send)
+    assert len(sink.frames) == 1
+    if error_name == "save_failure":
+        receipt = next(iter(gate._cooldown_save_tasks.values()))
+        with pytest.raises(OSError, match="receipt storage failed"):
+            await receipt
+        assert gate._ensure_safety_ledger().protection_reason == "safety_storage_failure"
+        assert time.monotonic() + 59 < telegram_rpc._COOLDOWN_DEADLINE
+        second_state.future.cancel()
+        await asyncio.gather(second_result, return_exceptions=True)
+        return
+    await gate._drain_cooldown_saves()
+    record = cast(dict[str, object], json.loads(cast(str, gate._safety_store.load_record())))
+    assert cast(dict[str, float], record["floor"])["until_utc"] > time.time() + 59
+    assert record["intents"] == before["intents"] and record["methods"] == before["methods"]
+    dc_id, key_id = gate._offline_wire_identity()
+    reloaded = TelegramRpcSafetyLedger(gate._safety_store, dc_id=dc_id, key_id=key_id)
+    assert time.monotonic() + 59 < reloaded.floor_deadline
+    second_state.future.cancel()
+    await asyncio.gather(second_result, return_exceptions=True)
+
+
+async def test_orphan_errors_respect_sender_identity_and_bootstrap(wire: _WireHarness) -> None:
+    gate, sender, _, _ = wire
+    ledger = gate._ensure_safety_ledger()
+    scope = cast(dict[str, object], ledger._record["scope"])
+    baseline = telegram_rpc._COOLDOWN_DEADLINE
+    error = types.RpcError(420, "FLOOD_WAIT_60")
+    scope["key_id"] = 123
+    await sender._handle_rpc_result(TLMessage(1, 0, RpcResult(999, None, error)))
+    assert baseline == telegram_rpc._COOLDOWN_DEADLINE
+    scope["key_id"] = gate._offline_wire_identity()[1]
+    scope["stage"] = "transport_only"
+    scope["account_id"] = None
+    await sender._handle_rpc_result(TLMessage(1, 0, RpcResult(999, None, types.RpcError(400, "BAD"))))
+    assert baseline == telegram_rpc._COOLDOWN_DEADLINE
+    await sender._handle_rpc_result(TLMessage(1, 0, RpcResult(999, None, error)))
+    assert time.monotonic() + 59 < telegram_rpc._COOLDOWN_DEADLINE
+    await gate._drain_cooldown_saves()
+
+
+async def test_revoked_auxiliary_flood_keeps_same_account_only(wire: _WireHarness) -> None:
+    gate, sender, _, _ = wire
+    scope = gate.retained_auth_scope()
+    assert scope is not None
+    lease = cast(_AuxPhotoLease, SimpleNamespace(gate=gate, scope=scope, sender=sender, revoked=True))
+    authority = _AuxPhotoAuthority(lease)
+    error = FloodWaitError(None, capture=60)
+    record_scope = cast(dict[str, object], gate._ensure_safety_ledger()._record["scope"])
+    baseline = telegram_rpc._COOLDOWN_DEADLINE
+    record_scope["account_id"] = scope.account_id + 1
+    authority.observe_orphan_error_now(sender, error)
+    assert baseline == telegram_rpc._COOLDOWN_DEADLINE
+    record_scope["account_id"] = scope.account_id
+    authority.observe_orphan_error_now(sender, error)
+    assert time.monotonic() + 59 < telegram_rpc._COOLDOWN_DEADLINE
+    await gate._drain_cooldown_saves()
 
 
 async def test_late_flood_after_read_timeout_blocks_pregranted_write(  # noqa: PLR0914 - real gate and wire

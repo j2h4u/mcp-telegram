@@ -298,6 +298,8 @@ class _MainSender(Protocol):
 
     async def disconnect(self) -> object: ...
 
+    async def disconnect_for_containment(self) -> None: ...
+
     async def settle_shutdown(self) -> None: ...
 
     def is_connected(self) -> bool: ...
@@ -3743,6 +3745,18 @@ class _AuxPhotoAuthority:
     def observe_error_now(self, owner: object, error: BaseException) -> None:
         self._gate.observe_error_now(owner, error)
 
+    def observe_orphan_error_now(self, sender: GuardedMTProtoSender, error: BaseException) -> None:
+        scope = cast(dict[str, object], self._gate._ensure_safety_ledger()._record["scope"])
+        lease_scope = self._lease.scope
+        if (
+            sender is self._lease.sender
+            and sender.auth_key.key_id is not None
+            and (scope["account_id"], scope["dc_id"], scope["key_id"])
+            == (lease_scope.account_id, lease_scope.dc_id, lease_scope.auth_key_id)
+            and self._gate._offline_wire_identity() == (lease_scope.dc_id, lease_scope.auth_key_id)
+        ):
+            self._gate._observe_orphan_flood(error)
+
     def observe_shutdown_cancel(self, owner: object) -> None:
         self._gate.observe_shutdown_cancel(owner)
 
@@ -6152,6 +6166,22 @@ class TelegramRpcGate(TelegramClient):
         attempt.shutdown_read_candidate = True
         self._shutdown_read_attempts.add(attempt.attempt_id)
 
+    def observe_orphan_error_now(self, sender: GuardedMTProtoSender, error: BaseException) -> None:
+        scope = cast(dict[str, object], self._ensure_safety_ledger()._record["scope"])
+        dc_id, key_id = self._offline_wire_identity()
+        if (
+            sender is self._main_sender
+            and key_id is not None
+            and sender.auth_key.key_id == key_id
+            and (scope["dc_id"], scope["key_id"]) == (dc_id, key_id)
+        ):
+            self._observe_orphan_flood(error)
+
+    def _observe_orphan_flood(self, error: BaseException) -> None:
+        if isinstance(error, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
+            self._record_flood(error)
+            self._notify_rpc_eligibility_changed()
+
     def observe_error_now(self, owner: object, error: BaseException) -> None:
         owner = self._require_wire_owner(owner)
         if isinstance(error, (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError)):
@@ -8294,9 +8324,8 @@ class TelegramRpcGate(TelegramClient):
         self._wire_generation += 1
         self._admission_scheduler.notify_eligibility_changed()
         primary: BaseException | None = None
-        result: object = None
         try:
-            result = await self._main_sender.disconnect()
+            await self._main_sender.disconnect_for_containment()
         except BaseException as error:  # noqa: BLE001 - drain all owners, then re-raise the original failure.
             primary = error
         try:
@@ -8311,7 +8340,7 @@ class TelegramRpcGate(TelegramClient):
             self._transport_state = _TransportBoundaryState.FAILED
             raise primary
         self._transport_state = _TransportBoundaryState.DISCONNECTED
-        return result
+        return None
 
     async def _handle_admission_deferral(
         self,
