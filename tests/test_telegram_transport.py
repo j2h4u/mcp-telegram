@@ -927,6 +927,26 @@ async def test_raw_result_reaches_paused_authority_before_publication(wire: _Har
     assert await wire.futures[-1] is result
 
 
+async def test_orphan_rpc_results_do_not_log_private_content(
+    wire: _Harness, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon.tl.types import storage, upload
+
+    caplog.set_level(logging.DEBUG)
+    errors: list[BaseException] = []
+    monkeypatch.setattr(wire.authority, "observe_orphan_error_now", lambda _sender, error: errors.append(error))
+    secret = b"synthetic-private-response"
+    responses = [bytes(ResPQ(1, 2, secret, [])), bytes(upload.File(storage.FileUnknown(), 0, secret))]
+    for body in responses:
+        await wire.sender._handle_rpc_result(TLMessage(123, 0, RpcResult(999, body, None)))
+    await wire.sender._handle_rpc_result(
+        TLMessage(123, 0, RpcResult(999, None, RpcError(400, "synthetic-private-error")))
+    )
+    assert "synthetic-private" not in caplog.text
+    assert "999" in caplog.text
+    assert len(errors) == 1
+
+
 @pytest.mark.parametrize("failed", [False, True])
 async def test_late_rpc_during_timeout_receipt_keeps_timeout_and_processes_response(
     wire: _Harness, monkeypatch: pytest.MonkeyPatch, failed: bool

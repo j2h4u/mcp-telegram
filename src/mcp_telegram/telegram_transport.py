@@ -848,9 +848,12 @@ class GuardedMTProtoSender(MTProtoSender):
         result = getattr(message, "obj", None)
         pending = self._pending_state.get(getattr(result, "req_msg_id", None))
         owned = self._owned_states.get(pending) if pending is not None else None
-        if pending is None and (error := getattr(result, "error", None)) is not None:
-            convert = cast(Callable[[object, object], BaseException], rpc_message_to_error)
-            self._authority.observe_orphan_error_now(self, convert(cast(object, error), None))
+        if pending is None:
+            if (error := getattr(result, "error", None)) is not None:
+                convert = cast(Callable[[object, object], BaseException], rpc_message_to_error)
+                self._authority.observe_orphan_error_now(self, convert(cast(object, error), None))
+            self._log.debug("Discarding RPC result without parent request: %s", getattr(result, "req_msg_id", None))
+            return
         late = pending.future if pending is not None and isinstance(pending.future, _LateResponseFuture) else None
         late_result = None
         if late is not None and owned is not None and pending is not None:
