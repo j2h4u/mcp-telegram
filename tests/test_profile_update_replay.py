@@ -38,7 +38,10 @@ async def test_retained_generic_user_update_replays_with_thin_peer(tmp_path: Pat
         await client.start_update_delivery(99)
         assert _pending(path) is None
         assert reader.execute("SELECT type FROM entities WHERE id=55").fetchone() == (kind or "unknown",)
-        assert {row[0] for row in reader.execute("SELECT section FROM entity_detail_sections WHERE entity_id=55")} == {
+        rows = cast(
+            list[tuple[str]], reader.execute("SELECT section FROM entity_detail_sections WHERE entity_id=55").fetchall()
+        )
+        assert {row[0] for row in rows} == {
             "full_profile",
             "personal_channel",
             "avatar_history",
