@@ -96,6 +96,10 @@ class TransportAuthority(Protocol):
     def contact_response_scope(self, owner: object, request: object, result: object) -> ScopeToken | None: ...
 
 
+class _LateResponseFuture(asyncio.Future[object]):
+    """A timed-out request awaiting a possible late wire response."""
+
+
 class _OwnedFuture(asyncio.Future[object]):
     """Observe terminal errors before scheduled callbacks can allow another write."""
 
@@ -493,6 +497,9 @@ class GuardedMTProtoSender(MTProtoSender):
             if owned.result is result and owned.owner is owner:
                 if not owned.state.future.done():
                     owned.state.future.set_exception(RpcReadTimeoutError("Telegram durable read response timed out"))
+                    # Let Telethon parse late responses without completing the timed-out future again.
+                    owned.state.future = _LateResponseFuture()
+                    owned.state.future.cancel()
                 return
         if not result.done():
             raise RuntimeError("read timeout lacks its exact application owner")
@@ -839,13 +846,30 @@ class GuardedMTProtoSender(MTProtoSender):
         result = getattr(message, "obj", None)
         pending = self._pending_state.get(getattr(result, "req_msg_id", None))
         owned = self._owned_states.get(pending) if pending is not None else None
+        late = pending.future if pending is not None and isinstance(pending.future, _LateResponseFuture) else None
+        late_result = None
+        if late is not None and owned is not None and pending is not None:
+            late_result = _OwnedFuture(self._authority, owned.owner, self._shutdown_cancel_owned)
+            pending.future = late_result
         response_token = self._response_owner.set(owned)
         token = self._control_origin.set((asyncio.current_task(), "ack"))
         try:
             await super()._handle_rpc_result(message)
         finally:
+            self._settle_late_response(pending, late, late_result)
             self._control_origin.reset(token)
             self._response_owner.reset(response_token)
+
+    @staticmethod
+    def _settle_late_response(
+        pending: _RequestState | None, late: _LateResponseFuture | None, result: _OwnedFuture | None
+    ) -> None:
+        if result is None:
+            return
+        if result.done() and not result.cancelled():
+            result.exception()
+        elif pending is not None and late is not None:
+            pending.future = late
 
     def _store_own_updates(self, obj: object, *args: object, **kwargs: object) -> None:
         capture = getattr(self._updates_queue, "capture_rpc_notification", None)

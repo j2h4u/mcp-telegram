@@ -118,6 +118,7 @@ from .runtime_observations import (
     tool_telemetry_identity,
 )
 from .sqlite_writer import SQLiteWriter
+from .sync_db import open_sync_db_reader
 from .sync_read_model import (
     DM_DELETION_RECONCILIATION_STATE_KEY,
     AutomaticGroupFacts,
@@ -892,6 +893,7 @@ class DaemonAPIServer:
         self._conversation_changes_token_codec = ConversationChangesTokenCodec()
         self._runtime_observation_sink: RuntimeObservationSink | None = None
         self._closing_clients = False
+        self._status_read_task: asyncio.Task[tuple[dict, int | None, int]] | None = None
         self._client_handlers: dict[asyncio.Task[object], asyncio.StreamWriter] = {}
         self._draft_commands: DraftCommands | None = None
         self._scheduled_commands: DraftCommands | None = None
@@ -2227,12 +2229,46 @@ class DaemonAPIServer:
             return self._profile_job_status(req)
         if "entity_id" in req:
             return self._profile_job_error("invalid_arguments", "Use the profile job view with an entity id.")
-        return self._get_history_sync_status(req)
+        scope, account_id = self._auth_scope, self.self_id
+        result, channel_id, observed_now = await self._await_history_sync_status(req)
+        if self._auth_scope != scope or self.self_id != account_id:
+            return self._directory_account_unverified("The verified account changed during the read.")
+        result["data"]["message_delivery"] = self._message_delivery_for_dialog(channel_id, observed_now)
+        return result
 
-    def _get_history_sync_status(self, req: dict[str, object]) -> dict:  # noqa: PLR0914
+    async def _await_history_sync_status(self, req: dict[str, object]) -> tuple[dict, int | None, int]:
+        """Own at most one status reader until its thread has actually settled."""
+        while self._status_read_task is not None:
+            previous = self._status_read_task
+            await asyncio.wait({previous})
+            if self._status_read_task is previous:
+                self._status_read_task = None
+        if self._closing_clients:
+            raise RuntimeError("daemon is shutting down")
+        task = asyncio.create_task(asyncio.to_thread(self._read_history_sync_status, dict(req)))
+        task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+        self._status_read_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done() and self._status_read_task is task:
+                self._status_read_task = None
+
+    def _read_history_sync_status(self, req: dict[str, object]) -> tuple[dict, int | None, int]:
+        if self._sync_db_path is None:
+            raise RuntimeError("sync database path is unavailable")
+        conn = open_sync_db_reader(self._sync_db_path)
+        try:
+            return self._get_history_sync_status(conn, req)
+        finally:
+            conn.close()
+
+    def _get_history_sync_status(  # noqa: PLR0914
+        self, conn: sqlite3.Connection, req: dict[str, object]
+    ) -> tuple[dict, int | None, int]:
         """Return local sync status and message statistics for a dialog."""
         dialog_id = _coerce_int(req.get("dialog_id", 0), 0)
-        row = cast(tuple[object, ...] | None, self._conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
+        row = cast(tuple[object, ...] | None, conn.execute(_GET_SYNC_STATUS_SQL, (dialog_id,)).fetchone())
 
         if row is not None:
             persisted_status = cast(str, row[0])
@@ -2256,13 +2292,13 @@ class DaemonAPIServer:
             last_delta_checked_at = None
             delta_refresh_requested_at = None
             access_revalidation = (None, None)
-            intent = read_intent(self._conn, dialog_id)
+            intent = read_intent(conn, dialog_id)
             enrollment_enabled = intent.enabled
             history_depth_complete = False
 
-        count_row = cast(tuple[object] | None, self._conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
+        count_row = cast(tuple[object] | None, conn.execute(_COUNT_SYNCED_MESSAGES_SQL, (dialog_id,)).fetchone())
         message_count = int(cast(int | str, count_row[0])) if count_row is not None else 0
-        latest = cast(tuple[int, int] | None, self._conn.execute(_LATEST_RETAINED_MESSAGE_SQL, (dialog_id,)).fetchone())
+        latest = cast(tuple[int, int] | None, conn.execute(_LATEST_RETAINED_MESSAGE_SQL, (dialog_id,)).fetchone())
         observed_now = int(time.time())
         sync_read_model = build_sync_read_model(
             persisted_status=persisted_status,
@@ -2278,7 +2314,6 @@ class DaemonAPIServer:
 
         data: dict = {
             "dialog_id": dialog_id,
-            "message_delivery": self._message_delivery_for_dialog(dialog_id, observed_now),
             "latest_retained_message": None if latest is None else {"message_id": latest[0], "sent_at": latest[1]},
             "delta_refresh_requested_at": delta_refresh_requested_at,
             "sync_progress": sync_progress,
@@ -2287,24 +2322,25 @@ class DaemonAPIServer:
                 "reliable (channel)"
                 if dialog_id < 0
                 else "paused (DM; older deletions may be stale)"
-                if _dm_deletion_reconciliation_is_blocked(self._conn)
+                if _dm_deletion_reconciliation_is_blocked(conn)
                 else "best-effort weekly (DM)"
             ),
             "access_lost_at": access_lost_at,
             "access_last_revalidated_at": access_revalidation[0],
             "access_next_revalidate_at": access_revalidation[1],
             "automatic_group_sync": self._automatic_group_status(
-                dialog_id, enrollment_enabled, persisted_status, observed_now
+                dialog_id, enrollment_enabled, persisted_status, observed_now, conn=conn
             ),
             **sync_read_model.to_wire(),
         }
         if sync_read_model.sync_status is SyncStatus.ACCESS_LOST and total_messages is None:
             data["archived_message_count"] = message_count
-        return {"ok": True, "data": data}
+        return {"ok": True, "data": data}, self._status_channel_id(conn, dialog_id), observed_now
 
-    def _message_delivery_for_dialog(self, dialog_id: int, observed_now: int) -> dict[str, object]:
-        identity = read_dialog_identities(self._conn, (dialog_id,)).get(dialog_id)
-        channel_id = None
+    @staticmethod
+    def _status_channel_id(conn: sqlite3.Connection, dialog_id: int) -> int | None:
+        """Resolve the channel identity needed by the live delivery snapshot."""
+        identity = read_dialog_identities(conn, (dialog_id,)).get(dialog_id)
         if identity is not None and identity.dialog_type in {
             DialogType.CHANNEL,
             DialogType.SUPERGROUP,
@@ -2312,7 +2348,10 @@ class DaemonAPIServer:
         }:
             raw_id, peer_type = telethon_utils.resolve_id(dialog_id)
             if peer_type.__name__ == "PeerChannel":
-                channel_id = raw_id
+                return raw_id
+        return None
+
+    def _message_delivery_for_dialog(self, channel_id: int | None, observed_now: int) -> dict[str, object]:
         snapshot = (
             self._message_delivery_snapshot(channel_id)
             if self._message_delivery_snapshot is not None
@@ -2321,9 +2360,9 @@ class DaemonAPIServer:
         return _project_message_delivery(snapshot)
 
     def _automatic_group_status(
-        self, dialog_id: int, enabled: bool | None, coverage: str | None, now: int
+        self, dialog_id: int, enabled: bool | None, coverage: str | None, now: int, *, conn: sqlite3.Connection
     ) -> dict[str, object]:
-        row, retry_row = self._automatic_group_rows(dialog_id)
+        row, retry_row = self._automatic_group_rows(dialog_id, conn=conn)
         policy = self._policy.automatic_group_history
         facts = AutomaticGroupFacts(
             enrollment_enabled=enabled,
@@ -2342,12 +2381,13 @@ class DaemonAPIServer:
         )
 
     def _automatic_group_rows(
-        self, dialog_id: int
+        self, dialog_id: int, *, conn: sqlite3.Connection | None = None
     ) -> tuple[tuple[object, object, object, object] | None, tuple[object] | None]:
-        row = read_automatic_group_metadata(self._conn, dialog_id)
+        conn = self._conn if conn is None else conn
+        row = read_automatic_group_metadata(conn, dialog_id)
         retry_row = cast(
             tuple[object] | None,
-            self._conn.execute(
+            conn.execute(
                 "SELECT value FROM daemon_state WHERE key=?", (f"automatic_group_history_retry:{dialog_id}",)
             ).fetchone(),
         )
@@ -2447,9 +2487,14 @@ class DaemonAPIServer:
             self._client_handlers[handler].transport.abort()
             handler.cancel()
         await asyncio.gather(*handlers, return_exceptions=True)
+        if self._status_read_task is not None:
+            await asyncio.gather(self._status_read_task, return_exceptions=True)
 
     async def shutdown(self) -> None:
         """Stop profile refresh tasks before the daemon closes SQLite."""
+        self._closing_clients = True
+        if self._status_read_task is not None:
+            await asyncio.gather(self._status_read_task, return_exceptions=True)
         if self._entity_info_service is not None:
             await self._entity_info_service.shutdown()
 

@@ -21,14 +21,19 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _DAEMON_CODE = """
 import asyncio
+import sqlite3
 from mcp_telegram.config import load_config
-from test_daemon_api import make_server, _make_db_with_entities
+from mcp_telegram.sync_db import ensure_sync_schema
+from test_daemon_api import make_server
 
 async def main():
-    api = make_server(conn=_make_db_with_entities())
+    state = load_config().state.dir
+    db_path = state / "sync.db"
+    ensure_sync_schema(db_path)
+    api = make_server(conn=sqlite3.connect(db_path))
     api.self_id = 7
     api.self_profile = {"id": 7, "first_name": "Test", "last_name": None, "username": None}
-    socket_path = load_config().state.dir / "daemon.sock"
+    socket_path = state / "daemon.sock"
     async with await asyncio.start_unix_server(api.handle_client, path=str(socket_path)) as server:
         await server.serve_forever()
 

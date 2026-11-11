@@ -718,9 +718,9 @@ def _install_message_observation_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
+def _make_db(*, with_fts: bool = False, with_entities: bool = False, db_path: Path | None = None) -> sqlite3.Connection:
     """Return an in-memory SQLite connection with the required schema."""
-    conn = _register_sqlite_connection(sqlite3.connect(":memory:"))
+    conn = _register_sqlite_connection(sqlite3.connect(":memory:" if db_path is None else db_path))
     conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute(
         """
@@ -977,9 +977,11 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.
     return conn
 
 
-def _make_db_with_dialogs(*, with_fts: bool = False, with_entities: bool = False) -> sqlite3.Connection:
+def _make_db_with_dialogs(
+    *, with_fts: bool = False, with_entities: bool = False, db_path: Path | None = None
+) -> sqlite3.Connection:
     """_make_db() + dialogs table + 4 indexes (Phase 40 schema v17)."""
-    conn = _make_db(with_fts=with_fts, with_entities=with_entities)
+    conn = _make_db(with_fts=with_fts, with_entities=with_entities, db_path=db_path)
     conn.execute(_DIALOG_FACT_OBSERVATIONS_DDL)
     conn.execute("DROP TABLE IF EXISTS dialogs")
     conn.execute(
@@ -2926,9 +2928,9 @@ async def test_unknown_method() -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_api_keeps_local_status_available_when_flood_wait_kill_switch_is_open() -> None:
+async def test_daemon_api_keeps_local_status_available_when_flood_wait_kill_switch_is_open(tmp_path: Path) -> None:
     """An active circuit does not pre-dispatch reject a local daemon read."""
-    server = make_server()
+    server = make_server(_make_db(db_path=tmp_path / "sync.db"))
     server._health_status = lambda: FloodWaitKillSwitchStatus(
         open=True,
         reason="too_many_flood_wait_events",
@@ -2939,6 +2941,7 @@ async def test_daemon_api_keeps_local_status_available_when_flood_wait_kill_swit
         source="test",
     )
 
+    server._conn.commit()
     response, method, request_id = await server._handle_client_line(
         b'{"method":"get_sync_status","request_id":"deadbeef"}',
         "",
@@ -3368,9 +3371,9 @@ async def test_mark_dialog_for_sync_disable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_synced_dialog() -> None:
+async def test_get_sync_status_synced_dialog(tmp_path: Path) -> None:
     """get_sync_status returns all required fields for a synced dialog."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(
         conn,
         -1001234567890,
@@ -3383,6 +3386,7 @@ async def test_get_sync_status_synced_dialog() -> None:
     _insert_message(conn, -1001234567890, 1, text="msg1")
     _insert_message(conn, -1001234567890, 2, text="msg2")
     server = make_server(conn)
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -3400,9 +3404,9 @@ async def test_get_sync_status_synced_dialog() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_overcount_omits_impossible_coverage() -> None:
+async def test_get_sync_status_overcount_omits_impossible_coverage(tmp_path: Path) -> None:
     """get_sync_status does not report a fake 100% when local rows outrun Telegram total."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(
         conn,
         -1001234567890,
@@ -3413,6 +3417,7 @@ async def test_get_sync_status_overcount_omits_impossible_coverage() -> None:
     for i in range(150):
         _insert_message(conn, -1001234567890, i + 1, text=f"msg{i + 1}")
     server = make_server(conn)
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": -1001234567890})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -3424,11 +3429,12 @@ async def test_get_sync_status_overcount_omits_impossible_coverage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_dm_delete_detection() -> None:
+async def test_get_sync_status_dm_delete_detection(tmp_path: Path) -> None:
     """get_sync_status returns 'best-effort weekly (DM)' delete_detection for positive dialog_id."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(conn, 12345, status="synced")
     server = make_server(conn)
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -3436,8 +3442,8 @@ async def test_get_sync_status_dm_delete_detection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> None:
-    conn = _make_db()
+async def test_get_sync_status_reports_suspended_dm_deletion_verification(tmp_path: Path) -> None:
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(conn, 12345, status="synced")
     conn.execute(
         "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
@@ -3460,6 +3466,7 @@ async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> N
     conn.commit()
     server = make_server(conn)
 
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
 
     assert result["ok"] is True
@@ -3492,9 +3499,9 @@ async def test_get_sync_status_reports_suspended_dm_deletion_verification() -> N
     ],
 )
 async def test_get_sync_status_reports_claimed_and_legacy_dm_work_as_paused(
-    checkpoint: dict[str, object],
+    checkpoint: dict[str, object], tmp_path: Path
 ) -> None:
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(conn, 12345, status="synced")
     raw = json.dumps(checkpoint)
     conn.execute(
@@ -3504,6 +3511,7 @@ async def test_get_sync_status_reports_claimed_and_legacy_dm_work_as_paused(
     conn.commit()
     server = make_server(conn)
 
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
 
     assert result["ok"] is True
@@ -3515,9 +3523,9 @@ async def test_get_sync_status_reports_claimed_and_legacy_dm_work_as_paused(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [None, "", "  ", "{broken", "{}", '{"generation":' + "9" * 5_000 + "}"])
 async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_rewriting(
-    payload: str | None,
+    payload: str | None, tmp_path: Path
 ) -> None:
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(conn, 12345, status="synced")
     conn.execute(
         "INSERT INTO daemon_state(key, value) VALUES ('delta_dm_gap_scan_state', ?)",
@@ -3527,6 +3535,7 @@ async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_r
     before = tuple(conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone())
     server = make_server(conn)
 
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
 
     assert result["ok"] is True
@@ -3537,22 +3546,24 @@ async def test_get_sync_status_reports_invalid_dm_checkpoint_as_paused_without_r
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_propagates_dm_checkpoint_sql_failure() -> None:
-    conn = _make_db()
+async def test_get_sync_status_propagates_dm_checkpoint_sql_failure(tmp_path: Path) -> None:
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(conn, 12345, status="synced")
     conn.execute("DROP TABLE daemon_state")
     conn.commit()
     server = make_server(conn)
 
     with pytest.raises(sqlite3.OperationalError):
+        server._conn.commit()
         await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_non_synced() -> None:
+async def test_get_sync_status_non_synced(tmp_path: Path) -> None:
     """get_sync_status for non-synced dialog returns sync_status='not_synced'."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     server = make_server(conn)
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 99999})
     assert result["ok"] is True
     data = cast(dict[str, object], result["data"])
@@ -5620,8 +5631,8 @@ async def test_list_messages_topic_filter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reinspection_preserves_local_history_horizon() -> None:
-    conn = _make_db()
+async def test_reinspection_preserves_local_history_horizon(tmp_path: Path) -> None:
+    conn = _make_db(db_path=tmp_path / "sync.db")
     _insert_synced_dialog(conn, 9033, status="synced", last_synced_at=1700000000)
     _insert_message(conn, 9033, 101, text="retained", forum_topic_id=5)
     server = make_server(conn)
@@ -5630,6 +5641,7 @@ async def test_reinspection_preserves_local_history_horizon() -> None:
     server.bind_demand_sink(sink)
     result = await server._dispatch({"method": "mark_dialog_for_sync", "dialog_id": 9033, "enable": True})
     assert cast(dict[str, object], result["data"])["action"] == "queue_full_history"
+    server._conn.commit()
     status = await server._get_sync_status({"dialog_id": 9033})
     assert status["data"]["history_sync_state"] == "syncing"
     assert status["data"]["history_depth_state"] == "complete"
@@ -6261,9 +6273,9 @@ def test_compute_sync_coverage_zero_total():
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_includes_coverage():
+async def test_get_sync_status_includes_coverage(tmp_path: Path):
     """get_sync_status returns sync_coverage_pct and access_lost_at."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages, history_depth_complete) VALUES (?, 'synced', 1000, 1)",
         (-100001,),
@@ -6276,6 +6288,7 @@ async def test_get_sync_status_includes_coverage():
         )
     conn.commit()
     server = make_server(conn)
+    server._conn.commit()
     result = await server._get_sync_status({"dialog_id": -100001})
     assert result["ok"] is True
     assert result["data"]["sync_coverage_pct"] == 80
@@ -6288,9 +6301,9 @@ async def test_get_sync_status_includes_coverage():
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect():
+async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect(tmp_path: Path):
     """A bad Telegram total estimate must not make a completed full sync look incomplete."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages, last_synced_at, last_event_at, history_depth_complete) "
         "VALUES (?, 'synced', 1, 1700000000, 1700001000, 1)",
@@ -6305,6 +6318,7 @@ async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect():
     conn.commit()
 
     server = make_server(conn)
+    server._conn.commit()
     result = await server._get_sync_status({"dialog_id": 7110815})
 
     assert result["ok"] is True
@@ -6320,9 +6334,9 @@ async def test_get_sync_status_keeps_synced_complete_when_total_is_suspect():
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_access_lost_with_coverage():
+async def test_get_sync_status_access_lost_with_coverage(tmp_path: Path):
     """access_lost dialog shows frozen coverage with access_lost_at."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages, access_lost_at) "
         "VALUES (?, 'access_lost', 500, 1700000000)",
@@ -6336,15 +6350,16 @@ async def test_get_sync_status_access_lost_with_coverage():
         )
     conn.commit()
     server = make_server(conn)
+    server._conn.commit()
     result = await server._get_sync_status({"dialog_id": -100002})
     assert result["data"]["sync_coverage_pct"] == 80
     assert result["data"]["access_lost_at"] == 1700000000
 
 
 @pytest.mark.asyncio
-async def test_get_sync_status_access_lost_null_total_has_archived_count():
+async def test_get_sync_status_access_lost_null_total_has_archived_count(tmp_path: Path):
     """access_lost + total_messages=NULL returns archived_message_count with local count."""
-    conn = _make_db()
+    conn = _make_db(db_path=tmp_path / "sync.db")
     conn.execute(
         "INSERT INTO synced_dialogs (dialog_id, status, total_messages, access_lost_at) "
         "VALUES (?, 'access_lost', NULL, 1700000000)",
@@ -6358,6 +6373,7 @@ async def test_get_sync_status_access_lost_null_total_has_archived_count():
         )
     conn.commit()
     server = make_server(conn)
+    server._conn.commit()
     result = await server._get_sync_status({"dialog_id": -100009})
     assert result["data"]["sync_coverage_pct"] is None
     assert result["data"]["access_lost_at"] == 1700000000
@@ -6370,8 +6386,8 @@ async def test_get_sync_status_access_lost_null_total_has_archived_count():
 
 
 @pytest.mark.asyncio
-async def test_sync_read_model_fields_match_between_sync_status_and_dialog_catalog() -> None:
-    conn = _make_db_with_dialogs()
+async def test_sync_read_model_fields_match_between_sync_status_and_dialog_catalog(tmp_path: Path) -> None:
+    conn = _make_db_with_dialogs(db_path=tmp_path / "sync.db")
     dialog_id = 5000
     _seed_dialog_row(conn, dialog_id, name="Parity Dialog", type_="User")
     _insert_synced_dialog(
@@ -9723,8 +9739,8 @@ async def test_directory_audit_fences_scope_change_and_overwrites_private_owner(
 
 
 @pytest.mark.asyncio
-async def test_sync_status_reports_local_account_and_selected_channel_delivery() -> None:
-    conn = _make_db()
+async def test_sync_status_reports_local_account_and_selected_channel_delivery(tmp_path: Path) -> None:
+    conn = _make_db(db_path=tmp_path / "sync.db")
     dialog_id = -1001234567890
     conn.execute("INSERT INTO dialogs (dialog_id, type) VALUES (?, ?)", (dialog_id, "channel"))
     server = make_server(conn)
@@ -9746,6 +9762,7 @@ async def test_sync_status_reports_local_account_and_selected_channel_delivery()
         }
 
     server._message_delivery_snapshot = snapshot
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": dialog_id})
     assert calls == [1234567890]
     data = cast(dict[str, object], result["data"])
@@ -9767,9 +9784,10 @@ async def test_sync_status_reports_local_account_and_selected_channel_delivery()
 
 
 @pytest.mark.asyncio
-async def test_sync_status_uses_unverified_real_gate_snapshot(wire: _WireHarness) -> None:
-    server = make_server()
+async def test_sync_status_uses_unverified_real_gate_snapshot(wire: _WireHarness, tmp_path: Path) -> None:
+    server = make_server(_make_db(db_path=tmp_path / "status.db"))
     server._message_delivery_snapshot = wire[0].message_delivery_snapshot
+    server._conn.commit()
     result = await server._dispatch({"method": "get_sync_status", "dialog_id": 12345})
     data = cast(dict[str, object], result["data"])
     delivery = cast(dict[str, object], data["message_delivery"])
