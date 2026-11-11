@@ -4,6 +4,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import cast
 
+import pytest
 from telethon import types
 from telethon.sessions import SQLiteSession
 
@@ -13,6 +14,47 @@ from mcp_telegram.sync_db import _open_sync_db, open_sync_db_reader
 from mcp_telegram.sync_transactions import write_transaction
 from tests.test_update_delivery import _client, _database, _message, _pending, _safe
 from tests.test_update_delivery_handlers import _admit, _manager
+
+
+@pytest.mark.parametrize("kind", [None, "unknown", "bot"])
+async def test_retained_generic_user_update_replays_with_thin_peer(tmp_path: Path, kind: str | None) -> None:
+    path = _database(tmp_path)
+    with closing(_open_sync_db(path)) as conn, write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
+        ensure_dialog_identity_baseline(conn, 55)
+        if kind is not None:
+            conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (55,?,1)", (kind,))
+        conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (55,5,1)")
+    writer = await SQLiteWriter.open(path)
+    reader = open_sync_db_reader(path)
+    client = _client(tmp_path / "session", writer, channel=False)
+    try:
+        await client.start_update_delivery(99)
+        await _admit(client, [types.UpdateUser(55)], include_fixture_user=False)
+        assert _pending(path) is not None
+        cast(SQLiteSession, client.session).close()
+        client = _client(tmp_path / "session", writer, channel=False)
+        _manager(client, reader, writer)
+        await client.start_update_delivery(99)
+        assert _pending(path) is None
+        assert reader.execute("SELECT type FROM entities WHERE id=55").fetchone() == (kind or "unknown",)
+        rows = cast(
+            list[tuple[str]], reader.execute("SELECT section FROM entity_detail_sections WHERE entity_id=55").fetchall()
+        )
+        assert {row[0] for row in rows} == {
+            "full_profile",
+            "personal_channel",
+            "avatar_history",
+            "common_chats",
+            "saved_music",
+            "saved_gifts",
+            "current_stories",
+            "pinned_stories",
+        }
+    finally:
+        cast(SQLiteSession, client.session).close()
+        reader.close()
+        await writer.aclose()
 
 
 async def test_retained_status_with_thin_dialog_replays_before_checkpoint(tmp_path: Path) -> None:

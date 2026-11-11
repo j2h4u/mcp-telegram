@@ -250,7 +250,11 @@ class EntityProfileRepository:
         if entity_id == bound_profile_account(self._conn):
             return ("full_profile", "personal_channel")
         kind = str(self._read_entity_stub(entity_id).get("type", "")).lower()
-        return PROFILE_SECTIONS if kind in {"user", "bot"} else PROFILE_SECTIONS[:5]
+        return (
+            PROFILE_SECTIONS
+            if kind in {"user", "bot"} or (kind in {"", "unknown"} and entity_id > 0)
+            else PROFILE_SECTIONS[:5]
+        )
 
     def _next_section(self, cursor: EntityRefreshCursor) -> str | None:
         sections = self._profile_sections(cursor.entity_id)
