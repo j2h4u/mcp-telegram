@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from telethon.errors import AuthKeyNotFound
 from telethon.network.connection.tcpfull import FullPacketCodec
 from telethon.tl import functions, types
 from telethon.tl.functions.updates import GetStateRequest
@@ -502,6 +503,54 @@ async def test_held_disconnect_reports_enter_and_completion(
     finally:
         release.set()
         await task
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+@pytest.mark.parametrize("ordinary_first", [False, True])
+async def test_recovery_fences_terminal_auth_error_without_hiding_cleanup_failure(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, cleanup_fails: bool, ordinary_first: bool
+) -> None:
+    gate, sender, connection, _ = wire
+    clock = _wire_clock(wire, monkeypatch)
+    gate.configure_auto_resume(enabled=True)
+    gate._startup_safety_prepared = True
+    await gate._ensure_safety_ledger().record_floor(clock.time() + 1, circuit_open=True)
+    terminal = AuthKeyNotFound()
+    original_disconnect = connection.disconnect
+
+    async def close() -> None:
+        if cleanup_fails:
+            raise OSError("socket close failed")
+        await original_disconnect()
+
+    monkeypatch.setattr(connection, "disconnect", close)
+    with pytest.raises(AuthKeyNotFound) as caught:
+        await sender._disconnect(terminal)
+    assert caught.value is terminal
+    with pytest.raises(AuthKeyNotFound) as caught:
+        await sender.disconnect()
+    assert caught.value is terminal
+    if ordinary_first:
+        if cleanup_fails:
+            with pytest.raises(AuthKeyNotFound):
+                await gate._disconnect_main_sender()
+        else:
+            await gate._disconnect_main_sender()
+    if cleanup_fails:
+        with pytest.raises(AuthKeyNotFound):
+            await gate.maintain_auto_resume()
+        assert gate._transport_state is telegram_rpc._TransportBoundaryState.FAILED
+        with pytest.raises(AuthKeyNotFound):
+            await gate._disconnect_main_sender()
+    else:
+        assert not await gate.maintain_auto_resume()
+        assert gate._transport_state is telegram_rpc._TransportBoundaryState.DISCONNECTED
+        assert not sender.physical_connected()
+        clock.advance(3600)
+        assert await gate.maintain_auto_resume()
+        await gate._disconnect_main_sender()
+        await gate.close_rpc_scheduler()
+    monkeypatch.setattr(connection, "disconnect", original_disconnect)
 
 
 @pytest.fixture
