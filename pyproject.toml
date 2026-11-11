@@ -15,7 +15,7 @@ dependencies = [
   "rapidfuzz>=3.14.6",
   "anyascii>=0.3.3",
   "snowballstemmer>=3.1.1",
-  "phonenumberslite>=9.0.41",
+  "phonenumberslite>=9.0.42",
   "starlette>=1.10.0",
   "uvicorn>=0.54.0",
   "python-dotenv>=1.2.4",
@@ -33,7 +33,7 @@ build-backend = "setuptools.build_meta"
 [dependency-groups]
 dev = [
     "mypy>=2.4.0",
-    "pytest>=9.1.1",
+    "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1",
     "hypothesis>=6.170.12",
     "ruff>=0.17.3",
@@ -229,6 +229,7 @@ tmp_path_retention_count = 1
 testpaths = ["tests"]
 pythonpath = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = [
   "--strict-config",
   "--strict-markers",

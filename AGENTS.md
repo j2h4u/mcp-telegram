@@ -45,7 +45,7 @@ Do not use GSD, `.planning`, or parallel project-management stores for this
 repository. Keep permanent checks and supporting code in normal project
 directories. Put temporary work in OS temporary directories and remove it when
 no longer needed.
-Use `wgr list-tickets --project TG --state active` to find current work; do not
+Use `wgr list-tickets --project TG --state open` to find current work; do not
 infer that the project is absent when automatic Git-context detection is unbound.
 On entering or resuming this project, use
 `wgr list-tickets --project TG --state waiting_for` to inspect next-review dates
