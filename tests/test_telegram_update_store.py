@@ -65,6 +65,53 @@ def test_upgrade_and_persistent_json_account_fences(tmp_path: Path, monkeypatch:
         assert store.bind_verified_account(conn, 43) == (3, False)
 
 
+def test_capacity_totals_survive_reopen_duplicates_and_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "totals.db"
+    sync_db.ensure_sync_schema(path)
+    monkeypatch.setattr(store, "MAX_ROWS", 2)
+    first, second, third = (_record(i, i, "x" * i) for i in range(1, 4))
+    with closing(sqlite3.connect(path)) as conn:
+        generation, _ = store.bind_verified_account(conn, 42)
+        assert store.begin_update_run(conn, runtime_id="one", expected_generation=generation)
+        conn.execute(
+            "INSERT INTO raw_telegram_updates(runtime_id,sequence,observed_at_ms,source,constructor,"
+            "payload_json,payload_bytes,trace_ids_json) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                first.runtime_id,
+                first.sequence,
+                first.observed_at_ms,
+                first.source,
+                first.constructor,
+                first.payload_json,
+                first.payload_bytes,
+                first.trace_ids_json,
+            ),
+        )
+        conn.commit()
+        assert store.write_update_batch(
+            conn, [first, second], now_ms=3, counters={}, expected_generation=generation, runtime_id="one"
+        )
+    with closing(sqlite3.connect(path)) as conn:
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        with pytest.raises(RuntimeError), write_transaction(conn):
+            assert store.write_update_batch(
+                conn, [third], now_ms=4, counters={}, expected_generation=generation, runtime_id="one"
+            )
+            raise RuntimeError("rollback")
+        assert store.write_update_batch(
+            conn, [third], now_ms=4, counters={}, expected_generation=generation, runtime_id="one"
+        )
+        conn.set_trace_callback(None)
+        assert not any("SELECT count(*),COALESCE(sum(payload_bytes)" in sql for sql in statements)
+        assert conn.execute("SELECT sequence FROM raw_telegram_updates ORDER BY sequence").fetchall() == [(2,), (3,)]
+        assert store._capacity_totals(conn) == (2, second.payload_bytes + third.payload_bytes)
+        assert store.bind_verified_account(conn, 43) == (2, True)
+        assert store._capacity_totals(conn) == (0, 0)
+
+
 def test_prunes_oldest_whole_rows_by_bytes_and_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "sync.db"
     sync_db.ensure_sync_schema(path)

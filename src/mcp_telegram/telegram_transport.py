@@ -493,6 +493,9 @@ class GuardedMTProtoSender(MTProtoSender):
             if owned.result is result and owned.owner is owner:
                 if not owned.state.future.done():
                     owned.state.future.set_exception(RpcReadTimeoutError("Telegram durable read response timed out"))
+                    # Let Telethon parse late responses without completing the timed-out future again.
+                    owned.state.future = asyncio.get_running_loop().create_future()
+                    owned.state.future.cancel()
                 return
         if not result.done():
             raise RuntimeError("read timeout lacks its exact application owner")

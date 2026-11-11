@@ -78,9 +78,9 @@ def test_group_status_propagates_database_read_failure() -> None:
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("unavailable", [False, True])
 async def test_registered_sync_status_projects_local_rows_and_unknown_delivery(
-    monkeypatch: pytest.MonkeyPatch, empty: bool, unavailable: bool
+    monkeypatch: pytest.MonkeyPatch, empty: bool, unavailable: bool, tmp_path: Path
 ) -> None:
-    conn = _make_db_with_dialogs()
+    conn = _make_db_with_dialogs(db_path=tmp_path / "sync.db")
     dialog_id = 123
     plan = cast(
         list[tuple[int, int, int, str]],
@@ -153,8 +153,10 @@ async def test_registered_sync_status_projects_local_rows_and_unknown_delivery(
 
 
 @pytest.mark.asyncio
-async def test_registered_status_reports_retry_without_acquisition(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = _make_db_with_dialogs()
+async def test_registered_status_reports_retry_without_acquisition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    conn = _make_db_with_dialogs(db_path=tmp_path / "sync.db")
     _seed_dialog_row(conn, 123, type_="group", members=12, created=1_700_000_000)
     _insert_synced_dialog(conn, 123, status="own_only")
     conn.execute("DELETE FROM full_history_enrollment WHERE dialog_id=123")

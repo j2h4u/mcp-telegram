@@ -111,7 +111,7 @@ depends_on = ["mcp_telegram.messages.sqlite_hydration_jobs", "mcp_telegram.conta
     "mcp_telegram.entity_store",
     "mcp_telegram.feedback_service",
     "mcp_telegram.reading",
-    "mcp_telegram.sync_read_model",
+    "mcp_telegram.sync_read_model", "mcp_telegram.sync_db",
     "mcp_telegram.history_enrollment", "mcp_telegram.conversation_changes",
     "mcp_telegram.models", "mcp_telegram.pagination", "mcp_telegram.resolver",
     "mcp_telegram.telegram_demand",

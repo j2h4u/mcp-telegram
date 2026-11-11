@@ -105,15 +105,19 @@ def _add_evictions(conn: sqlite3.Connection, name: str, count: int) -> None:
         _set_state(conn, name, int(_state(conn, name) or 0) + count)
 
 
-def _prune_capacity(conn: sqlite3.Connection, inserted_count: int) -> None:
-    if inserted_count <= 0:
-        return
-    count, size = cast(
-        tuple[int, int],
-        conn.execute("SELECT count(*),COALESCE(sum(payload_bytes),0) FROM raw_telegram_updates").fetchone(),
-    )
+def _capacity_totals(conn: sqlite3.Connection) -> tuple[int, int]:
+    count, size = _state(conn, "capacity_rows"), _state(conn, "capacity_bytes")
+    if count is None or size is None:
+        return cast(
+            tuple[int, int],
+            conn.execute("SELECT count(*),COALESCE(sum(payload_bytes),0) FROM raw_telegram_updates").fetchone(),
+        )
+    return int(count), int(size)
+
+
+def _prune_capacity(conn: sqlite3.Connection, count: int, size: int) -> tuple[int, int]:
     if count <= MAX_ROWS and size <= MAX_PAYLOAD_BYTES:
-        return
+        return count, size
     cursor = conn.execute("SELECT id,observed_at_ms,payload_bytes FROM raw_telegram_updates ORDER BY observed_at_ms,id")
     cutoff: tuple[int, int] | None = None
     for row_id, observed_at_ms, payload_bytes in cast(Iterator[tuple[int, int, int]], cursor):
@@ -126,6 +130,34 @@ def _prune_capacity(conn: sqlite3.Connection, inserted_count: int) -> None:
     assert cutoff is not None
     capacity = conn.execute("DELETE FROM raw_telegram_updates WHERE (observed_at_ms,id)<=(?,?)", cutoff).rowcount
     _add_evictions(conn, "db_evicted_capacity", capacity)
+    return count, size
+
+
+def _retain_records(conn: sqlite3.Connection, records: Sequence[UpdateRecord]) -> None:
+    if not records:
+        return
+    count, size = _capacity_totals(conn)
+    for r in records:
+        inserted = conn.execute(
+            "INSERT INTO raw_telegram_updates(runtime_id,sequence,observed_at_ms,source,constructor,"
+            "payload_json,payload_bytes,trace_ids_json) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(runtime_id,sequence) DO NOTHING",
+            (
+                r.runtime_id,
+                r.sequence,
+                r.observed_at_ms,
+                r.source,
+                r.constructor,
+                r.payload_json,
+                r.payload_bytes,
+                r.trace_ids_json,
+            ),
+        )
+        count += inserted.rowcount
+        size += inserted.rowcount * r.payload_bytes
+    count, size = _prune_capacity(conn, count, size)
+    _set_state(conn, "capacity_rows", count)
+    _set_state(conn, "capacity_bytes", size)
 
 
 def write_update_batch(  # noqa: PLR0913 - explicit batch and lifecycle boundaries
@@ -147,25 +179,7 @@ def write_update_batch(  # noqa: PLR0913 - explicit batch and lifecycle boundari
             return False
         if any(item.runtime_id != runtime_id for item in records):
             raise ValueError("batch belongs to a different runtime")
-        inserted = conn.executemany(
-            "INSERT INTO raw_telegram_updates(runtime_id,sequence,observed_at_ms,source,constructor,"
-            "payload_json,payload_bytes,trace_ids_json) VALUES(?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(runtime_id,sequence) DO NOTHING",
-            (
-                (
-                    r.runtime_id,
-                    r.sequence,
-                    r.observed_at_ms,
-                    r.source,
-                    r.constructor,
-                    r.payload_json,
-                    r.payload_bytes,
-                    r.trace_ids_json,
-                )
-                for r in records
-            ),
-        )
-        _prune_capacity(conn, inserted.rowcount)
+        _retain_records(conn, records)
         for key, value in counters.items():
             if key in {"pending_records", "pending_bytes"}:
                 _set_state(conn, key, value)
