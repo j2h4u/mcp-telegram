@@ -1,5 +1,5 @@
 ### Stage 1: builder — builds Python venv ###
-FROM python:3.15.2-slim@sha256:c4158543ecb725b99e57d129dfd43d761d4c43e4577b5e23326aabb223cf7f4e AS builder
+FROM python:3.16.0a1-slim@sha256:df293ba3b89f458e1aad6051b62ff1c4fad7b3b52b8147ae9cc4b667f9cf2741 AS builder
 
 # uv from official image — no curl or shell pipe
 COPY --from=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /usr/local/bin/uv
@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 ### Stage 2: runtime ###
-FROM python:3.15.2-slim@sha256:c4158543ecb725b99e57d129dfd43d761d4c43e4577b5e23326aabb223cf7f4e
+FROM python:3.16.0a1-slim@sha256:df293ba3b89f458e1aad6051b62ff1c4fad7b3b52b8147ae9cc4b667f9cf2741
 
 COPY --from=builder /opt/venv /opt/venv
 ENV HOME="/home/mcp-telegram" \
