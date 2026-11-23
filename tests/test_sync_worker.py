@@ -692,15 +692,19 @@ def test_real_telethon_topic_headers_and_root() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dm_bootstrap_excludes_hidden_rows_and_preserves_richer_entity_type(sync_db: _SQLiteConnection) -> None:
-    publish_local_dialogs(sync_db, [(101, "user", "Visible", None, None), (102, "user", "Hidden", None, None)])
-    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
+async def test_dm_bootstrap_keeps_omitted_rows_and_preserves_richer_entity_type(sync_db: _SQLiteConnection) -> None:
+    publish_local_dialogs(sync_db, [(101, "user", "Visible", None, None), (102, "user", "Omitted", None, None)])
+    sync_db.execute("UPDATE dialog_directory_publication SET account_id=42")
+    sync_db.execute(
+        "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+        "VALUES (42,102,'not_returned','completed_directory',10,1)"
+    )
     sync_db.execute("INSERT INTO entities(id,type,name,updated_at) VALUES (101,'channel','Rich',1)")
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
-    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 1
-    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,)]
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 2
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(101,), (102,)]
     assert sync_db.execute("SELECT type FROM entities WHERE id=101").fetchone() == ("channel",)
 
 
@@ -708,7 +712,7 @@ def test_dm_enrollment_uses_canonical_type_after_partial_realtime_identity(sync_
     sync_db.executemany("INSERT INTO dialogs(dialog_id) VALUES (?)", [(201,), (202,), (203,)])
     for dialog_id, dialog_type, name, username in (
         (201, "user", "Alice", "alice"),
-        (202, "user", "Hidden", None),
+        (202, "user", "Omitted", None),
         (203, "unknown", "Unknown", None),
     ):
         baseline = capture_identity_baseline(sync_db, dialog_id)
@@ -726,7 +730,11 @@ def test_dm_enrollment_uses_canonical_type_after_partial_realtime_identity(sync_
             ),
             baseline,
         )
-    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=202")
+    sync_db.execute("UPDATE dialog_directory_publication SET account_id=42")
+    sync_db.execute(
+        "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+        "VALUES (42,202,'not_returned','completed_directory',10,1)"
+    )
     sync_db.execute("UPDATE dialog_directory_publication SET generation=77")
     sync_db.commit()
 
@@ -751,21 +759,25 @@ def test_dm_enrollment_uses_canonical_type_after_partial_realtime_identity(sync_
     sync_db.commit()
 
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
-    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 1
-    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(201,)]
+    assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 2
+    assert sync_db.execute("SELECT dialog_id FROM synced_dialogs ORDER BY dialog_id").fetchall() == [(201,), (202,)]
 
 
 @pytest.mark.asyncio
-async def test_hidden_previously_synced_dm_is_neither_reenrolled_nor_scheduled(sync_db: _SQLiteConnection) -> None:
+async def test_omitted_previously_synced_dm_remains_scheduled(sync_db: _SQLiteConnection) -> None:
     publish_local_dialogs(sync_db, [(102, "user", "Absent", None, None)])
-    sync_db.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=102")
+    sync_db.execute("UPDATE dialog_directory_publication SET account_id=42")
+    sync_db.execute(
+        "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+        "VALUES (42,102,'not_returned','completed_directory',10,1)"
+    )
     sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (102,'syncing')")
     sync_db.execute("INSERT INTO full_history_enrollment VALUES (102,1,1)")
     sync_db.commit()
     worker = make_worker(MagicMock(), sync_db, asyncio.Event())
 
     assert worker.consume_canonical_dm_publication(cast(sqlite3.Connection, sync_db)) == 0
-    assert worker._next_pending_dialog() is None
+    assert worker._next_pending_dialog() == (102, 0)
     assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=102").fetchone() == ("syncing",)
 
 
