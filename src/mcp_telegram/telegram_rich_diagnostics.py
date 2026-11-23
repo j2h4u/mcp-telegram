@@ -10,13 +10,17 @@ from telethon.utils import get_peer_id
 _MAX_ITEMS = 100
 
 
-class RichLookupCounts(TypedDict):
-    requested: int
-    matched: int
-    explicit_empty: int
-    wrong_peer: int
-    absent: int
-    unexpected: int
+RichLookupCounts = TypedDict(  # noqa: UP013 - classification keys are consumed dynamically
+    "RichLookupCounts",
+    {
+        "requested": int,
+        "matched": int,
+        "explicit_empty": int,
+        "wrong_peer": int,
+        "absent": int,
+        "unexpected": int,
+    },
+)
 
 
 def _message_ids(request: object) -> tuple[set[int], int]:
