@@ -173,6 +173,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "folders/reference_demand.py",  # Native peer lookup through the shared gateway.
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",
+            "message_deletion_evidence.py",  # Classifies supplied Telegram deletion evidence without acquisition.
             "media_hydration.py",  # Bounded rich-message acquisition through the shared RPC gateway.
             "reactions/telegram_adapter.py",
             "rich_authoring.py",  # Constructs native rich inputs without client or network access.
@@ -187,6 +188,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "message_images/worker.py",  # Classifies selected vendor RPC errors without transport access.
             "telegram_gateway.py",
             "telegram_rpc.py",
+            "telegram_rich_diagnostics.py",  # Classifies decoded native message responses without I/O.
             "telegram_update_admission.py",  # Gate-owned vendor gap bookkeeping; no network dispatch.
             "telegram_delivery.py",  # Versioned local TL recovery serialization, no acquisition.
             "telegram_update_ring.py",  # Bounded in-memory retention of decoded TL notifications.

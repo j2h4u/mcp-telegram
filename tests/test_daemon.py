@@ -746,6 +746,11 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         def set_self_id(self, account_id: int) -> None:
             events.append(f"handler:self:{account_id}")
 
+        async def verify_channel_deletions(
+            self, _dialog_id: int, _target_ids: tuple[int, ...], _control_id: int
+        ) -> dict[str, object]:
+            return {}
+
     class _Directory:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             events.append("directory:init")
@@ -759,6 +764,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             assert connection is writer_connection and writer_active
             events.append("image:registry_bound")
 
+    verifier_binding = MagicMock()
     ctx = SimpleNamespace(
         coordinator=SimpleNamespace(run=lambda: asyncio.sleep(0)),
         rpc_observation_sink=None,
@@ -777,6 +783,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
             self_id=314,
             _policy=SimpleNamespace(full_user_pair_enabled=True, entity_detail_ttl_seconds=300),
             bind_message_image_service=lambda _service: events.append("image:service_bound"),
+            bind_channel_deletion_verifier=verifier_binding,
             bind_folder_commands=lambda _owner: None,
             bind_contact_note_commands=lambda _owner: None,
             bind_contact_commands=lambda _owner: None,
@@ -865,6 +872,7 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
         with pytest.raises(expected_error, match="synthetic startup failure"):
             await daemon.sync_main()
 
+    verifier_binding.assert_called_once_with(cast(_Handler, ctx.handler_manager).verify_channel_deletions)
     assert self_profile_start.await_count == (1 if failure_stage is None else 0)
     expected = [
         "context",

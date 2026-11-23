@@ -37,6 +37,34 @@ def repair_message(dialog_id: int, message_id: int) -> None:
         raise SystemExit(1)
 
 
+@app.command("verify-channel-deletions")
+def verify_channel_deletions(
+    dialog_id: Annotated[int, Option("--dialog-id", help="Canonical marked channel ID.")],
+    control_id: Annotated[int, Option("--control-id", help="Known available message in the same channel.")],
+    message_ids: Annotated[list[int], Option("--message-id", help="Message ID to verify; repeat up to 99 times.")],
+) -> None:
+    """Verify retained channel messages against one controlled Telegram response."""
+    import json
+    import sys
+
+    from .daemon_client import DaemonNotRunningError, daemon_connection
+
+    async def request() -> dict[str, object]:
+        async with daemon_connection() as conn:
+            return await conn.verify_channel_deletions(
+                dialog_id=dialog_id, message_ids=message_ids, control_id=control_id
+            )
+
+    try:
+        result = asyncio.run(request())
+    except (ConfigError, DaemonNotRunningError, OSError, TimeoutError) as exc:
+        print(f"Verification unavailable: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(json.dumps(result, ensure_ascii=False))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 @app.command("export-chat")
 def export_chat(
     dialog_id: Annotated[str, Argument(help="Public Telegram group URL, @username, or canonical negative group ID.")],

@@ -43,6 +43,7 @@ from telethon.errors import (  # type: ignore[import-untyped]
     FloodWaitError,
     InterdcCallErrorError,
     InterdcCallRichErrorError,
+    MessageIdsEmptyError,
     RpcCallFailError,
     RPCError,
     RpcMcgetFailError,
@@ -124,6 +125,7 @@ from .telegram_image_download import (
     iter_photo_chunks,
     photo_locator_from_message,
 )
+from .telegram_rich_diagnostics import classify_rich_lookup, rich_response_kind
 from .telegram_rpc_consumers import (
     CONNECTION_BOOTSTRAP_MAX_RPC_ATTEMPTS,
     DemandKind,
@@ -8452,7 +8454,13 @@ class TelegramRpcGate(TelegramClient):
         assert task is not None
         self._vendor_call_tasks.add(task)
         try:
-            return await super()._call(sender, request, ordered=ordered)  # type: ignore[misc]
+            result = await super()._call(sender, request, ordered=ordered)  # type: ignore[misc]
+            self._observe_rich_lookup(scope, request, result)
+            return result
+        except MessageIdsEmptyError as exc:
+            if type(exc) is MessageIdsEmptyError and type(request) is functions.channels.GetMessagesRequest:
+                self._observe_rich_lookup(scope, request, None, empty_error=True)
+            raise
         except (FloodWaitError, FloodPremiumWaitError, FloodTestPhoneWaitError) as exc:
             vendor_cache = self._is_vendor_cache_deferral(exc, request, sender)
             if vendor_cache:
@@ -8472,6 +8480,49 @@ class TelegramRpcGate(TelegramClient):
             raise
         finally:
             self._vendor_call_tasks.discard(task)
+
+    def _observe_rich_lookup(
+        self, scope: TelegramRpcScope, request: object, response: object, *, empty_error: bool = False
+    ) -> None:
+        if self._rpc_request_observer is None or not self._is_rich_lookup(scope, request):
+            return
+        try:
+            counts = classify_rich_lookup(request, response, current_peer_target())
+            if empty_error:
+                counts["absent"] = counts["unexpected"] = 0
+            reason = "message_ids_empty" if empty_error else rich_response_kind(response)
+            if reason == "native_messages" and not any(
+                counts[key] for key in ("explicit_empty", "wrong_peer", "absent", "unexpected")
+            ):
+                return
+            self._rpc_request_observer(
+                scope=TelegramRpcScope(
+                    scope.source,
+                    scope.service_class,
+                    None,
+                    None,
+                    demand_kind=scope.demand_kind,
+                    acquisition_kind=scope.acquisition_kind,
+                ),
+                phase="rich_lookup_anomaly",
+                rich_lookup_counts=counts,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001 - passive diagnostics cannot alter Telegram behavior
+            logger.debug("rich_lookup_observation_failed")
+
+    @staticmethod
+    def _is_rich_lookup(scope: TelegramRpcScope, request: object) -> bool:
+        budget = scope.attempt_budget
+        selected = budget.selected if budget is not None else None
+        return (
+            scope.demand_kind in {DemandKind.LIVE_HYDRATION_BATCH, DemandKind.BACKFILL_HYDRATION_BATCH}
+            and scope.acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
+            and selected is not None
+            and selected.key.demand_kind is scope.demand_kind
+            and selected.key.target.startswith("rich_composition:")
+            and type(request) in {functions.messages.GetMessagesRequest, functions.channels.GetMessagesRequest}
+        )
 
     def _is_vendor_cache_deferral(
         self,

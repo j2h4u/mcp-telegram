@@ -29,7 +29,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Protocol, cast, runtime_checkable
 
-from telethon import events  # type: ignore[import-untyped]
+from telethon import events, functions, types  # type: ignore[import-untyped]
 from telethon.tl.types import (  # type: ignore[import-untyped]
     Channel,
     ChannelParticipantBanned,
@@ -136,8 +136,10 @@ from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .image_authorization import ScopeToken
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
+from .message_deletion_evidence import classify_channel_lookup, classify_dm_lookup, valid_channel_verification
 from .message_delivery_observations import observe_current
 from .messages.sqlite_bundle import (
+    all_messages_retained,
     find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
@@ -594,6 +596,8 @@ class _EventHandlerClient(Protocol):
 
     async def get_messages(self, *_args: object, **_kwargs: object) -> object: ...
 
+    def retained_draft_peer(self, dialog_id: int) -> object | None: ...
+
     async def get_me(self) -> object: ...
 
     async def get_entity(self, _dialog_id: object) -> object: ...
@@ -666,6 +670,16 @@ _SELECT_SYNCED_ONLY_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.status = 'synced'"
 )
+
+
+def _eligible_for_deletion_verification(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    """Require active history enrollment and a fully synchronized dialog."""
+    status = cast(
+        tuple[str] | None,
+        conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+    )
+    return full_history_enabled(conn, dialog_id) and status is not None and status[0] == "synced"
+
 
 # ---------------------------------------------------------------------------
 # Phase 42 SQL — dialogs event writes. Body metadata remains UPDATE-only;
@@ -3479,6 +3493,64 @@ class EventHandlerManager:
     # DM gap scan
     # ------------------------------------------------------------------
 
+    async def verify_channel_deletions(
+        self, dialog_id: int, target_ids: tuple[int, ...], control_id: int
+    ) -> dict[str, object]:
+        """Verify an explicit bounded channel cohort before marking deletions."""
+        if not valid_channel_verification(dialog_id, target_ids, control_id):
+            raise ValueError("invalid bounded channel verification")
+        scope = self._client.capture_image_scope()
+        if scope is None or scope.scope.account_id != self._self_id:
+            raise RuntimeError("account scope unavailable")
+        ids = (*target_ids, control_id)
+
+        def reserve(conn: sqlite3.Connection) -> int:
+            with write_transaction(conn):
+                if not self._client.claim_image_scope(scope) or bound_profile_account(conn) != self._self_id:
+                    raise RuntimeError("account scope changed")
+                if not _eligible_for_deletion_verification(conn, dialog_id):
+                    raise RuntimeError("dialog history unavailable")
+                if not all_messages_retained(conn, dialog_id, ids):
+                    raise ValueError("requested messages are not retained")
+                return allocate_observation_order(conn)
+
+        observation_order = await self._writer.run(reserve)
+        with peer_target(dialog_id):
+            peer = self._client.retained_draft_peer(dialog_id)
+            if not isinstance(peer, types.InputPeerChannel) or get_peer_id(peer) != dialog_id:
+                raise RuntimeError("channel identity unavailable")
+            channel = types.InputChannel(peer.channel_id, peer.access_hash)
+            request = functions.channels.GetMessagesRequest(channel, [types.InputMessageID(item) for item in ids])
+            response = await self._client(request)
+        evidence = classify_channel_lookup(response, dialog_id, frozenset(target_ids), control_id)
+        now = int(time.time())
+
+        def persist(conn: sqlite3.Connection) -> int:
+            with write_transaction(conn):
+                if not self._client.claim_image_scope(scope) or bound_profile_account(conn) != self._self_id:
+                    return 0
+                if not _eligible_for_deletion_verification(conn, dialog_id):
+                    return 0
+                marked = 0
+                for message_id in evidence.deleted_ids:
+                    current = cast(
+                        tuple[int] | None,
+                        conn.execute(
+                            "SELECT observation_order FROM message_observations WHERE dialog_id=? AND message_id=?",
+                            (dialog_id, message_id),
+                        ).fetchone(),
+                    )
+                    if (current is None or current[0] <= observation_order) and mark_message_deleted(
+                        conn, dialog_id, message_id, now
+                    ):
+                        marked += 1
+                if not self._client.claim_image_scope(scope):
+                    raise RuntimeError("account scope changed during verification")
+                return marked
+
+        marked = await self._writer.run(persist)
+        return {"requested": len(target_ids), "newly_marked": marked, "not_marked": len(target_ids) - marked}
+
     @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
     async def run_dm_gap_scan(self) -> int:
         """Scan all synced DM dialogs for deleted messages via live Telegram lookup.
@@ -3547,18 +3619,12 @@ class EventHandlerManager:
 
         observation_order, reaction_boundary = await self._writer.run(reserve)
         with peer_target(dialog_id):
-            results = cast(
-                "Sequence[_MessageLike | None]",
-                await self._client.get_messages(dialog_id, ids=list(message_ids)),
+            response = await self._client(
+                functions.messages.GetMessagesRequest([types.InputMessageID(item) for item in message_ids])
             )
         now = int(time.time())
-        survivors = extract_received_messages(
-            [
-                result
-                for queried_id, result in zip(message_ids, results, strict=False)
-                if result is not None and getattr(result, "id", None) == queried_id
-            ]
-        )
+        evidence = classify_dm_lookup(response, dialog_id, frozenset(message_ids))
+        survivors = extract_received_messages(evidence.surviving_messages)
 
         def _persist_event_0(conn: sqlite3.Connection) -> int:
             marked = 0
@@ -3569,9 +3635,12 @@ class EventHandlerManager:
                 )
                 if not self._client.claim_image_scope(scope):
                     return 0
-                can_mark_deleted = full_history_enabled(conn, dialog_id) and status == ("synced",)
-                for queried_id, returned_msg in zip(message_ids, results, strict=False):
-                    if returned_msg is None and can_mark_deleted:
+                can_mark_deleted = (
+                    full_history_enabled(conn, dialog_id) and status is not None and status[0] == "synced"
+                )
+                owners = find_unique_nonchannel_message_dialogs(conn, tuple(evidence.deleted_ids))
+                for queried_id in evidence.deleted_ids:
+                    if can_mark_deleted and owners.get(queried_id) == dialog_id:
                         current = cast(
                             tuple[int] | None,
                             conn.execute(

@@ -460,9 +460,13 @@ class RpcAdmissionObservationAggregator:
         incident_owner_attempt: str | None = None,
         rejection: BudgetRejection | None = None,
         owner_summary: BudgetRejection | None = None,
+        rich_lookup_counts: Mapping[str, int] | None = None,
     ) -> None:
         """Bounded method counters and biased root samples; never admit work."""
         try:
+            if phase == "rich_lookup_anomaly":
+                self._observe_rich_lookup(scope, rich_lookup_counts, reason)
+                return
             if phase == "incident_unknown":
                 self._observe_unknown_incident(
                     scope,
@@ -496,6 +500,27 @@ class RpcAdmissionObservationAggregator:
                 self._sample_rpc_event(operation_id, payload, wall_ms)
             self.flush_if_due()
         except Exception:  # noqa: BLE001 - neither payloads nor observer failures enter the product path
+            with self._state_lock:
+                self._rpc_lost_rows += 1
+
+    def _observe_rich_lookup(
+        self, scope: TelegramRpcScope, counts: Mapping[str, int] | None, reason: str | None
+    ) -> None:
+        max_count = 202
+        keys = ("requested", "matched", "explicit_empty", "wrong_peer", "absent", "unexpected")
+        if (
+            counts is None
+            or not _valid_rpc_scope(scope)
+            or reason not in {"message_ids_empty", "native_messages", "native_not_modified", "native_invalid"}
+        ):
+            return
+        if any(type(counts.get(key)) is not int or not 0 <= counts[key] <= max_count for key in keys):
+            return
+        payload: dict[str, object] = {key: counts[key] for key in keys}
+        payload.update(source=scope.source.value, reason=reason)
+        if not self._record_rpc_row(
+            outcome="rich_lookup_anomaly", payload=payload, observed_at_ms=int(time.time() * _MILLISECONDS_PER_SECOND)
+        ):
             with self._state_lock:
                 self._rpc_lost_rows += 1
 
