@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from telethon.tl import types
+from telethon.tl import functions, types
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.image_authorization import ScopeCell
@@ -52,8 +52,10 @@ async def test_gap_scan_retains_edited_survivor_without_extra_request(tmp_path: 
         conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (55,'user',0)")
         insert_messages_with_fts(conn, [extract_message_row(55, old)])
 
-    async def get_messages(dialog_id: int, *, ids: list[int]) -> object:
-        assert dialog_id == 55 and ids == [7]
+    async def get_messages(request: object) -> object:
+        assert isinstance(request, functions.messages.GetMessagesRequest)
+        assert len(request.id) == 1 and isinstance(request.id[0], types.InputMessageID)
+        assert request.id[0].id == 7
         if case == "revoke":
             change = cell.begin_change()
             cell.end_change(change)
@@ -62,9 +64,9 @@ async def test_gap_scan_retains_edited_survivor_without_extra_request(tmp_path: 
         if case == "syncing":
             with write_transaction(conn):
                 conn.execute("UPDATE synced_dialogs SET status='syncing' WHERE dialog_id=55")
-        return [edited]
+        return types.messages.Messages(messages=[edited], topics=[], chats=[], users=[])
 
-    client.get_messages = get_messages
+    client.side_effect = get_messages
     assert await manager.run_dm_gap_scan_page(55, [7]) == 0
     if case == "revoke":
         assert conn.execute("SELECT text FROM messages WHERE dialog_id=55 AND message_id=7").fetchone() == ("old body",)

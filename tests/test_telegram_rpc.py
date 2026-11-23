@@ -3590,6 +3590,9 @@ class _DmEventHandlerGateClient:
     def claim_image_scope(self, token: ScopeToken) -> bool:
         return self._gate.claim_image_scope(token)
 
+    def retained_draft_peer(self, dialog_id: int) -> object | None:
+        return self._gate.retained_draft_peer(dialog_id)
+
     async def get_messages(self, *args: object, **kwargs: object) -> object:
         return await self._gate.get_messages(*args, **kwargs)
 
@@ -3715,10 +3718,13 @@ async def _dispatch_forward_history_sibling(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("not_modified", [False, True])
 async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_cursor(
-    tmp_path: Path, request: pytest.FixtureRequest
+    tmp_path: Path, request: pytest.FixtureRequest, not_modified: bool
 ) -> None:
     conn = _dm_reconciliation_test_db()
+    conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (211, 2, 1)")
+    conn.commit()
     gate, sender, adapter, scanner = await _real_dm_page_adapter(conn, tmp_path, request)
     try:
         budget = _selected_dm_page_budget(adapter)
@@ -3727,22 +3733,35 @@ async def test_dm_page_success_uses_real_get_messages_and_commits_tombstone_curs
 
         rpc_request = sender.requests[0]
         assert isinstance(rpc_request, functions.messages.GetMessagesRequest)
-        assert len(rpc_request.id) == 1
+        assert len(rpc_request.id) == 2
         assert rpc_request.id[0].id == 1
+        assert rpc_request.id[1].id == 2
         scope = sender.scopes[0]
         assert scope.demand_kind is DemandKind.DM_DELETION_RECONCILIATION
         assert scope.acquisition_kind is AcquisitionKind.MESSAGE_LOOKUP
         assert scope.attempt_budget is budget
-        sender.futures[0].set_result(types.messages.MessagesNotModified(count=1))
+        response = (
+            types.messages.MessagesNotModified(count=2)
+            if not_modified
+            else types.messages.Messages(
+                messages=[types.MessageEmpty(1, None), types.Message(2, types.PeerUser(211), None, "control")],
+                topics=[],
+                chats=[],
+                users=[],
+            )
+        )
+        sender.futures[0].set_result(response)
         await task
 
         assert scanner.calls == 1
         assert budget.attempts == 1
-        assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (1,)
+        assert conn.execute("SELECT is_deleted FROM messages WHERE dialog_id=211 AND message_id=1").fetchone() == (
+            int(not not_modified),
+        )
         state = _dm_reconciliation_state_for_rpc_test(conn)
         assert state["status"] == "running"
         assert state["dialog_id_cursor"] == 211
-        assert state["message_cursor"] == 1
+        assert state["message_cursor"] == 2
     finally:
         await gate.close_rpc_scheduler()
         conn.close()
@@ -3753,12 +3772,14 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
     tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
     conn = _dm_reconciliation_test_db()
+    conn.execute("INSERT INTO messages(dialog_id, message_id, sent_at) VALUES (211, 2, 1)")
+    conn.commit()
     gate, sender, adapter, scanner = await _real_dm_page_adapter(conn, tmp_path, request)
     try:
         conn.execute(
             """CREATE TRIGGER fail_dm_cursor_commit
                BEFORE INSERT ON daemon_state
-               WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"message_cursor\": 1%'
+               WHEN NEW.key='delta_dm_gap_scan_state' AND NEW.value LIKE '%\"message_cursor\": 2%'
                BEGIN SELECT RAISE(ABORT, 'injected cursor commit failure'); END"""
         )
         conn.commit()
@@ -3767,7 +3788,14 @@ async def test_dm_page_cursor_commit_failure_preserves_tombstone_and_blocks_reco
         task = asyncio.create_task(adapter.run_slice(budget))
         await _wait_for(lambda: sender.calls == 1)
         assert isinstance(sender.requests[0], functions.messages.GetMessagesRequest)
-        sender.futures[0].set_result(types.messages.MessagesNotModified(count=1))
+        sender.futures[0].set_result(
+            types.messages.Messages(
+                messages=[types.MessageEmpty(1, None), types.Message(2, types.PeerUser(211), None, "control")],
+                topics=[],
+                chats=[],
+                users=[],
+            )
+        )
         with pytest.raises(sqlite3.IntegrityError, match="injected cursor commit failure"):
             await task
 
