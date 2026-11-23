@@ -114,7 +114,8 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 
 - **dotMD is archived/stopped.** Its source-export daemon API is retained only
   as archived code and its port is deliberately not registered in the active
-  daemon dispatch table. It is not a current downstream consumer.
+  daemon dispatch table. It is not a current downstream consumer. See the
+  [archive notes](archive/dotmd/README.md).
 - Keep the active integration boundary explicit: mcp-telegram owns Telegram
   auth, sync, and local state. Generic Unix-socket and HTTP MCP serving remain
   active; do not remove them for the archived dotMD integration.
@@ -184,6 +185,7 @@ MCP serving code uses daemon APIs and read-only DB access for lightweight querie
 - `conversation_changes.py` — `list_conversation_changes`
 
 Canonical tool registry: `tools/__init__.py`. Total: 25 MCP tools.
+The [tool output inventory](tests/fixtures/52-TOOL-OUTPUT-INVENTORY.md) is a test fixture.
 All registered tools expose `outputSchema`. Successful MCP tool calls put agent-facing data in `structuredContent` and return empty
 `content`, except `get_message_image`, which returns one native JPEG image when available. Text rendering belongs to non-MCP surfaces such as a future CLI.
 Recoverable tool errors still use `isError=true` with concise text and an Action hint.
