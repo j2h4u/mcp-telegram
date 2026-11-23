@@ -113,14 +113,9 @@ def test_migration_rearms_unwitnessed_access_recovery_without_losing_facts(
         tuple[object, ...] | None,
         conn.execute("SELECT * FROM delta_access_recovery_state WHERE dialog_id=13").fetchone(),
     )
-    conn.close()
-    sync_db.ensure_sync_schema(path)
-    conn = sync_db._open_sync_db(path)
+    assert sync_db._apply_migration_96(conn, 95) == 96
     try:
         assert _preserved_rows(conn, message_columns) == preserved
-        assert conn.execute(
-            "SELECT rich_message,formatting_text FROM messages WHERE dialog_id=11 AND message_id=500"
-        ).fetchone() == (None, None)
         assert conn.execute("SELECT * FROM delta_access_recovery_state").fetchall() == [witnessed]
         after = conn.execute(
             "SELECT dialog_id,status,access_lost_at,access_next_revalidate_at,delta_message_id,delta_retry_at FROM synced_dialogs ORDER BY dialog_id"
@@ -137,11 +132,14 @@ def test_migration_rearms_unwitnessed_access_recovery_without_losing_facts(
         )
         selected = adapter.status(0)
         assert selected is not None and selected.selected is not None
-        assert selected.selected.key.target == "probe:14" and selected.release_at == 200
+        assert selected.selected.key.target == "probe:16" and selected.release_at == 50
         second = adapter.status(0, excluded=frozenset({selected.selected}))
         assert second is not None and second.selected is not None
-        assert second.selected.key.target == "probe:16" and second.release_at == 200
+        assert second.selected.key.target == "probe:14" and second.release_at == 200
         sync_db.ensure_sync_schema(path)
+        assert conn.execute(
+            "SELECT rich_message,formatting_text FROM messages WHERE dialog_id=11 AND message_id=500"
+        ).fetchone() == (None, None)
         assert _preserved_rows(conn, message_columns) == preserved
         assert conn.execute("SELECT * FROM delta_access_recovery_state").fetchall() == [witnessed]
     finally:
