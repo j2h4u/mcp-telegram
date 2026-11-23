@@ -131,7 +131,7 @@ from .sync_read_model import (
     history_sync_state,
 )
 from .sync_transactions import write_transaction
-from .telegram_demand import AcquisitionKind, demand_context
+from .telegram_demand import AcquisitionKind, RpcAttemptBudget, demand_context
 from .telegram_demand_progress import WorkRevision
 from .telegram_rpc_consumers import DemandKind
 from .telegram_rpc_scheduler import (
@@ -141,9 +141,37 @@ from .telegram_rpc_scheduler import (
     TelegramRpcAdmissionDeferred,
     TelegramRpcSource,
     UnclassifiedTelegramRpcError,
+    rpc_attempt_budget,
     rpc_scope,
 )
 from .topics.catalog import TopicCatalogRepository
+
+_CHANNEL_MARK_OFFSET = 1_000_000_000_000
+_MAX_DELETION_TARGETS = 99
+
+
+def _valid_message_id(value: object) -> bool:
+    return type(value) is int and 0 < value < 2**31
+
+
+def _valid_channel_deletion_request(dialog_id: object, ids: object, control: object) -> bool:
+    if type(dialog_id) is not int or not -(2**63) <= dialog_id < -_CHANNEL_MARK_OFFSET:
+        return False
+    if not _valid_message_id(control):
+        return False
+    if not isinstance(ids, list) or not 1 <= len(ids) <= _MAX_DELETION_TARGETS:
+        return False
+    return all(_valid_message_id(value) for value in ids) and control not in ids and len(set(ids)) == len(ids)
+
+
+def _deletion_verification_response(result: dict[str, object], count: int) -> dict[str, object]:
+    requested, confirmed, not_marked = (result.get(key) for key in ("requested", "newly_marked", "not_marked"))
+    if not all(type(value) is int for value in (requested, confirmed, not_marked)):
+        return {"ok": False, "error": "verification_failed", "message": "Verification result is invalid."}
+    requested, confirmed, not_marked = cast(int, requested), cast(int, confirmed), cast(int, not_marked)
+    if requested != count or min(confirmed, not_marked) < 0 or confirmed + not_marked != requested:
+        return {"ok": False, "error": "verification_failed", "message": "Verification result is invalid."}
+    return {"ok": True, "data": {"requested": requested, "newly_marked": confirmed, "not_marked": not_marked}}
 
 
 def _dm_deletion_reconciliation_is_blocked(conn: sqlite3.Connection) -> bool:
@@ -901,6 +929,15 @@ class DaemonAPIServer:
         self._contact_note_commands: DraftCommands | None = None
         self._contact_commands: DraftCommands | None = None
         self._message_image_service: MessageImageServicePort | None = None
+        self._channel_deletion_verifier: Callable[[int, tuple[int, ...], int], Awaitable[dict[str, object]]] | None = (
+            None
+        )
+
+    def bind_channel_deletion_verifier(
+        self, verifier: Callable[[int, tuple[int, ...], int], Awaitable[dict[str, object]]]
+    ) -> None:
+        """Attach the daemon-owned finite channel deletion verifier."""
+        self._channel_deletion_verifier = verifier
 
     def bind_message_image_service(self, service: MessageImageServicePort) -> None:
         """Attach the account-fenced image service after daemon composition."""
@@ -1423,6 +1460,7 @@ class DaemonAPIServer:
     def _dispatch_handlers(self) -> dict[str, _DispatchHandler]:
         return {
             "export_chat": self._export_chat,
+            "verify_channel_deletions": self._verify_channel_deletions,
             "list_messages": self._list_messages,
             "get_draft": self._get_draft,
             "get_message_image": self._get_message_image,
@@ -1469,6 +1507,9 @@ class DaemonAPIServer:
         if handler is None:
             return {"ok": False, "error": "unknown_method"}
 
+        if method == "verify_channel_deletions":
+            return await self._verify_channel_deletions(req)
+
         if method == "export_chat":
             with demand_context(DemandKind.CHAT_EXPORT_OPERATION):
                 with _preserve_or_rpc_scope(TelegramRpcSource.CHAT_EXPORT):
@@ -1482,19 +1523,59 @@ class DaemonAPIServer:
                 with _preserve_or_rpc_scope(TelegramRpcSource.OPERATOR_LOGOUT):
                     return await self._logout_account(req)
 
-        if method in {
+        mutation = method in {
             "manage_draft",
             "manage_scheduled_message",
             "manage_folder",
             "manage_contact_note",
             "manage_contact",
-        }:
+        }
+        scope = nullcontext() if mutation else _preserve_or_rpc_scope(TelegramRpcSource.MCP_INTERACTIVE)
+        with scope:
             result = handler(req)
             return result if isinstance(result, dict) else cast(dict[str, object], await result)
 
-        with _preserve_or_rpc_scope(TelegramRpcSource.MCP_INTERACTIVE):
-            result = handler(req)
-            return result if isinstance(result, dict) else cast(dict[str, object], await result)
+    async def _verify_channel_deletions(self, req: dict[str, object]) -> dict[str, object]:
+        dialog_id, ids, control = req.get("dialog_id"), req.get("message_ids"), req.get("control_id")
+        if not _valid_channel_deletion_request(dialog_id, ids, control):
+            return {
+                "ok": False,
+                "error": "invalid_input",
+                "message": "Supply one channel, 1–99 unique message IDs and a distinct control ID.",
+            }
+        scope, verifier = self._auth_scope, self._channel_deletion_verifier
+        if scope is None or scope.account_id != self.self_id or verifier is None:
+            return {
+                "ok": False,
+                "error": "account_unverified",
+                "message": "Verified account or deletion verifier unavailable.",
+            }
+        try:
+            with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=time.monotonic() + 30.0):
+                with _preserve_or_rpc_scope(
+                    TelegramRpcSource.MCP_INTERACTIVE, acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP
+                ):
+                    async with asyncio.timeout(30.0):
+                        with rpc_attempt_budget(RpcAttemptBudget(1)):
+                            result = await verifier(
+                                cast(int, dialog_id), tuple(cast(list[int], ids)), cast(int, control)
+                            )
+        except TimeoutError:
+            return {
+                "ok": False,
+                "error": "verification_timeout",
+                "message": "Verification timed out; result is unconfirmed.",
+            }
+        except Exception as exc:  # noqa: BLE001 - no raw Telegram error details cross the operator boundary
+            logger.warning("channel_deletion_verification_failed error_type=%s", type(exc).__name__)
+            return {
+                "ok": False,
+                "error": "verification_failed",
+                "message": "Verification failed; result is unconfirmed.",
+            }
+        if self._auth_scope != scope or self.self_id != scope.account_id:
+            return {"ok": False, "error": "account_changed", "message": "Account changed; result is unconfirmed."}
+        return _deletion_verification_response(result, len(cast(list[int], ids)))
 
     async def _export_chat(self, req: dict[str, object]) -> dict[str, object]:
         from .chat_export import export_operation

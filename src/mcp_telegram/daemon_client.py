@@ -510,6 +510,19 @@ class DaemonConnection:
             }
         )
 
+    async def verify_channel_deletions(
+        self, *, dialog_id: int, message_ids: list[int], control_id: int
+    ) -> dict[str, object]:
+        """Run one bounded channel deletion verification through the daemon."""
+        return await self.request(
+            {
+                "method": "verify_channel_deletions",
+                "dialog_id": dialog_id,
+                "message_ids": message_ids,
+                "control_id": control_id,
+            }
+        )
+
     async def repair_message(self, *, dialog_id: int, message_id: int) -> dict:
         """Request bounded rich-composition recovery for one retained message."""
         return await self.request({"method": "repair_message", "dialog_id": dialog_id, "message_id": message_id})

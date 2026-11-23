@@ -2931,6 +2931,7 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
             profile_pair_mode="enabled" if ctx.api_server._policy.full_user_pair_enabled else "disabled",
             profile_detail_ttl_seconds=ctx.api_server._policy.entity_detail_ttl_seconds,
         )
+        ctx.api_server.bind_channel_deletion_verifier(ctx.handler_manager.verify_channel_deletions)
         _bind_event_observers(ctx)
         ctx.handler_manager.register()
         logger.info("event handlers registered behind startup account barrier")
