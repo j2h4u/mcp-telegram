@@ -37,7 +37,7 @@ class FolderProfilePort(_PairClient):
 async def test_full_user_folder_name_uses_only_original_account(
     tmp_path: Path, account_id: int | None, projection_account: int, expected: str | None, paired: bool
 ) -> None:
-    conn, raw_service = _prepare(tmp_path / "folder-name.db", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "folder-name.db")
     service = cast(DaemonEntityInfoService, raw_service)
     seed_folder_snapshot(conn, [(7, "Account A folder")], [])
     conn.execute("UPDATE telegram_folder_projection_state SET account_id=? WHERE singleton=1", (projection_account,))

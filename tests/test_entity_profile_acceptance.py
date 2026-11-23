@@ -71,7 +71,7 @@ async def test_actual_sink_loss_is_durable_and_does_not_change_pair_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "pair-telemetry-loss.sqlite"
-    conn, service = _prepare(path, migrated=True)
+    conn, service = _prepare(path)
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
@@ -138,7 +138,7 @@ async def test_file_backed_pending_pair_shutdown_preserves_state_then_reopens_fo
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "pending-pair-shutdown.sqlite"
-    conn, raw_service = _prepare(path, migrated=True)
+    conn, raw_service = _prepare(path)
     service = cast(object, raw_service)
     service._deps = replace(service._deps, full_user_auth_scope=None)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]

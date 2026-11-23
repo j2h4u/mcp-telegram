@@ -16,7 +16,6 @@ from typing import Protocol, cast
 from telethon.errors import PeerIdInvalidError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from .access_lifecycle import set_access_lost
 from .dialog_fact_observations import claim_dialog_fact
 from .dialog_identity import capture_identity_baseline, publish_dialog_identity
 from .dialog_identity_contracts import IDENTITY_OMITTED, DialogIdentityObservation
@@ -49,6 +48,10 @@ from .topics.contracts import TopicSourceUnavailableError, is_topic_capable
 from .topics.refresh import TopicRefresher
 
 logger = logging.getLogger(__name__)
+
+
+class DialogLookupDeniedError(Exception):
+    """A profile or topic request failed without proving history access loss."""
 
 
 @contextmanager
@@ -97,8 +100,8 @@ class _DialogSyncClient(Protocol):
 _EntityFields = dict[str, object]
 
 
-_SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
-_SELECT_DIRTY_DIALOG_EXISTS_SQL = "SELECT 1 FROM dialogs WHERE needs_refresh = 1 AND hidden = 0 LIMIT 1"
+_SELECT_DIRTY_DIALOGS_SQL = "SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=dialogs.dialog_id AND sd.status='access_lost')"
+_SELECT_DIRTY_DIALOG_EXISTS_SQL = "SELECT 1 FROM dialogs WHERE needs_refresh = 1 AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=dialogs.dialog_id AND sd.status='access_lost') LIMIT 1"
 _UPDATE_DIALOG_ENTITY_SQL = (
     "UPDATE dialogs SET members=?, created=COALESCE(?,created), needs_refresh=0, snapshot_at=? "
     "WHERE dialog_id=? AND revision=?"
@@ -167,7 +170,8 @@ class DialogReconciliationWorker:
             current = cast(
                 tuple[int, int] | None,
                 conn.execute(
-                    "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)
+                    "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=? AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=dialogs.dialog_id AND sd.status='access_lost')",
+                    (dialog_id,),
                 ).fetchone(),
             )
             successor = None if current is None else f"{current[0]}:{current[1]}"
@@ -185,7 +189,7 @@ class DialogReconciliationWorker:
             lambda db: cast(
                 tuple[int, int] | None,
                 db.execute(
-                    "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=? AND needs_refresh=1 AND hidden=0",
+                    "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=? AND needs_refresh=1 AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=dialogs.dialog_id AND sd.status='access_lost')",
                     (dialog_id,),
                 ).fetchone(),
             )
@@ -238,17 +242,7 @@ class DialogReconciliationWorker:
             )
             return False
         if isinstance(exc, ACCESS_LOST_ERRORS):
-            reason = type(exc).__name__
-            observed_at = int(time.time())
-            counts = await self._writer.run(
-                lambda db: _record_access_lost(db, dialog_id, reason, owner, observation_order, observed_at)
-            )
-            if self._access_loss_observer is not None:
-                try:
-                    self._access_loss_observer(counts)
-                except Exception:  # noqa: BLE001
-                    logger.debug("access_loss_observer_failed")
-            return False
+            raise DialogLookupDeniedError from exc
         if isinstance(exc, PeerIdInvalidError):
             logger.warning(
                 "recon_light_pass_peer_invalid dialog_id=%s (session cache miss; will retry next cycle)", dialog_id
@@ -310,22 +304,6 @@ class DialogReconciliationWorker:
         return count
 
 
-def _record_access_lost(  # noqa: PLR0913, PLR0917
-    conn: sqlite3.Connection, dialog_id: int, reason: str, owner: int | None, order: int, observed_at: int
-) -> MembershipSignalCounts:
-    with write_transaction(conn):
-        return set_access_lost(
-            conn,
-            dialog_id,
-            observed_at,
-            reason=reason,
-            profile_owner_account_id=owner,
-            observation_order=order,
-            membership_revision_at=observed_at,
-            processing_at=int(time.time()),
-        ).membership_counts
-
-
 def _publish_light_identity(
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -368,7 +346,7 @@ class DialogLightReconciliationDemandAdapter:
         rows = cast(
             list[tuple[int, int, int]],
             self._worker._conn.execute(
-                "SELECT dialog_id,revision,identity_revision FROM dialogs WHERE needs_refresh=1 AND hidden=0 ORDER BY dialog_id"
+                "SELECT dialog_id,revision,identity_revision FROM dialogs WHERE needs_refresh=1 AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=dialogs.dialog_id AND sd.status='access_lost') ORDER BY dialog_id"
             ).fetchall(),
         )
         for dialog_id, revision, identity_revision in rows:
@@ -381,12 +359,13 @@ class DialogLightReconciliationDemandAdapter:
 
     def _selected_for(self, dialog_id: int) -> WorkRevision | None:
         row = cast(
-            tuple[int, int, int, int] | None,
+            tuple[int, int, int] | None,
             self._worker._conn.execute(
-                "SELECT revision,identity_revision,needs_refresh,hidden FROM dialogs WHERE dialog_id=?", (dialog_id,)
+                "SELECT revision,identity_revision,needs_refresh FROM dialogs WHERE dialog_id=? AND NOT EXISTS (SELECT 1 FROM synced_dialogs sd WHERE sd.dialog_id=dialogs.dialog_id AND sd.status='access_lost')",
+                (dialog_id,),
             ).fetchone(),
         )
-        if row is None or not row[2] or row[3]:
+        if row is None or not row[2]:
             return None
         return WorkRevision(WorkKey(self.demand_kind, self._account_id, str(dialog_id)), f"{row[0]}:{row[1]}")
 
@@ -417,6 +396,8 @@ class DialogLightReconciliationDemandAdapter:
                     )
                 except RpcAttemptBudgetExhaustedError:
                     return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+                except DialogLookupDeniedError:
+                    return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
         if accepted and accepted_revisions:
             return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, accepted_revisions[-1])
         return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)

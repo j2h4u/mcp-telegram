@@ -19,7 +19,8 @@ from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
-_CURRENT_SCHEMA_VERSION = 103
+_DIALOG_LISTING_EVIDENCE_MIGRATION = 104
+_CURRENT_SCHEMA_VERSION = _DIALOG_LISTING_EVIDENCE_MIGRATION
 _TODO_MEDIA_MIGRATION = 103
 _RICH_COMPOSITION_MIGRATION = 102
 _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION = 101
@@ -5112,7 +5113,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
     current = _apply_migrations_93_to_100(conn, current)
     current = _apply_migrations_101_to_102(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _TODO_MEDIA_MIGRATION:
-        _apply_migration_103(conn, current)
+        current = _apply_migration_103(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _DIALOG_LISTING_EVIDENCE_MIGRATION:
+        current = _apply_migration_104(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
 
@@ -5175,6 +5178,84 @@ def _apply_migrations_101_to_102(conn: sqlite3.Connection, current: int) -> int:
     if _CURRENT_SCHEMA_VERSION >= _RICH_COMPOSITION_MIGRATION:
         current = _apply_migration_102(conn, current)
     return current
+
+
+_FOLDER_PEER_REFERENCES_DDL = (
+    "CREATE TABLE IF NOT EXISTS folder_peer_references ("
+    "account_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, kind TEXT NOT NULL, "
+    "access_hash INTEGER, auth_scope TEXT, observation_order INTEGER NOT NULL, "
+    "metadata_state TEXT NOT NULL DEFAULT 'pending', capability_revision INTEGER NOT NULL DEFAULT 0, "
+    "metadata_observed_at INTEGER, metadata_source TEXT, metadata_error_code TEXT, "
+    "metadata_candidate TEXT NOT NULL DEFAULT 'native', PRIMARY KEY(account_id,dialog_id)) WITHOUT ROWID"
+)
+
+
+def _apply_migration_104(conn: sqlite3.Connection, current: int) -> int:
+    """Separate completed directory observations from retained dialog facts."""
+    if current >= _DIALOG_LISTING_EVIDENCE_MIGRATION:
+        return current
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_FOLDER_PEER_REFERENCES_DDL)
+        for field in ("include", "pins", "exclude"):
+            conn.execute(
+                "INSERT OR IGNORE INTO folder_peer_references(account_id,dialog_id,kind,observation_order) "
+                "SELECT r.account_id,CAST(p.value AS INTEGER),'unknown',r.observation_order "
+                "FROM telegram_folder_rules r, json_each(r.rule_json,?) p "
+                "WHERE r.account_id IS NOT NULL AND r.deleted=0 AND r.catalog_member IS NOT 0 AND p.type='integer'",
+                (f"$.{field}",),
+            )
+        conn.execute(
+            "UPDATE folder_peer_references SET metadata_state='retained' WHERE metadata_state='pending' "
+            "AND EXISTS (SELECT 1 FROM dialogs d LEFT JOIN entities e ON e.id=d.dialog_id "
+            "WHERE d.dialog_id=folder_peer_references.dialog_id AND "
+            "(d.identity_complete=1 OR (e.name IS NOT NULL AND e.type IN ('user','bot','group','supergroup','channel'))))"
+        )
+    except BaseException:
+        conn.rollback()
+        raise
+    return _apply_migration(
+        conn,
+        current,
+        104,
+        [
+            "DROP INDEX IF EXISTS idx_dialogs_hidden_pinned",
+            "DROP INDEX IF EXISTS idx_dialogs_needs_refresh_hidden",
+            "DROP TRIGGER IF EXISTS dialogs_revision_after_update",
+            "ALTER TABLE synced_dialogs ADD COLUMN access_loss_scope TEXT CHECK(access_loss_scope IN ('history','membership') OR access_loss_scope IS NULL)",
+            "ALTER TABLE synced_dialogs ADD COLUMN access_scope_observed_at INTEGER",
+            "ALTER TABLE synced_dialogs ADD COLUMN access_loss_event_seq INTEGER",
+            (
+                "UPDATE synced_dialogs SET access_loss_event_seq=(SELECT e.seq FROM conversation_history_events e "
+                "WHERE e.dialog_id=synced_dialogs.dialog_id AND e.kind='access_lost' "
+                "AND e.seq>COALESCE((SELECT MAX(r.seq) FROM conversation_history_events r "
+                "WHERE r.dialog_id=e.dialog_id AND r.kind='access_restored'),0) "
+                "ORDER BY e.seq DESC LIMIT 1) WHERE status='access_lost'"
+            ),
+            (
+                "UPDATE synced_dialogs SET access_loss_scope='membership' WHERE status='access_lost' AND EXISTS ("
+                "SELECT 1 FROM conversation_history_events e WHERE e.seq=synced_dialogs.access_loss_event_seq "
+                "AND e.access_change_cause IN ('self_left','removed_by_admin','banned_by_admin'))"
+            ),
+            (
+                "UPDATE synced_dialogs SET access_next_revalidate_at=CAST(strftime('%s','now') AS INTEGER) "
+                "WHERE status='access_lost' AND access_loss_scope IS NULL AND NOT EXISTS ("
+                "SELECT 1 FROM dialog_fact_observations state JOIN dialog_fact_observations witness "
+                "ON witness.dialog_id=state.dialog_id AND witness.observation_order=state.observation_order "
+                "WHERE state.dialog_id=synced_dialogs.dialog_id AND state.field='access_state' "
+                "AND witness.field='access_recovery_witness')"
+            ),
+            "ALTER TABLE dialogs DROP COLUMN hidden",
+            _DIALOGS_REVISION_TRIGGER_DDL.replace("snapshot_at,hidden,needs_refresh", "snapshot_at,needs_refresh"),
+            "CREATE INDEX idx_dialogs_pinned ON dialogs(pinned DESC)",
+            "CREATE INDEX idx_dialogs_needs_refresh ON dialogs(needs_refresh)",
+            "CREATE TABLE dialog_listing_observations (account_id INTEGER NOT NULL, dialog_id INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('returned','not_returned')), source TEXT NOT NULL CHECK(source='completed_directory'), observed_at INTEGER NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY(account_id,dialog_id)) WITHOUT ROWID",
+            "DELETE FROM dialog_directory_baseline",
+            "ALTER TABLE dialog_directory_baseline ADD COLUMN baseline_exists INTEGER NOT NULL DEFAULT 1 CHECK(baseline_exists IN (0,1))",
+            "DELETE FROM dialog_directory_staging",
+            "UPDATE dialog_directory_state SET status='pending',ordinary_status='pending',pinned_main_status='pending',pinned_archive_status='pending',offset_date=NULL,offset_id=0,offset_peer=NULL,observation_started_at=NULL,observation_completed_at=NULL,observed_count=0,reason='listing_evidence_cutover',retry_at=NULL WHERE status IN ('in_progress','incomplete')",
+        ],
+    )
 
 
 def _apply_migration_103(conn: sqlite3.Connection, current: int) -> int:

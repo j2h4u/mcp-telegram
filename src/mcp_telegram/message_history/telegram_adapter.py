@@ -52,6 +52,13 @@ class _TelegramHistoryClient(Protocol):
     async def get_entity(self, peer: object) -> object: ...
 
 
+async def _resolve_history_input(client: _TelegramHistoryClient, dialog_id: int) -> object:
+    try:
+        return await client.get_input_entity(dialog_id)
+    except (RPCError, TimeoutError, OSError) as exc:
+        raise MessageHistoryUnavailableError(f"message history peer unavailable for dialog {dialog_id}") from exc
+
+
 class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
     """Translate one exact Telegram backward page into canonical message rows."""
 
@@ -72,21 +79,21 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
 
     async def fetch_page(self, dialog_id: int, *, before_message_id: int) -> FullHistoryPage:
         observed_at = int(time.time())
+        input_entity = await _resolve_history_input(self._client, dialog_id)
         try:
-            input_entity = await self._client.get_input_entity(dialog_id)
             response = await _fetch_raw_history_page(self._client, input_entity, before_message_id)
-            raw_messages = tuple(cast(Sequence[object], getattr(response, "messages", ()) or ()))
-            raw_count = len(raw_messages)
-            next_cursor = _history_cursor(raw_messages)
-            messages = await _normalize_full_history_messages(
-                dialog_id, response, self._client, input_entity, self._entity_lookup_context
-            )
         except ACCESS_LOST_ERRORS as exc:
             raise MessageHistoryAccessLostError(
                 f"message history access lost for dialog {dialog_id}", reason_code=type(exc).__name__
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
+        raw_messages = tuple(cast(Sequence[object], getattr(response, "messages", ()) or ()))
+        raw_count = len(raw_messages)
+        next_cursor = _history_cursor(raw_messages)
+        messages = await _normalize_full_history_messages(
+            dialog_id, response, self._client, input_entity, self._entity_lookup_context
+        )
         raw_total = cast(object, getattr(response, "count", getattr(response, "total", None)))
         total_messages = raw_count if raw_total is None else _optional_nonnegative_int(raw_total)
         return FullHistoryPage(
@@ -181,8 +188,9 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
         should_stop: Callable[[], bool],
     ) -> ForwardGapPage:
         observed_at = int(time.time())
+        input_entity = await _resolve_history_input(self._client, dialog_id)
         try:
-            input_entity, response = await _fetch_forward_history_response(self._client, dialog_id, after_message_id)
+            response = await _fetch_forward_history_response(self._client, input_entity, after_message_id)
         except ACCESS_LOST_ERRORS as exc:
             raise MessageHistoryAccessLostError(
                 f"message history access lost for dialog {dialog_id}", reason_code=type(exc).__name__
@@ -195,10 +203,9 @@ class TelethonForwardGapPageAdapter(ForwardGapPagePort):
 
 
 async def _fetch_forward_history_response(
-    client: _TelegramHistoryClient, dialog_id: int, after_message_id: int
-) -> tuple[object, object]:
-    input_entity = await client.get_input_entity(dialog_id)
-    response = await client(
+    client: _TelegramHistoryClient, input_entity: object, after_message_id: int
+) -> object:
+    return await client(
         GetHistoryRequest(
             peer=cast(TypeInputPeer, input_entity),
             offset_id=after_message_id + 1,
@@ -210,7 +217,6 @@ async def _fetch_forward_history_response(
             hash=0,
         )
     )
-    return input_entity, response
 
 
 def _build_forward_gap_page(  # noqa: PLR0913, PLR0917 - response and request context
@@ -298,8 +304,9 @@ class TelethonHistoryAccessProbe:
         return self._client.claim_image_scope(token)
 
     async def probe_total_messages(self, dialog_id: int) -> HistoryAccessProbeResult:
+        input_entity = await _resolve_history_input(self._client, dialog_id)
         try:
-            response = await self._client.get_messages(entity=dialog_id, limit=1)
+            response = await self._client.get_messages(entity=input_entity, limit=1)
         except ACCESS_LOST_ERRORS as exc:
             raise MessageHistoryAccessLostError(
                 f"message history access lost for dialog {dialog_id}", reason_code=type(exc).__name__

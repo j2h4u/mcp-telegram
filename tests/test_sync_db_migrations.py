@@ -2334,6 +2334,7 @@ def test_v59_seeds_active_scheduled_repairs_and_staggers_discovery(tmp_path: Pat
         conn.execute("DROP TABLE scheduled_reconciliation_state")
         remove_v80_schema_for_historical_fixture(conn)
         conn.execute("DELETE FROM schema_version WHERE version=59")
+        conn.execute("ALTER TABLE dialogs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
         conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
         conn.execute(
             "INSERT INTO scheduled_messages(dialog_id, message_id, scheduled_at, first_seen_at, updated_at) "
@@ -2511,7 +2512,7 @@ def test_v64_preserves_legacy_generation_one_without_manufacturing_a_receipt(tmp
             "UPDATE dialog_full_reconciliation_state SET generation=1,status='in_progress',offset_date=NULL,"
             "offset_id=0,offset_peer=NULL,observed_count=0 WHERE singleton=1"
         )
-        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (77,'kept','user',1,0)")
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at) VALUES (77,'kept','user',1)")
         conn.commit()
 
         assert _apply_migration_64(conn, 63) == 64
@@ -2536,7 +2537,7 @@ def test_v64_keeps_completed_legacy_generation_one_pending_for_raw_proof(tmp_pat
         conn.execute(
             "UPDATE dialog_full_reconciliation_state SET generation=1,status='idle',observed_count=0 WHERE singleton=1"
         )
-        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at,hidden) VALUES (78,'kept','user',1,0)")
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,snapshot_at) VALUES (78,'kept','user',1)")
         conn.commit()
 
         assert _apply_migration_64(conn, 63) == 64

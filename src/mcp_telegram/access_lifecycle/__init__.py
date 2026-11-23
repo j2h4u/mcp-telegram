@@ -34,6 +34,43 @@ class AccessLossResult:
     membership_counts: MembershipSignalCounts
 
 
+@dataclass(frozen=True, slots=True)
+class _AccessTransition:
+    record_event: bool
+    select_event: bool
+    observe_scope: bool
+
+
+def _loss_observation(
+    reason: str | None, scope: str | None, evidence: AccessLossEvidence | None
+) -> tuple[str | None, str | None]:
+    if evidence is None:
+        return reason, scope
+    if evidence.access_change_cause in {"self_left", "removed_by_admin", "banned_by_admin"}:
+        scope = "membership"
+    return evidence.reason_code, scope
+
+
+def _classify_access_transition(
+    previous_status: str | None,
+    prior_scope: str | None,
+    scope: str | None,
+    *,
+    recovery_observed: bool,
+    has_evidence: bool,
+) -> _AccessTransition:
+    """Decide which current-episode facts a newly accepted loss can replace."""
+    new_episode = previous_status != "access_lost" or recovery_observed
+    accepted_scope = scope is not None and (prior_scope != "membership" or scope == "membership")
+    stronger_evidence = accepted_scope and (prior_scope != scope or has_evidence)
+    select_event = new_episode or stronger_evidence
+    return _AccessTransition(
+        record_event=select_event or has_evidence,
+        select_event=select_event,
+        observe_scope=select_event and accepted_scope,
+    )
+
+
 def _purge_hydration_jobs(conn: sqlite3.Connection, dialog_id: int) -> None:
     HydrationQueueRepository(conn).remove_active_for_dialog(dialog_id)
 
@@ -60,6 +97,7 @@ def set_access_lost(  # noqa: PLR0913
     now: int,
     *,
     reason: str | None = None,
+    access_scope: str | None = None,
     evidence: AccessLossEvidence | None = None,
     refresh_generation: int | None = None,
     profile_owner_account_id: int | None = None,
@@ -67,28 +105,59 @@ def set_access_lost(  # noqa: PLR0913
     membership_revision_at: int | None = None,
     processing_at: int | None = None,
 ) -> AccessLossResult:
-    """Atomically mark a peer inaccessible and hide its local snapshot."""
-    changed = False
-    counts = MembershipSignalCounts()
-    reason_code = evidence.reason_code if evidence is not None else reason
+    """Atomically mark a peer inaccessible while retaining its local snapshot."""
+    reason_code, access_scope = _loss_observation(reason, access_scope, evidence)
     with write_savepoint(conn):
         recovery_observed = observation_order is not None and _has_current_recovery_witness(conn, dialog_id)
         if not _accept_access_loss(conn, dialog_id, profile_owner_account_id, observation_order):
-            return AccessLossResult(False, counts)
-        previous_status = _mark_access_lost_state(conn, dialog_id, now, refresh_generation)
-        if previous_status != "access_lost" or recovery_observed:
-            _record_access_loss(conn, dialog_id, now, membership_revision_at, previous_status, reason_code, evidence)
-            changed = True
-            if profile_owner_account_id is not None:
-                counts = request_membership_refreshes(
-                    conn,
-                    profile_owner_account_id,
-                    [MembershipChange(dialog_id, frozenset({profile_owner_account_id}), membership_revision_at)],
-                    now=now if processing_at is None else processing_at,
-                )
-    if changed:
-        logger.warning("access_lost dialog_id=%d reason_code=%s", dialog_id, reason_code)
-    return AccessLossResult(changed, counts)
+            return AccessLossResult(False, MembershipSignalCounts())
+        if recovery_observed:
+            conn.execute(
+                "UPDATE synced_dialogs SET access_lost_at=?,access_next_revalidate_at=NULL,"
+                "access_loss_scope=NULL,access_scope_observed_at=NULL,access_loss_event_seq=NULL WHERE dialog_id=?",
+                (now, dialog_id),
+            )
+        prior_scope_row = cast(
+            tuple[str | None] | None,
+            conn.execute("SELECT access_loss_scope FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+        )
+        prior_scope = prior_scope_row[0] if prior_scope_row else None
+        previous_status = _mark_access_lost_state(conn, dialog_id, now, refresh_generation, access_scope)
+        transition = _classify_access_transition(
+            previous_status,
+            prior_scope,
+            access_scope,
+            recovery_observed=recovery_observed,
+            has_evidence=evidence is not None,
+        )
+        if transition.observe_scope:
+            conn.execute("UPDATE synced_dialogs SET access_scope_observed_at=? WHERE dialog_id=?", (now, dialog_id))
+        if not transition.record_event:
+            return AccessLossResult(False, MembershipSignalCounts())
+        event_seq = _record_access_loss(
+            conn, dialog_id, now, membership_revision_at, previous_status, reason_code, evidence
+        )
+        if transition.select_event:
+            conn.execute("UPDATE synced_dialogs SET access_loss_event_seq=? WHERE dialog_id=?", (event_seq, dialog_id))
+        counts = _request_loss_membership_refresh(
+            conn,
+            dialog_id,
+            profile_owner_account_id,
+            membership_revision_at,
+            now if processing_at is None else processing_at,
+        )
+    logger.warning("access_lost dialog_id=%d reason_code=%s", dialog_id, reason_code)
+    return AccessLossResult(True, counts)
+
+
+def _request_loss_membership_refresh(
+    conn: sqlite3.Connection, dialog_id: int, owner: int | None, revision_at: int | None, now: int
+) -> MembershipSignalCounts:
+    if owner is None:
+        return MembershipSignalCounts()
+    return request_membership_refreshes(
+        conn, owner, [MembershipChange(dialog_id, frozenset({owner}), revision_at)], now=now
+    )
 
 
 def _record_access_loss(  # noqa: PLR0913, PLR0917
@@ -99,9 +168,9 @@ def _record_access_loss(  # noqa: PLR0913, PLR0917
     previous_status: str | None,
     reason_code: str | None,
     evidence: AccessLossEvidence | None,
-) -> None:
+) -> int:
     telegram_time = evidence is not None and occurred_at is not None
-    conn.execute(
+    cursor = conn.execute(
         """INSERT INTO conversation_history_events(
                kind, occurred_at, time_basis, dialog_id, reason_code, previous_status, access_change_cause, actor_id
            ) VALUES ('access_lost', ?, ?, ?, ?, ?, ?, ?)""",
@@ -115,6 +184,8 @@ def _record_access_loss(  # noqa: PLR0913, PLR0917
             evidence.actor_id if evidence is not None else None,
         ),
     )
+    assert cursor.lastrowid is not None
+    return cursor.lastrowid
 
 
 def _accept_access_loss(
@@ -126,7 +197,7 @@ def _accept_access_loss(
 
 
 def _mark_access_lost_state(
-    conn: sqlite3.Connection, dialog_id: int, now: int, refresh_generation: int | None
+    conn: sqlite3.Connection, dialog_id: int, now: int, refresh_generation: int | None, access_scope: str | None
 ) -> str | None:
     revoke_peer(conn, dialog_id)
     row = cast(
@@ -136,18 +207,17 @@ def _mark_access_lost_state(
     previous_status = str(row[0]) if row is not None and row[0] is not None else None
     if row is None:
         conn.execute(
-            "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at) VALUES (?, 'access_lost', ?)",
-            (dialog_id, now),
+            "INSERT INTO synced_dialogs (dialog_id, status, access_lost_at, access_loss_scope) VALUES (?, 'access_lost', ?, ?)",
+            (dialog_id, now, access_scope),
         )
     else:
         conn.execute(
-            "UPDATE synced_dialogs SET status = 'access_lost', access_lost_at = ?, delta_refresh_requested_at = CASE WHEN ? IS NULL OR delta_refresh_generation=? THEN NULL ELSE delta_refresh_requested_at END WHERE dialog_id = ?",
-            (now, refresh_generation, refresh_generation, dialog_id),
+            "UPDATE synced_dialogs SET access_loss_scope = CASE WHEN status!='access_lost' THEN ? WHEN access_loss_scope='membership' THEN access_loss_scope ELSE COALESCE(?,access_loss_scope) END, access_next_revalidate_at = CASE WHEN status!='access_lost' THEN NULL ELSE access_next_revalidate_at END, access_lost_at = CASE WHEN status='access_lost' THEN access_lost_at ELSE ? END, status = 'access_lost', delta_refresh_requested_at = CASE WHEN ? IS NULL OR delta_refresh_generation=? THEN NULL ELSE delta_refresh_requested_at END WHERE dialog_id = ?",
+            (access_scope, access_scope, now, refresh_generation, refresh_generation, dialog_id),
         )
     invalidate_scheduled_access_loss(conn, dialog_id, now)
     reset_read_position_retry(conn, dialog_id)
     _purge_hydration_jobs(conn, dialog_id)
-    conn.execute("UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?", (now, dialog_id))
     return previous_status
 
 
@@ -184,7 +254,7 @@ def restore_access_after_revalidation(
         if was_access_lost:
             revoke_peer(conn, dialog_id)
         conn.execute(
-            "UPDATE synced_dialogs SET access_lost_at = NULL, access_last_revalidated_at = ?, access_next_revalidate_at = NULL WHERE dialog_id = ?",
+            "UPDATE synced_dialogs SET access_lost_at = NULL, access_loss_scope = NULL, access_scope_observed_at = NULL, access_loss_event_seq = NULL, access_last_revalidated_at = ?, access_next_revalidate_at = NULL WHERE dialog_id = ?",
             (now, dialog_id),
         )
         restore_access_status(conn, dialog_id)
@@ -203,13 +273,7 @@ def restore_access_after_revalidation(
                 (dialog_id,),
             )
         _rearm_terminal_reaction_details(conn, dialog_id, now)
-        conn.execute(
-            """INSERT INTO dialogs (dialog_id, hidden, needs_refresh, snapshot_at, archived, pinned,
-               unread_mentions_count, unread_reactions_count)
-               VALUES (?, 0, 1, ?, 0, 0, 0, 0)
-               ON CONFLICT(dialog_id) DO UPDATE SET hidden = 0, needs_refresh = 1, snapshot_at = excluded.snapshot_at""",
-            (dialog_id, now),
-        )
+        conn.execute("UPDATE dialogs SET needs_refresh = 1 WHERE dialog_id = ?", (dialog_id,))
         if total_messages is not None:
             conn.execute(
                 "UPDATE synced_dialogs SET total_messages = ? WHERE dialog_id = ?", (total_messages, dialog_id)
@@ -266,8 +330,8 @@ def due_access_revalidations(conn: sqlite3.Connection, *, now: int, cooldown_sec
         conn.execute(
             """SELECT dialog_id FROM synced_dialogs
            WHERE status = 'access_lost'
-             AND MAX(COALESCE(access_next_revalidate_at, 0), COALESCE(access_lost_at, 0) + ?) <= ?
-           ORDER BY MAX(COALESCE(access_next_revalidate_at, 0), COALESCE(access_lost_at, 0) + ?), dialog_id LIMIT ?""",
+             AND COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?) <= ?
+           ORDER BY COALESCE(access_next_revalidate_at, COALESCE(access_lost_at, 0) + ?), dialog_id LIMIT ?""",
             (cooldown_seconds, now, cooldown_seconds, limit),
         ).fetchall(),
     )
@@ -293,17 +357,6 @@ def complete_access_revalidation(conn: sqlite3.Connection, dialog_id: int, check
         )
 
 
-def unhide_after_realtime_presence(conn: sqlite3.Connection, dialog_id: int) -> bool:
-    """Expose a catalog row proved present by realtime without reviving access loss."""
-    with write_savepoint(conn):
-        cursor = conn.execute(
-            "UPDATE dialogs SET hidden=0 WHERE dialog_id=? AND hidden=1 AND "
-            + not_access_lost_sql("dialogs.dialog_id"),
-            (dialog_id,),
-        )
-    return cursor.rowcount > 0
-
-
 __all__ = [
     "AccessLossEvidence",
     "AccessLossResult",
@@ -314,5 +367,4 @@ __all__ = [
     "restore_access_after_revalidation",
     "set_access_lost",
     "stamp_access_revalidation",
-    "unhide_after_realtime_presence",
 ]

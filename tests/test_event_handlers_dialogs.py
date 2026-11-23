@@ -16,13 +16,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TypedDict, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from telethon.tl.types import (  # type: ignore[import-untyped]
@@ -137,9 +138,9 @@ def _insert_dialog(
     conn.execute(
         "INSERT OR REPLACE INTO dialogs "
         "(dialog_id, name, type, archived, pinned, members, created, "
-        " last_message_at, snapshot_at, hidden, needs_refresh, "
+        " last_message_at, snapshot_at, needs_refresh, "
         " unread_mentions_count, unread_reactions_count) "
-        "VALUES (?, 'X', 'channel', 0, ?, NULL, NULL, ?, ?, 0, ?, 0, 0)",
+        "VALUES (?, 'X', 'channel', 0, ?, NULL, NULL, ?, ?, ?, 0, 0)",
         (dialog_id, opts.pinned, opts.last_message_at, opts.snapshot_at, opts.needs_refresh),
     )
     conn.commit()
@@ -699,7 +700,7 @@ async def test_update_dialog_unread_mark_false_is_exact_and_does_not_unhide(
     dialog_id = get_peer_id(PeerUser(user_id=user_id))
     _enroll_synced(sync_db, dialog_id)
     _insert_dialog(sync_db, dialog_id, needs_refresh=0, snapshot_at=1)
-    sync_db.execute("UPDATE dialogs SET hidden=1, unread_mark=1 WHERE dialog_id=?", (dialog_id,))
+    sync_db.execute("UPDATE dialogs SET unread_mark=1 WHERE dialog_id=?", (dialog_id,))
     sync_db.commit()
 
     upd = UpdateDialogUnreadMark(
@@ -710,10 +711,10 @@ async def test_update_dialog_unread_mark_false_is_exact_and_does_not_unhide(
     await mgr.on_raw_dialog_pinned(upd)
 
     row = sync_db.execute(
-        "SELECT hidden, unread_mark, unread_mark_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
+        "SELECT unread_mark, unread_mark_observed_at FROM dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone()
-    assert row[0:2] == (1, 0)
-    assert row[2] is not None
+    assert row[0] == 0
+    assert row[1] is not None
 
 
 @pytest.mark.asyncio
@@ -805,7 +806,7 @@ async def test_realtime_username_clear_is_authoritative_without_changing_presenc
     _insert_dialog(sync_db, dialog_id, snapshot_at=1)
     sync_db.execute(
         "UPDATE dialogs SET name='Known Name',type='user',username='old',identity_complete=1,"
-        "identity_source='directory',identity_observed_at=10,hidden=1 WHERE dialog_id=?",
+        "identity_source='directory',identity_observed_at=10 WHERE dialog_id=?",
         (dialog_id,),
     )
     sync_db.execute(
@@ -819,8 +820,8 @@ async def test_realtime_username_clear_is_authoritative_without_changing_presenc
     manager._update_realtime_username(sync_db, SimpleNamespace(user_id=dialog_id, usernames=[]), now=20)
 
     assert sync_db.execute(
-        "SELECT name,username,type,identity_complete,hidden FROM dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == ("Known Name", None, "user", 0, 1)
+        "SELECT name,username,type,identity_complete FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == ("Known Name", None, "user", 0)
     assert sync_db.execute(
         "SELECT revision,identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (presence_revision, 1)
@@ -1410,8 +1411,8 @@ async def test_non_unread_handlers_do_not_insert_into_dialogs_table(
     await mgr.on_raw_inbox_read(cast(_InboxReadUpdateLike, upd_read))
     assert _dialogs_count(sync_db) == 1
     assert sync_db.execute(
-        "SELECT hidden, needs_refresh, snapshot_at, unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == (0, 1, None, 0)
+        "SELECT needs_refresh, snapshot_at, unread_count FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (1, None, 0)
 
     # Test 4: on_new_message — enrolled in synced_dialogs but NO dialogs row
     _enroll_synced(sync_db, dialog_id)
@@ -1724,10 +1725,37 @@ async def test_stale_linked_chat_access_loss_does_not_change_dialog(
     sync_db.commit()
     manager = _make_manager(mock_client, sync_db, shutdown_event)
     manager.set_self_id(42)
-    await manager._mark_linked_chat_access_lost(work, 102, RuntimeError(), 42, 10)
+    await manager._writer.run(lambda conn: manager._defer_linked_chat_work(conn, work, 102))
     assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
         "synced",
     )
     assert sync_db.execute(
         "SELECT COUNT(*) FROM dialog_fact_observations WHERE dialog_id=? AND field='access_state'", (dialog_id,)
     ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_linked_metadata_denial_only_defers_metadata(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from telethon.errors import ChannelPrivateError
+    from telethon.tl.types import InputChannel
+
+    from mcp_telegram.linked_chat_fact import linked_chat_fact_owner
+
+    dialog_id = -1_000_000_000_006
+    _enroll_synced(sync_db, dialog_id)
+    _insert_dialog(sync_db, dialog_id)
+    linked_chat_fact_owner.invalidate_from_update(sync_db, dialog_id, 100)
+    work = linked_chat_fact_owner.pending_work(sync_db)[0]
+    sync_db.commit()
+    manager = _make_manager(mock_client, sync_db, shutdown_event)
+    with patch.object(linked_chat_fact_owner, "acquire", side_effect=ChannelPrivateError(request=None)):
+        assert await manager._request_linked_chat_full(work, InputChannel(channel_id=6, access_hash=1)) is None
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "synced",
+    )
+    failure_count, retry_at = sync_db.execute(
+        "SELECT failure_count,retry_at FROM linked_chat_fact_state WHERE channel_id=?", (dialog_id,)
+    ).fetchone()
+    assert failure_count == 1 and retry_at > int(time.time())

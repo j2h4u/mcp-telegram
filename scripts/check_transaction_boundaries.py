@@ -74,6 +74,7 @@ _SYNC_DB_BOOTSTRAP_TRANSACTIONS = frozenset(
         "_apply_migration_97",
         "_apply_migration_102",
         "_apply_migration_103",
+        "_apply_migration_104",
     }
     | TRANSACTION_EXCEPTIONS[Path("sync_db.py")]
 )

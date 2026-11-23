@@ -37,6 +37,7 @@ from mcp_telegram.drafts.owner import DraftMessageOwner
 from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, EntityRefreshCoordinator
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter, MessageFactHydrationWorker
+from mcp_telegram.folders.reference_demand import FolderPeerMetadataDemandAdapter
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker, FolderVerification
 from mcp_telegram.hydration_queue import HydrationPriority
 from mcp_telegram.image_authorization import ScopeToken
@@ -262,7 +263,6 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
             writer=dependencies.writer,
             membership_observer=membership_observer,
-            access_loss_observer=access_loss_observer,
         ),
         DemandKind.LIVE_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,
@@ -284,6 +284,9 @@ def build_durable_adapter_map(
         ),
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter(
             dependencies.dialog_reconciliation_worker, account_id=dependencies.account_id
+        ),
+        DemandKind.FOLDER_PEER_METADATA: FolderPeerMetadataDemandAdapter(
+            dependencies.client, dependencies.conn, dependencies.writer, dependencies.account_id
         ),
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter(
             dependencies.client,
@@ -317,7 +320,6 @@ def build_durable_adapter_map(
             account_id=dependencies.account_id,
             writer=dependencies.writer,
             membership_observer=membership_observer,
-            access_loss_observer=access_loss_observer,
         ),
         DemandKind.BACKFILL_HYDRATION_BATCH: FactHydrationDemandAdapter(
             dependencies.fact_hydration_worker,

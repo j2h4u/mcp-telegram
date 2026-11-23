@@ -374,6 +374,13 @@ def folder_catalog_owner(conn: sqlite3.Connection) -> int | None:
 
 def read_folder(conn: sqlite3.Connection, account_id: int, folder_id: int) -> dict[str, object]:
     """Read retained folder facts without initiating acquisition."""
+    from ..sync_transactions import read_snapshot
+
+    with read_snapshot(conn):
+        return _read_folder_snapshot(conn, account_id, folder_id)
+
+
+def _read_folder_snapshot(conn: sqlite3.Connection, account_id: int, folder_id: int) -> dict[str, object]:
     from .read_model import folder_snapshot
     from .sqlite_repository import SQLiteFolderSnapshotRepository, read_folder_rules
 

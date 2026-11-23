@@ -1620,7 +1620,6 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
             "created",
             "last_message_at",
             "snapshot_at",
-            "hidden",
             "needs_refresh",
             "unread_mentions_count",
             "unread_reactions_count",
@@ -1648,7 +1647,6 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
         for col_name in (
             "archived",
             "pinned",
-            "hidden",
             "needs_refresh",
             "unread_mentions_count",
             "unread_reactions_count",
@@ -1686,7 +1684,7 @@ def test_dialogs_columns_match_current_schema(tmp_sync_db_path: Path) -> None:
 def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
     """dialogs table has at least the three v17-era indexes after full migration.
 
-    Note: idx_dialogs_needs_refresh_hidden is intentionally NOT listed here —
+    Note: idx_dialogs_needs_refresh is intentionally NOT listed here —
     it is added by the v20 migration (Phase 43). That index is verified
     separately by test_v20_adds_needs_refresh_index.
     """
@@ -1698,12 +1696,12 @@ def test_schema_v17_dialogs_indexes(tmp_sync_db_path: Path) -> None:
         )
         index_names = {str(row[0]) for row in rows}
         expected_v17_indexes = {
-            "idx_dialogs_hidden_pinned",
+            "idx_dialogs_pinned",
             "idx_dialogs_type",
             "idx_dialogs_snapshot_at",
         }
         # Use issubset so future migrations adding new indexes don't break this test.
-        # v20 adds idx_dialogs_needs_refresh_hidden — see test_v20_adds_needs_refresh_index.
+        # v20 adds idx_dialogs_needs_refresh — see test_v20_adds_needs_refresh_index.
         assert expected_v17_indexes.issubset(index_names), (
             f"v17-era indexes missing. Expected subset {expected_v17_indexes}, got: {index_names}"
         )
@@ -1790,7 +1788,7 @@ def test_synced_dialogs_has_delta_freshness_columns(tmp_sync_db_path: Path) -> N
 
 
 def test_v20_adds_needs_refresh_index(tmp_path: Path) -> None:
-    """Phase 43 RECON-02: composite index covers needs_refresh + hidden."""
+    """The current index covers needs_refresh."""
     from mcp_telegram.sync_db import ensure_sync_schema
 
     db_path = tmp_path / "sync.db"
@@ -1798,18 +1796,15 @@ def test_v20_adds_needs_refresh_index(tmp_path: Path) -> None:
     conn = _open_db(db_path)
     try:
         row = _fetchone_row(
-            conn, "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dialogs_needs_refresh_hidden'"
+            conn, "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dialogs_needs_refresh'"
         )
         assert row is not None, (
-            "idx_dialogs_needs_refresh_hidden missing — Plan 02 SELECT will "
-            "trigger a full table scan every hourly cycle"
+            "idx_dialogs_needs_refresh missing — Plan 02 SELECT will trigger a full table scan every hourly cycle"
         )
         # Confirm SQLite uses the new index for the planned light-pass query.
-        plan = _fetchall_rows(
-            conn, "EXPLAIN QUERY PLAN SELECT dialog_id FROM dialogs WHERE needs_refresh = 1 AND hidden = 0"
-        )
+        plan = _fetchall_rows(conn, "EXPLAIN QUERY PLAN SELECT dialog_id FROM dialogs WHERE needs_refresh = 1")
         plan_text = " ".join(str(row) for row in plan)
-        assert "idx_dialogs_needs_refresh_hidden" in plan_text, f"Query planner ignored the index. EXPLAIN: {plan_text}"
+        assert "idx_dialogs_needs_refresh" in plan_text, f"Query planner ignored the index. EXPLAIN: {plan_text}"
     finally:
         conn.close()
 

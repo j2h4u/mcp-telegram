@@ -210,7 +210,7 @@ async def test_background_reconciliation_survives_restart_beyond_waiter_capacity
     service._deps = replace(service._deps, self_id=42)
     with write_savepoint(conn):
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,name,type,archived,hidden) VALUES (?,'DM','user',1,1)",
+            "INSERT INTO dialogs(dialog_id,name,type,archived) VALUES (?,'DM','user',1)",
             ((entity_id,) for entity_id in range(1000, 1129)),
         )
         conn.executemany(

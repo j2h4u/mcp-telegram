@@ -1909,6 +1909,9 @@ async def test_access_probe_slice_records_retry_policy_for_probe_outcomes(
     assert conn.execute(
         "SELECT access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)
     ).fetchone() == (expected_retry,)
+    assert conn.execute("SELECT access_loss_scope FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        "history" if error_kind == "access" else None,
+    )
 
 
 @pytest.mark.asyncio
@@ -1965,8 +1968,7 @@ async def test_access_probe_propagates_exhausted_slice_budget(conn: sqlite3.Conn
 @pytest.mark.asyncio
 async def test_dialog_light_adapter_clears_one_durable_dirty_flag(conn: sqlite3.Connection) -> None:
     conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, hidden, needs_refresh, snapshot_at) "
-        "VALUES (401, 'old', 'user', 0, 1, 1)"
+        "INSERT INTO dialogs (dialog_id, name, type, needs_refresh, snapshot_at) VALUES (401, 'old', 'user', 1, 1)"
     )
     conn.commit()
     observed_scopes: list[TelegramRpcScope] = []
@@ -2012,8 +2014,8 @@ async def test_dialog_light_refresh_treats_deleted_row_as_stale(conn: sqlite3.Co
     assert await worker._refresh_light_dialog(999999) == (False, None)
 
 
-@pytest.mark.parametrize(("retry_at", "expected"), [(None, 1100), (1050, 1100), (1200, 1200)])
-def test_access_probe_scheduler_preserves_both_retry_floors(
+@pytest.mark.parametrize(("retry_at", "expected"), [(None, 1100), (1050, 1050), (1200, 1200)])
+def test_access_probe_scheduler_uses_explicit_deadline(
     conn: sqlite3.Connection, retry_at: int | None, expected: int
 ) -> None:
     conn.execute(

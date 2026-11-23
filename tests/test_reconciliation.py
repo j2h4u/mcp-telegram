@@ -15,7 +15,11 @@ import pytest
 from telethon.errors import ChannelPrivateError, PeerIdInvalidError
 from telethon.tl import types  # type: ignore[import-untyped]
 
-from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
+from mcp_telegram.dialog_sync import (
+    DialogLightReconciliationDemandAdapter,
+    DialogLookupDeniedError,
+    DialogReconciliationWorker,
+)
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.sync_db import _open_sync_db, ensure_sync_schema
 from mcp_telegram.telegram_demand import RpcAttemptBudget
@@ -56,10 +60,12 @@ def mock_client() -> _MockClient:
 def _seed_dialog(conn: sqlite3.Connection, dialog_id: int, *, needs_refresh: int = 0, hidden: int = 0) -> None:
     with conn:
         conn.execute(
-            "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, snapshot_at, hidden, needs_refresh) "
-            "VALUES (?, 'Old', 'user', 0, 0, 1700000000, ?, ?)",
-            (dialog_id, hidden, needs_refresh),
+            "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, snapshot_at, needs_refresh) "
+            "VALUES (?, 'Old', 'user', 0, 0, 1700000000, ?)",
+            (dialog_id, needs_refresh),
         )
+        if hidden:
+            conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (?,'access_lost')", (dialog_id,))
 
 
 def _user(dialog_id: int, name: str = "Alice") -> object:
@@ -133,7 +139,7 @@ async def test_recon_light_pass_preserves_known_creation_date_when_entity_omits_
 
 
 @pytest.mark.asyncio
-async def test_recon_light_pass_skips_hidden_and_clean_rows(
+async def test_recon_light_pass_skips_access_lost_and_clean_rows(
     sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
 ) -> None:
     _seed_dialog(sync_db, 100, needs_refresh=1, hidden=1)
@@ -209,7 +215,7 @@ async def test_recon_light_pass_flood_wait_returns_on_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_recon_light_pass_access_lost_sets_hidden(
+async def test_recon_light_pass_access_lost_preserves_dialog(
     sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
 ) -> None:
     _seed_dialog(sync_db, 100, needs_refresh=1)
@@ -217,12 +223,13 @@ async def test_recon_light_pass_access_lost_sets_hidden(
     sync_db.commit()
     mock_client.get_entity.side_effect = ChannelPrivateError(request=None)
 
-    await DialogReconciliationWorker(
-        mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
-    ).run_light_pass()
+    with pytest.raises(DialogLookupDeniedError):
+        await DialogReconciliationWorker(
+            mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)
+        ).run_light_pass()
 
-    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=100").fetchone() == ("access_lost",)
-    assert sync_db.execute("SELECT hidden FROM dialogs WHERE dialog_id=100").fetchone() == (1,)
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=100").fetchone() == ("syncing",)
+    assert sync_db.execute("SELECT name FROM dialogs WHERE dialog_id=100").fetchone() == ("Old",)
 
 
 @pytest.mark.asyncio
@@ -243,7 +250,7 @@ async def test_recon_light_pass_peer_invalid_leaves_dirty(
             == 0
         )
 
-    assert sync_db.execute("SELECT needs_refresh, hidden FROM dialogs WHERE dialog_id=100").fetchone() == (1, 0)
+    assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == (1,)
     assert any("recon_light_pass_peer_invalid" in record.message for record in caplog.records)
 
 
@@ -403,3 +410,22 @@ async def test_light_reconciliation_does_not_overwrite_identity_refreshed_during
     identity = read_dialog_identities(sync_db, [302])[302]
     assert (identity.name, identity.username, identity.source) == ("Directory name", "directory", "directory")
     assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=302").fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_denied_profile_lookup_retries_without_revoking_history(
+    sync_db: sqlite3.Connection, mock_client: _MockClient, shutdown_event: asyncio.Event
+) -> None:
+    _seed_dialog(sync_db, 100, needs_refresh=1)
+    sync_db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(100,'syncing')")
+    sync_db.commit()
+    mock_client.get_entity.side_effect = ChannelPrivateError(request=None)
+    adapter = DialogLightReconciliationDemandAdapter(
+        DialogReconciliationWorker(mock_client, sync_db, shutdown_event, writer=inline_writer(sync_db)), account_id=123
+    )
+    status = adapter.status(0.0)
+    assert status is not None and status.selected is not None
+    outcome = await adapter.run_slice(RpcAttemptBudget(limit=1, selected=status.selected))
+    assert outcome.kind.value == "retryable_failure"
+    assert sync_db.execute("SELECT status FROM synced_dialogs WHERE dialog_id=100").fetchone() == ("syncing",)
+    assert sync_db.execute("SELECT needs_refresh FROM dialogs WHERE dialog_id=100").fetchone() == (1,)

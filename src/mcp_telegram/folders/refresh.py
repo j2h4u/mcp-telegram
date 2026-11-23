@@ -71,7 +71,7 @@ class FolderRefresher:
         scope = None if self._auth_scope is None else self._auth_scope()
         scope_token = None if self._capture_scope is None else self._capture_scope()
         observation_order = await self._writer.run(allocate_observation_order)
-        observation = await self.acquire(started_at=completion)
+        observation = replace(await self.acquire(started_at=completion), auth_scope=scope)
 
         def publish(conn: sqlite3.Connection) -> FolderRefreshResult:
             with write_transaction(conn):

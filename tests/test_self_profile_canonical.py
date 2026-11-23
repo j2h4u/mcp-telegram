@@ -31,7 +31,7 @@ from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient,
 
 @pytest.mark.asyncio
 async def test_startup_admits_self_once_after_identity_binding(tmp_path: Path) -> None:
-    conn, prior = _prepare(tmp_path / "self-startup.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "self-startup.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -91,7 +91,7 @@ async def test_startup_admits_self_once_after_identity_binding(tmp_path: Path) -
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [True, False])
 async def test_self_profile_worker_drains_only_owned_pair(tmp_path: Path, enabled: bool) -> None:
-    conn, prior = _prepare(tmp_path / "self.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "self.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -140,7 +140,7 @@ async def test_self_profile_worker_drains_only_owned_pair(tmp_path: Path, enable
     [TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100), TelegramAuthScope(AUTH_SCOPE_VERSION, 43, 2, 99)],
 )
 async def test_self_worker_rejects_old_scope_result(tmp_path: Path, changed_scope: TelegramAuthScope) -> None:
-    conn, prior = _prepare(tmp_path / "self-scope.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "self-scope.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -179,7 +179,7 @@ async def test_self_worker_rejects_old_scope_result(tmp_path: Path, changed_scop
 async def test_self_worker_keeps_value_on_failure_then_accepts_clear(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    conn, prior = _prepare(tmp_path / "self-clear.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "self-clear.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     clock = [100.0]
     boundary = pair_fixtures.ObservationBoundary
@@ -229,7 +229,7 @@ async def test_self_worker_keeps_value_on_failure_then_accepts_clear(
 
 @pytest.mark.asyncio
 async def test_self_update_during_pair_creates_one_followup(tmp_path: Path) -> None:
-    conn, prior = _prepare(tmp_path / "self-race.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "self-race.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -296,7 +296,7 @@ async def test_self_update_during_pair_creates_one_followup(tmp_path: Path) -> N
 async def test_self_scope_change_while_writer_queued_rejects_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
-    conn, prior = _prepare(tmp_path / "queued-scope.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "queued-scope.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -343,7 +343,7 @@ async def test_self_scope_change_while_writer_queued_rejects_result(
 
 @pytest.mark.asyncio
 async def test_self_followup_changes_coordinator_revision_when_pair_becomes_eligible(tmp_path: Path) -> None:
-    conn, prior = _prepare(tmp_path / "followup-revision.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "followup-revision.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
@@ -383,7 +383,7 @@ async def test_self_pair_commits_on_real_sqlite_writer_thread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rotate_key: bool
 ) -> None:
     path = tmp_path / "writer-thread.sqlite"
-    conn, prior = _prepare(path, migrated=True)
+    conn, prior = _prepare(path)
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_transaction(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")

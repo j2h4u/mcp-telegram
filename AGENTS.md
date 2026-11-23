@@ -27,6 +27,13 @@ knowledge or authorize read-time network access. Failed acquisition does not
 erase last-known facts. Actual clears/deletions, domain validity and account
 isolation still apply; age alone is neither deletion nor an account change.
 
+Every Telegram-observed peer reference, including one supplied by a folder rule,
+is locally addressable before enrichment. Folder enumeration covers all retained
+present membership. Omission from a completed listing is not access denial: it
+neither erases facts nor suppresses independent history intent. Denial of one
+operation does not globally revoke chat access. MCP returns structured listing,
+access and acquisition facts.
+
 Apply supplied updates directly to canonical persistence shared by SQL analytics
 and MCP, not a response-only overlay. Obtain missing or invalidated evidence
 through the existing bounded ingestion owners and classified RPC gate. Do not

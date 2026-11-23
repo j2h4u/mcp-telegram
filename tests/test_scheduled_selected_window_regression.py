@@ -28,7 +28,7 @@ async def test_scheduled_runs_selected_revision_outside_bounded_head(
         "VALUES (?, ?, 1, ?)",
         [(41, now - 2, now), (42, now - 1, now)],
     )
-    conn.executemany("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?, 'user', 0)", [(41,), (42,)])
+    conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'user')", [(41,), (42,)])
     if repair:
         conn.execute("UPDATE scheduled_reconciliation_state SET repair_due_at=discovery_due_at")
     conn.commit()
@@ -54,7 +54,7 @@ async def test_scheduled_runs_selected_revision_outside_bounded_head(
 @pytest.mark.parametrize("change", ["removed", "future", "generation"])
 async def test_selected_revision_must_remain_current_and_due(conn: sqlite3.Connection, change: str) -> None:
     now = int(time.time())
-    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (42, 'user', 0)")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (42, 'user')")
     conn.execute(
         "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,dirty_generation,updated_at) "
         "VALUES (42, ?, 1, ?)",

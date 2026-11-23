@@ -226,20 +226,20 @@ WITH agent_visible_dialogs AS (
     FROM dialogs d
     LEFT JOIN synced_dialogs sd USING(dialog_id)
     LEFT JOIN topic_catalog_state tc ON tc.dialog_id = d.dialog_id
-    WHERE d.hidden = 0 OR sd.status = 'access_lost'
+    WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=d.dialog_id AND lo.state='not_returned')
 
     UNION ALL
 
     SELECT
         sd.dialog_id,
-        0 AS archived,
-        0 AS pinned,
+        NULL AS archived,
+        NULL AS pinned,
         NULL AS members,
         NULL AS created,
         NULL AS last_message_at,
         NULL AS snapshot_at,
-        0 AS unread_mentions_count,
-        0 AS unread_reactions_count,
+        NULL AS unread_mentions_count,
+        NULL AS unread_reactions_count,
         NULL AS unread_count,
         tc.applicable AS topic_applicable,
         sd.status AS sync_status,
@@ -252,6 +252,7 @@ WITH agent_visible_dialogs AS (
     LEFT JOIN dialogs d USING(dialog_id)
     LEFT JOIN topic_catalog_state tc ON tc.dialog_id = sd.dialog_id
     WHERE sd.status = 'access_lost' AND d.dialog_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=sd.dialog_id AND lo.state='not_returned')
 )
 SELECT
     dialog_id, archived, pinned,
@@ -275,20 +276,22 @@ SELECT d.dialog_id AS dialog_id, d.archived, d.pinned, d.members, d.created, d.l
        sd.last_delta_checked_at, sd.access_lost_at, sd.history_depth_complete
 FROM dialogs d LEFT JOIN synced_dialogs sd USING(dialog_id)
 LEFT JOIN topic_catalog_state tc ON tc.dialog_id=d.dialog_id
-WHERE (d.hidden=0 OR sd.status='access_lost')
+WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=d.dialog_id AND lo.state='not_returned')
   AND d.dialog_id > :after_id AND d.dialog_id <= :upper_id
   AND (:archived_filter IS NULL OR d.archived=:archived_filter)
   AND (:pinned_filter IS NULL OR d.pinned=:pinned_filter)
 UNION ALL
-SELECT sd.dialog_id AS dialog_id, 0 AS archived, 0 AS pinned, NULL AS members, NULL AS created,
-       NULL AS last_message_at, NULL AS snapshot_at, 0 AS unread_mentions_count,
-       0 AS unread_reactions_count, NULL AS unread_count,
+SELECT sd.dialog_id AS dialog_id, NULL AS archived, NULL AS pinned, NULL AS members, NULL AS created,
+       NULL AS last_message_at, NULL AS snapshot_at, NULL AS unread_mentions_count,
+       NULL AS unread_reactions_count, NULL AS unread_count,
        CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
        sd.status AS sync_status, sd.total_messages, sd.last_synced_at, sd.last_event_at,
        sd.last_delta_checked_at, sd.access_lost_at, sd.history_depth_complete
-FROM synced_dialogs sd LEFT JOIN dialogs d USING(dialog_id)
+FROM synced_dialogs sd NOT INDEXED LEFT JOIN dialogs d USING(dialog_id)
 LEFT JOIN topic_catalog_state tc ON tc.dialog_id=sd.dialog_id
 WHERE sd.status='access_lost' AND d.dialog_id IS NULL
+  AND :archived_filter IS NULL AND :pinned_filter IS NULL
+  AND NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=sd.dialog_id AND lo.state='not_returned')
   AND sd.dialog_id > :after_id AND sd.dialog_id <= :upper_id
 ORDER BY dialog_id ASC LIMIT 501
 """
@@ -299,12 +302,14 @@ _DIALOG_DIRECTORY_FIRST_PAGE_SQL = _DIALOG_DIRECTORY_PAGE_SQL.replace("sd.dialog
 _DIALOG_DIRECTORY_UPPER_SQL = """
 SELECT MAX(bound) FROM (
   SELECT MAX(d.dialog_id) AS bound FROM dialogs d LEFT JOIN synced_dialogs sd USING(dialog_id)
-  WHERE (d.hidden=0 OR sd.status='access_lost')
+  WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=d.dialog_id AND lo.state='not_returned')
     AND (:archived_filter IS NULL OR d.archived=:archived_filter)
     AND (:pinned_filter IS NULL OR d.pinned=:pinned_filter)
   UNION ALL
-  SELECT MAX(sd.dialog_id) AS bound FROM synced_dialogs sd LEFT JOIN dialogs d USING(dialog_id)
+  SELECT MAX(sd.dialog_id) AS bound FROM synced_dialogs sd NOT INDEXED LEFT JOIN dialogs d USING(dialog_id)
   WHERE sd.status='access_lost' AND d.dialog_id IS NULL
+    AND :archived_filter IS NULL AND :pinned_filter IS NULL
+    AND NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=sd.dialog_id AND lo.state='not_returned')
 )
 """
 
@@ -363,7 +368,7 @@ WITH matching AS (
         d.unread_reactions_count
     FROM dialogs d
     LEFT JOIN synced_dialogs sd USING(dialog_id)
-    WHERE d.hidden = 0
+    WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=d.dialog_id AND lo.state='not_returned')
       AND (sd.status IS NULL OR sd.status <> 'access_lost')
       AND (
           COALESCE(d.unread_count, 0) > 0
@@ -847,3 +852,22 @@ def _add_read_state_positions(state: ReadState, values: _ReadStateValues) -> Non
         state["inbox_oldest_unread_date"] = int(values.inbox_oldest)
     if values.outbox_count > 0 and values.outbox_oldest is not None:
         state["outbox_oldest_unread_date"] = int(values.outbox_oldest)
+
+
+_FOLDER_DIALOG_ROWS_SQL = """
+SELECT m.dialog_id, d.archived, d.pinned, d.members, d.created, d.last_message_at, d.snapshot_at,
+       d.unread_mentions_count, d.unread_reactions_count, d.unread_count,
+       CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
+       sd.status AS sync_status, sd.total_messages, sd.last_synced_at, sd.last_event_at,
+       sd.last_delta_checked_at, sd.access_lost_at, sd.history_depth_complete
+FROM telegram_folder_local_members m
+JOIN telegram_folder_rules f ON f.namespace=m.namespace AND f.folder_id=m.folder_id
+JOIN telegram_folder_projection_state ps ON ps.singleton=1 AND ps.account_id=f.account_id
+LEFT JOIN dialogs d ON d.dialog_id=m.dialog_id
+LEFT JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id
+LEFT JOIN topic_catalog_state tc ON tc.dialog_id=m.dialog_id
+WHERE f.account_id=:account_id AND f.folder_id=:folder_id AND f.deleted=0
+  AND f.catalog_member IS NOT 0 AND m.state='present'
+  AND (:archived_filter IS NULL OR d.archived=:archived_filter)
+  AND (:pinned_filter IS NULL OR d.pinned=:pinned_filter)
+"""

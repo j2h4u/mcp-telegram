@@ -122,24 +122,31 @@ class UserProfileClient(Protocol):
 class TelethonChannelProfileGateway(ChannelProfilePort):
     """Normalize channel profile capabilities at the Telethon boundary."""
 
-    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
+    def __init__(
+        self,
+        client: object,
+        *,
+        now_provider: Callable[[], float] | None = None,
+        retained_reference: Callable[[int], object] | None = None,
+    ) -> None:
         self._client = cast(ChannelProfileClient, client)
         self._now_provider = now_provider or time.time
+        self._retained_reference = retained_reference
 
     def get_channel_reference(self, channel_id: int) -> ChannelReference | None:
         if not _is_canonical_channel_id(channel_id):
             return None
         session = getattr(self._client, "session", None)
         getter = getattr(session, "get_input_entity", None)
-        if not callable(getter):
-            return None
-        if inspect.iscoroutinefunction(getter):
-            return None
-        try:
-            input_entity = getter(channel_id)
-        except AttributeError, KeyError, TypeError, ValueError:
-            return None
-        return _channel_reference_from_session_entity(input_entity, channel_id)
+        if callable(getter) and not inspect.iscoroutinefunction(getter):
+            try:
+                reference = _channel_reference_from_session_entity(getter(channel_id), channel_id)
+            except AttributeError, KeyError, TypeError, ValueError:
+                reference = None
+            if reference is not None:
+                return reference
+        retained = None if self._retained_reference is None else self._retained_reference(channel_id)
+        return retained if isinstance(retained, ChannelReference) else None
 
     async def fetch_channel_profile(self, reference: ChannelReference) -> ChannelProfileObservation:
         _validate_channel_reference(reference)
@@ -384,14 +391,25 @@ class TelethonChatAvatarHistoryGateway(ChatAvatarHistoryPort):
 class TelethonUserProfileGateway(UserProfilePort):
     """Normalize ``users.GetFullUser`` at the Telethon boundary."""
 
-    def __init__(self, client: object, *, now_provider: Callable[[], float] | None = None) -> None:
+    def __init__(
+        self,
+        client: object,
+        *,
+        now_provider: Callable[[], float] | None = None,
+        retained_reference: Callable[[int], object] | None = None,
+    ) -> None:
         self._client = cast(UserProfileClient, client)
         self._now_provider = now_provider or time.time
+        self._retained_reference = retained_reference
 
     def get_user_reference(self, user_id: int, *, is_self: bool = False) -> UserReference | None:
         if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
             return None
-        return _user_reference_from_peer(_session_entity(self._client, user_id), user_id, is_self=is_self)
+        reference = _user_reference_from_peer(_session_entity(self._client, user_id), user_id, is_self=is_self)
+        if reference is not None:
+            return reference
+        retained = None if self._retained_reference is None else self._retained_reference(user_id)
+        return retained if isinstance(retained, UserReference) and not is_self else None
 
     async def fetch_contact_note_limit(self, config_hash: int = 0) -> tuple[int, int | None]:
         """Read one native configuration snapshot; None preserves a previous value."""

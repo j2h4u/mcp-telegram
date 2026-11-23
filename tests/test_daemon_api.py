@@ -150,7 +150,6 @@ class _SeedDialogRowKwargs(TypedDict, total=False):
     created: int | None
     last_message_at: int | None
     snapshot_at: int | None
-    hidden: int
     needs_refresh: int
     unread_mentions_count: int
     unread_reactions_count: int
@@ -596,7 +595,7 @@ async def test_entity_info_dispatch_logs_separate_stage_durations(
         result = await server._get_entity_info({"entity_id": 42})
     assert result["ok"] is True
     message = next(record.message for record in caplog.records if "entity_info_dispatch_timing" in record.message)
-    assert "service_s=0.300 dialog_placement_s=0.400" in message
+    assert "service_s=0.300" in message
 
 
 @pytest.mark.asyncio
@@ -606,7 +605,7 @@ async def test_entity_profile_request_duration_is_measured(
     service = make_server()._get_entity_info_service()
     clock = iter([10.0, 10.6])
     monkeypatch.setattr("mcp_telegram.daemon_entity_info.time.perf_counter", lambda: next(clock))
-    monkeypatch.setattr(service, "_get_entity_info", AsyncMock(return_value={"ok": True}))
+    monkeypatch.setattr(service, "_get_entity_info", MagicMock(return_value={"ok": True}))
     with caplog.at_level("INFO", logger="mcp_telegram.daemon_api"):
         result = await service.get_entity_info({"entity_id": 42})
     assert result["ok"] is True
@@ -736,6 +735,9 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False, db_path: Pa
             sync_progress       INTEGER DEFAULT 0,
             total_messages      INTEGER,
             access_lost_at      INTEGER,
+            access_loss_scope TEXT,
+            access_scope_observed_at INTEGER,
+            access_loss_event_seq INTEGER,
             access_last_revalidated_at INTEGER,
             access_next_revalidate_at INTEGER,
             read_inbox_max_id   INTEGER,
@@ -898,7 +900,6 @@ def _make_db(*, with_fts: bool = False, with_entities: bool = False, db_path: Pa
             type        TEXT,
             members     INTEGER,
             created     INTEGER,
-            hidden      INTEGER NOT NULL DEFAULT 0,
             username    TEXT,
             identity_observed_at INTEGER,
             identity_complete INTEGER NOT NULL DEFAULT 0,
@@ -996,7 +997,6 @@ def _make_db_with_dialogs(
             created                 INTEGER,
             last_message_at         INTEGER,
             snapshot_at             INTEGER,
-            hidden                  INTEGER NOT NULL DEFAULT 0,
             needs_refresh           INTEGER NOT NULL DEFAULT 0,
             unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
             unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
@@ -1012,10 +1012,8 @@ def _make_db_with_dialogs(
         )
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_hidden_pinned ON dialogs(hidden, pinned DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS own_only_dialogs (
@@ -1130,14 +1128,13 @@ def _seed_dialog_row(
     created = kwargs.get("created")
     last_message_at = kwargs.get("last_message_at")
     snapshot_at = kwargs.get("snapshot_at", 1700000000)
-    hidden = kwargs.get("hidden", 0)
     needs_refresh = kwargs.get("needs_refresh", 0)
     unread_mentions_count = kwargs.get("unread_mentions_count", 0)
     unread_reactions_count = kwargs.get("unread_reactions_count", 0)
     conn.execute(
         "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, members, created, "
-        "last_message_at, snapshot_at, hidden, needs_refresh, unread_mentions_count, "
-        "unread_reactions_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "last_message_at, snapshot_at, needs_refresh, unread_mentions_count, "
+        "unread_reactions_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             dialog_id,
             name,
@@ -1148,11 +1145,21 @@ def _seed_dialog_row(
             created,
             last_message_at,
             snapshot_at,
-            hidden,
             needs_refresh,
             unread_mentions_count,
             unread_reactions_count,
         ),
+    )
+    conn.commit()
+
+
+def _mark_directory_omitted(conn: sqlite3.Connection, dialog_id: int) -> None:
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("UPDATE dialog_directory_publication SET account_id=42 WHERE singleton=1")
+    conn.execute(
+        "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+        "VALUES(42,?,'not_returned','completed_directory',100,1)",
+        (dialog_id,),
     )
     conn.commit()
 
@@ -2203,11 +2210,11 @@ async def test_list_dialogs_bootstrap_pending_when_table_truly_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_bootstrap_false_when_only_hidden_rows() -> None:
-    """Test F2: bootstrap_pending=False when dialogs table has rows (even if all hidden)."""
+async def test_list_dialogs_bootstrap_false_when_only_omitted_rows() -> None:
+    """A retained dialog omitted from the latest directory is not a bootstrap."""
     conn = _make_db_with_dialogs()
-    # One hidden row — table is NOT empty, sync has run, rows are just hidden.
-    _seed_dialog_row(conn, 1, name="Hidden Chat", type_="Chat", hidden=1)
+    _seed_dialog_row(conn, 1, name="Omitted Chat", type_="Chat")
+    _mark_directory_omitted(conn, 1)
 
     client = _TestClient()
     client.iter_dialogs = MagicMock(side_effect=AssertionError("SQL path must not call iter_dialogs"))
@@ -2222,10 +2229,10 @@ async def test_list_dialogs_bootstrap_false_when_only_hidden_rows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_dialogs_includes_hidden_access_lost_archive() -> None:
-    """Hidden access_lost rows remain agent-visible as read-only archives."""
+async def test_list_dialogs_includes_access_lost_archive() -> None:
+    """A retained access-lost dialog remains available in the catalogue."""
     conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 42, name="Lost Group", type_="Chat", hidden=1, last_message_at=1700000001)
+    _seed_dialog_row(conn, 42, name="Lost Group", type_="Chat", last_message_at=1700000001)
     _insert_synced_dialog(
         conn,
         42,
@@ -8701,10 +8708,11 @@ async def test_resolve_dialog_name_fuzzy_suggestion_reports_incomplete_coverage(
 
 
 @pytest.mark.asyncio
-async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
-    """Local resolution cannot reintroduce a hidden dialog id."""
+async def test_resolve_dialog_name_retains_exact_omitted_identity() -> None:
+    """An exact retained name remains usable after omission from the latest directory."""
     conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 999, name="Old Group", type_="supergroup", hidden=1)
+    _seed_dialog_row(conn, 999, name="Old Group", type_="supergroup")
+    _mark_directory_omitted(conn, 999)
 
     client = _TestClient()
     client.get_entity = AsyncMock(side_effect=ValueError(""))
@@ -8714,17 +8722,17 @@ async def test_resolve_dialog_name_dialogs_snapshot_skips_hidden() -> None:
     server = make_server(conn, client)
     result = await server._dispatch({"method": "list_messages", "dialog": "Old Group"})
 
-    assert result["ok"] is False
-    assert result["error"] == "dialog_directory_incomplete"
+    assert result["ok"] is True
+    assert cast(dict[str, object], result["data"])["dialog_id"] == 999
     cast(MagicMock, client.iter_dialogs).assert_not_called()
     cast(MagicMock, client.iter_messages).assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_resolve_dialog_name_dialogs_snapshot_matches_hidden_access_lost() -> None:
-    """Hidden access_lost archives remain resolvable by cached dialog name."""
+async def test_resolve_dialog_name_dialogs_snapshot_matches_access_lost() -> None:
+    """Access-lost archives remain resolvable by cached dialog name."""
     conn = _make_db_with_dialogs()
-    _seed_dialog_row(conn, 1001, name="Lost Group", type_="supergroup", hidden=1)
+    _seed_dialog_row(conn, 1001, name="Lost Group", type_="supergroup")
     _insert_synced_dialog(conn, 1001, status="access_lost", access_lost_at=1700000000)
 
     client = _TestClient()
@@ -9028,7 +9036,6 @@ def _make_trace_db() -> sqlite3.Connection:
             created                 INTEGER,
             last_message_at         INTEGER,
             snapshot_at             INTEGER,
-            hidden                  INTEGER NOT NULL DEFAULT 0,
             needs_refresh           INTEGER NOT NULL DEFAULT 0,
             unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
             unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
@@ -9153,7 +9160,7 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
     # (lowercase) classified as `unsupported` and the channel→linked-group scope
     # expansion never fired in production.
     conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        "INSERT INTO dialogs (dialog_id, name, type) VALUES (?, ?, ?)",
         (_CHANNEL_ID, "Test Channel", "channel"),
     )
     conn.execute(
@@ -9163,7 +9170,7 @@ def _seed_channel_with_linked_chat(conn: sqlite3.Connection) -> None:
     seed_full_history_enrollment(conn, _CHANNEL_ID, enabled=True)
     # Linked discussion group type so _trace_strategy_for_dialog returns author_search.
     conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        "INSERT INTO dialogs (dialog_id, name, type) VALUES (?, ?, ?)",
         (_LINKED_CHAT_ID, "Test Discussion Group", "supergroup"),
     )
     conn.execute(
@@ -9204,20 +9211,19 @@ def test_trace_strategy_for_dialog_is_case_insensitive() -> None:
 
     s = _trace_strategy_for_dialog
     # lowercase (the casing the dialogs table actually stores)
-    assert s("channel", status="synced", hidden=False) == "signature_only"
-    assert s("supergroup", status="synced", hidden=False) == "author_search"
-    assert s("group", status="synced", hidden=False) == "author_search"
-    assert s("user", status="synced", hidden=False) == "dialog_scan"
-    assert s("bot", status="synced", hidden=False) == "dialog_scan"
+    assert s("channel", status="synced") == "signature_only"
+    assert s("supergroup", status="synced") == "author_search"
+    assert s("group", status="synced") == "author_search"
+    assert s("user", status="synced") == "dialog_scan"
+    assert s("bot", status="synced") == "dialog_scan"
     # capitalized legacy values (entities table) still map identically
-    assert s("Channel", status="synced", hidden=False) == "signature_only"
-    assert s("Group", status="synced", hidden=False) == "author_search"
-    assert s("User", status="synced", hidden=False) == "dialog_scan"
+    assert s("Channel", status="synced") == "signature_only"
+    assert s("Group", status="synced") == "author_search"
+    assert s("User", status="synced") == "dialog_scan"
     # precedence guards unchanged
-    assert s("channel", status="synced", hidden=True) == "hidden"
-    assert s("channel", status="access_lost", hidden=False) == "access_lost"
+    assert s("channel", status="access_lost") == "access_lost"
     # genuinely unknown type still unsupported
-    assert s("unknown", status="synced", hidden=False) == "unsupported"
+    assert s("unknown", status="synced") == "unsupported"
 
 
 # -------- (a) Enrollment --------
@@ -9526,7 +9532,7 @@ def test_trace_candidate_no_discussion_group_stays_signature_only() -> None:
     conn = _make_trace_db()
     # Register a plain broadcast channel — no linked chat.
     conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        "INSERT INTO dialogs (dialog_id, name, type) VALUES (?, ?, ?)",
         (_CHANNEL_ID, "Bare Channel", "Channel"),
     )
     conn.execute(

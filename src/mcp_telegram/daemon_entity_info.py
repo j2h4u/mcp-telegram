@@ -782,7 +782,10 @@ class DaemonEntityInfoService:
         """Time a local-only projection of the durable entity profile."""
         started_at = time.perf_counter()
         try:
-            return await self._get_entity_info(req)
+            from .sync_transactions import read_snapshot
+
+            with read_snapshot(self._deps.conn):
+                return self._get_entity_info(req)
         finally:
             self._deps.logger.info(
                 "entity_profile.request duration_s=%.3f%s",
@@ -790,7 +793,7 @@ class DaemonEntityInfoService:
                 self._deps.rid(),
             )
 
-    async def _get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
+    def _get_entity_info(self, req: Mapping[str, object]) -> dict[str, object]:
         """Project persisted observations without initiating Telegram acquisition."""
         entity_id = self._extract_entity_id(req)
         if isinstance(entity_id, dict):
@@ -803,7 +806,7 @@ class DaemonEntityInfoService:
                     "entity_profile_account_unavailable",
                     "The stored profile is not bound to the current account. Action: verify the daemon account binding.",
                 )
-            return await self._local_profile_result(entity_id, stored.detail, stored.sections, now=now, req=req)
+            return self._local_profile_result(entity_id, stored.detail, stored.sections, now=now, req=req)
         identity = self._local_profile_identity(entity_id)
         if not identity:
             return self._error(
@@ -811,9 +814,9 @@ class DaemonEntityInfoService:
                 "No local observations exist for this entity. Action: use list_dialogs to select a known local entity.",
             )
         sections = self._unobserved_sections(identity)
-        return await self._local_profile_result(entity_id, identity, sections, now=now, req=req)
+        return self._local_profile_result(entity_id, identity, sections, now=now, req=req)
 
-    async def _local_profile_result(
+    def _local_profile_result(
         self,
         entity_id: int,
         detail: Mapping[str, object],
@@ -824,7 +827,7 @@ class DaemonEntityInfoService:
     ) -> dict[str, object]:
         from .entity_profile.reader import read_common_chats, read_profile
 
-        result = await self._progressive_result(entity_id, detail, sections, now=now)
+        result = self._progressive_result(entity_id, detail, sections, now=now)
         if isinstance(result.get("data"), dict):
             cast(dict[str, object], result["data"])["common_chats"] = []
         owner = self._local_profile_owner(entity_id)
@@ -900,10 +903,21 @@ class DaemonEntityInfoService:
 
     def _observed_directory_identity(self, entity_id: int) -> dict[str, object]:
         identity = self._profiles.read_identity(entity_id)
-        if identity.get("type") != DialogType.UNKNOWN.value:
+        if identity.get("type") not in (None, DialogType.UNKNOWN.value):
             return identity
         if any(isinstance(value, str) and value.strip() for value in (identity.get("name"), identity.get("username"))):
             return identity
+        scope = self._capture_pair_scope()
+        account_id = self._deps.self_id if scope is None else scope.account_id
+        if (
+            account_id is not None
+            and self._profile_owner_matches(account_id)
+            and self._deps.conn.execute(
+                "SELECT 1 FROM folder_peer_references WHERE account_id=? AND dialog_id=?", (account_id, entity_id)
+            ).fetchone()
+            is not None
+        ):
+            return {"id": entity_id, "type": DialogType.UNKNOWN.value, **identity}
         return {}
 
     def _unobserved_sections(self, identity: Mapping[str, object]) -> dict[str, dict[str, object]]:
@@ -3506,7 +3520,7 @@ class DaemonEntityInfoService:
             ),
         }
 
-    async def _progressive_result(
+    def _progressive_result(
         self,
         entity_id: int,
         detail: Mapping[str, object],
@@ -3528,6 +3542,11 @@ class DaemonEntityInfoService:
             if self._deps.get_dialog_placement
             else dialog_placement(self._deps.conn, entity_id, account_id=scope.account_id if scope else None),
         )
+        account_id = self._deps.self_id if scope is None else scope.account_id
+        if account_id is not None and self._profile_owner_matches(account_id):
+            from .dialog_availability import read_dialog_availability
+
+            result["availability"] = read_dialog_availability(self._deps.conn, account_id, entity_id)
         result["completeness"] = completeness(sections)
         result["sections"] = self._section_summaries(sections)
         self._deps.logger.info(

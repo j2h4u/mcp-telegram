@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -137,15 +138,30 @@ def capture_identity_baseline(conn: sqlite3.Connection, dialog_id: int) -> int |
     return None if row is None else int(row[0])
 
 
+def retained_dialog_metadata_ids(conn: sqlite3.Connection, dialog_ids: Iterable[int]) -> set[int]:
+    """Identify retained dialogs with enough identity to avoid reacquiring metadata."""
+    ids = list(dialog_ids)
+    if not ids:
+        return set()
+    rows = cast(
+        list[tuple[int]],
+        conn.execute(
+            "SELECT d.dialog_id FROM dialogs d JOIN json_each(?) ids ON d.dialog_id=ids.value "
+            "LEFT JOIN entities e ON e.id=d.dialog_id WHERE d.identity_complete=1 OR "
+            "(e.name IS NOT NULL AND e.type IN ('user','bot','group','supergroup','channel'))",
+            (json.dumps(ids),),
+        ).fetchall(),
+    )
+    return {int(row[0]) for row in rows}
+
+
 def read_automatic_group_metadata(
     conn: sqlite3.Connection, dialog_id: int
-) -> tuple[str | None, int | None, int | None, int | None] | None:
+) -> tuple[str | None, int | None, int | None] | None:
     """Read the raw directory facts used by automatic group selection."""
     return cast(
-        tuple[str | None, int | None, int | None, int | None] | None,
-        conn.execute(
-            "SELECT type,members,created,hidden FROM dialogs WHERE dialog_id=?", (_dialog_id(dialog_id),)
-        ).fetchone(),
+        tuple[str | None, int | None, int | None] | None,
+        conn.execute("SELECT type,members,created FROM dialogs WHERE dialog_id=?", (_dialog_id(dialog_id),)).fetchone(),
     )
 
 
