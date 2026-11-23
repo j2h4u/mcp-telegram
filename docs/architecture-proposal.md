@@ -193,8 +193,9 @@ configuration tree for local fallback policy; `check_config_imports.py`
 ratchets that rule.
 
 Every application-owned Telegram RPC reason is declared in the immutable
-consumer registry. Its admission view classifies transport work, while its
-acquisition and demand views describe fact ownership, overlap with recovery
+consumer registry; its [design record](plans/telegram-rpc-consumer-registry.md)
+describes the registry’s original scope. Its admission view classifies transport
+work, while its acquisition and demand views describe fact ownership, overlap with recovery
 paths, fan-out, and where offered work is bounded. The transport gate rejects
 unclassified calls before Telegram sees them. Producer-specific cadence and
 work selection remain with the producer rather than turning the registry into
@@ -315,3 +316,8 @@ a permitted recovery/restart boundary applies. Producers retain cadence and
 local fact state, but do not add independent network retry delays. Failed
 profile acquisition preserves last-known facts and section failure evidence.
 Account protection and manual recovery remain separate from method recovery.
+
+## Historical decisions
+
+The [receive-only decision](plans/telegram-receive-only-decision.md) records the
+protective-stop research and links its supporting architecture work.

@@ -3,6 +3,9 @@
 Status: historical acquisition-design and acceptance record. Current ordinary-read
 behavior is governed by the [durable local mirror contract](../architecture-proposal.md#durable-facts-and-acquisition-evidence);
 reads do not initiate or await Telegram acquisition.
+The [expert inputs](telegram-fact-acquisition-expert-inputs.md) and [first panel
+round](telegram-fact-acquisition-panel-round-1.md) preserve the research behind
+this decision.
 
 ## Decision
 

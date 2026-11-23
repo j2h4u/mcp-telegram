@@ -47,7 +47,7 @@ jobs:
           if [ -n "$changed_files" ]; then
             while IFS= read -r path; do
               case "$path" in
-                *.md|docs/*|.planning/*) ;;
+                *.md|docs/*) ;;
                 *) run_heavy=true; break ;;
               esac
             done <<< "$changed_files"
