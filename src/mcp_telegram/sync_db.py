@@ -14,13 +14,17 @@ from .dialog_classification import (
     is_bot_dialog_type,
     is_reserved_replies_username,
 )
+from .hydration_queue import RICH_COMPOSITION_KIND, HydrationOutcome, HydrationPriority
 from .models import DialogType
+from .observation_order import hydration_observation_current
+from .rich_hydration_policy import rich_composition_automatic_eligible, rich_composition_hydration_eligible
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
 _DIALOG_LISTING_EVIDENCE_MIGRATION = 104
-_CURRENT_SCHEMA_VERSION = _DIALOG_LISTING_EVIDENCE_MIGRATION
+_RICH_TERMINAL_REPAIR_MIGRATION = 105
+_CURRENT_SCHEMA_VERSION = _RICH_TERMINAL_REPAIR_MIGRATION
 _TODO_MEDIA_MIGRATION = 103
 _RICH_COMPOSITION_MIGRATION = 102
 _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION = 101
@@ -5116,6 +5120,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_103(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _DIALOG_LISTING_EVIDENCE_MIGRATION:
         current = _apply_migration_104(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _RICH_TERMINAL_REPAIR_MIGRATION:
+        current = _apply_migration_105(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
 
@@ -5188,6 +5194,41 @@ _FOLDER_PEER_REFERENCES_DDL = (
     "metadata_observed_at INTEGER, metadata_source TEXT, metadata_error_code TEXT, "
     "metadata_candidate TEXT NOT NULL DEFAULT 'native', PRIMARY KEY(account_id,dialog_id)) WITHOUT ROWID"
 )
+
+
+def _apply_migration_105(conn: sqlite3.Connection, current: int) -> int:
+    """Reopen legacy unclassified terminal rich-fact jobs once."""
+    if current >= _RICH_TERMINAL_REPAIR_MIGRATION:
+        return current
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        candidates = cast(
+            list[tuple[int, int]],
+            conn.execute(
+                "SELECT dialog_id,message_id FROM hydration_jobs INDEXED BY idx_hydration_jobs_schedule "
+                "WHERE kind=? AND terminal=1 AND priority=? AND last_outcome=? AND last_error_code IS NULL",
+                (RICH_COMPOSITION_KIND, HydrationPriority.BACKFILL, HydrationOutcome.TERMINAL_ERROR),
+            ).fetchall(),
+        )
+        now = int(time.time())
+        for dialog_id, message_id in candidates:
+            if (
+                rich_composition_hydration_eligible(conn, dialog_id, message_id)
+                and rich_composition_automatic_eligible(conn, dialog_id, message_id)
+                and conn.execute(
+                    "SELECT 1 FROM messages WHERE dialog_id=? AND message_id=? AND rich_message IS NULL",
+                    (dialog_id, message_id),
+                ).fetchone()
+                and hydration_observation_current(conn, dialog_id, message_id, None)
+            ):
+                conn.execute(
+                    "UPDATE hydration_jobs SET terminal=0,due_at=? WHERE kind=? AND dialog_id=? AND message_id=?",
+                    (now, RICH_COMPOSITION_KIND, dialog_id, message_id),
+                )
+        return _apply_migration(conn, current, _RICH_TERMINAL_REPAIR_MIGRATION, [])
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _apply_migration_104(conn: sqlite3.Connection, current: int) -> int:
