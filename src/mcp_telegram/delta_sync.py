@@ -176,7 +176,7 @@ SELECT sd.dialog_id, sd.last_synced_at, sd.last_delta_checked_at, sd.delta_refre
 FROM synced_dialogs sd
 JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1
 WHERE sd.status = 'synced'
-  AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)
+
 ORDER BY
     CASE WHEN sd.delta_refresh_requested_at IS NULL THEN 1 ELSE 0 END,
     COALESCE(sd.delta_refresh_requested_at, sd.last_delta_checked_at, sd.last_synced_at, 0),
@@ -239,7 +239,7 @@ SELECT sd.dialog_id
   JOIN entities AS entity ON entity.id = sd.dialog_id
  WHERE sd.status = 'synced'
    AND entity.type IN ('user', 'bot')
-   AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)
+
  ORDER BY sd.dialog_id
 """
 
@@ -665,6 +665,7 @@ class DeltaSyncWorker:
                 dialog_id,
                 observed_at,
                 reason=reason,
+                access_scope="history",
                 refresh_generation=generation,
                 profile_owner_account_id=owner,
                 observation_order=order,
@@ -1478,7 +1479,7 @@ class DeltaAccessProbeDemandAdapter:
                 "COALESCE(synced.delta_message_id,0),COALESCE(synced.delta_refresh_generation,0),0,0 "
                 "FROM delta_access_recovery_state recovery JOIN synced_dialogs synced ON synced.dialog_id=recovery.dialog_id "
                 "WHERE synced.status='access_lost' "
-                "UNION ALL SELECT synced.dialog_id,0,NULL,NULL,MAX(COALESCE(synced.access_next_revalidate_at,0), "
+                "UNION ALL SELECT synced.dialog_id,0,NULL,NULL,COALESCE(synced.access_next_revalidate_at, "
                 "COALESCE(synced.access_lost_at,0)+?),COALESCE(synced.delta_message_id,0),"
                 "COALESCE(synced.delta_refresh_generation,0),COALESCE(synced.access_lost_at,0),"
                 "COALESCE((SELECT f.observation_order FROM dialog_fact_observations f "
@@ -1606,7 +1607,7 @@ class DeltaAccessProbeDemandAdapter:
         )
         if probe_row is None or probe_row[4]:
             return None
-        release = float(max(probe_row[1] or 0, probe_row[0] + self._policy.cooldown_seconds))
+        release = float(probe_row[1] if probe_row[1] is not None else probe_row[0] + self._policy.cooldown_seconds)
         return release, self._probe_revision(connection, dialog_id), None
 
     async def _run_observed_recovery_slice(
@@ -1735,6 +1736,16 @@ class DeltaAccessProbeDemandAdapter:
                 ).fetchone(),
             )
             if current is not None:
+                if isinstance(failure.error, MessageHistoryAccessLostError):
+                    set_access_lost(
+                        conn,
+                        dialog_id,
+                        failure.observed_at,
+                        reason=failure.error.reason_code,
+                        access_scope="history",
+                        profile_owner_account_id=self._account_id,
+                        observation_order=failure.order,
+                    )
                 stamp_access_revalidation(conn, dialog_id, failure.observed_at, retry)
             if not self._probe.claim_scope(failure.scope) or bound_profile_account(conn) != self._account_id:
                 raise ReceivedMessageScopeChangedError

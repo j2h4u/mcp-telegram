@@ -286,7 +286,7 @@ def _assert_fresh_crawl_was_published(client: _PublicationClient, db_path: Path)
             "complete",
             "complete",
         )
-        assert conn.execute("SELECT dialog_id FROM dialogs WHERE hidden=0").fetchall() == [(99,)]
+        assert conn.execute("SELECT dialog_id FROM dialogs").fetchall() == [(99,)]
         assert conn.execute("SELECT observed_count FROM dialog_directory_state").fetchone() == (1,)
     finally:
         conn.close()

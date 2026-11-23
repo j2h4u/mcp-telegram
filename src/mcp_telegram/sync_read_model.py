@@ -22,7 +22,6 @@ class AutomaticGroupFacts:
     is_group: bool | None
     members: int | None
     created: int | None
-    hidden: bool | None
     coverage_status: str | None
     retry_at: int | None
 
@@ -63,12 +62,10 @@ def _automatic_group_blocker(
 def _automatic_group_metadata_blocker(
     facts: AutomaticGroupFacts, *, now: int, max_members: int, recent_days: int
 ) -> str:
-    if facts.is_group is None or facts.hidden is None:
+    if facts.is_group is None:
         return "dialog_metadata_unknown"
     if not facts.is_group:
         return "not_a_group"
-    if facts.hidden:
-        return "hidden"
     if facts.coverage_status in {"access_lost", "synced"}:
         return "access_lost" if facts.coverage_status == "access_lost" else "already_synced"
     return _automatic_group_limits_blocker(facts, now=now, max_members=max_members, recent_days=recent_days)

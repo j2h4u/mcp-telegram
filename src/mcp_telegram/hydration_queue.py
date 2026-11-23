@@ -21,8 +21,6 @@ HYDRATION_QUEUE_TABLE = "hydration_jobs"
 MEDIA_METADATA_KIND = "media_metadata"
 RICH_COMPOSITION_KIND = "rich_composition"
 TRANSCRIPTION_HYDRATION_KIND = "transcription"
-DEFAULT_SUMMARY_MESSAGE_IDS = 32
-_REGISTERED_HYDRATION_KINDS = (MEDIA_METADATA_KIND, RICH_COMPOSITION_KIND, TRANSCRIPTION_HYDRATION_KIND)
 
 
 class HydrationOutcome(StrEnum):
@@ -75,18 +73,6 @@ class HydrationJob:
 
 
 @dataclass(frozen=True, slots=True)
-class HydrationQueueSummary:
-    """Bounded, privacy-safe summary of queued jobs for one kind and dialog."""
-
-    kind: str
-    dialog_id: int
-    job_count: int
-    message_ids: tuple[int, ...]
-    attempts_min: int
-    attempts_max: int
-
-
-@dataclass(frozen=True, slots=True)
 class HydrationQueueKindSnapshot:
     """Privacy-safe operational state for one hydration kind."""
 
@@ -103,14 +89,6 @@ class HydrationQueueKindSnapshot:
 
 _JOB_COLUMNS = "kind, dialog_id, message_id, due_at, attempts, message_sent_at, priority, terminal"
 _SELECT_JOB_COLUMNS = ", ".join(f"hj.{column}" for column in _JOB_COLUMNS.split(", "))
-_SUMMARY_AGGREGATE_SQL = (
-    f"SELECT COUNT(*), MIN(attempts), MAX(attempts) FROM {HYDRATION_QUEUE_TABLE} "
-    "WHERE kind = ? AND dialog_id = ? AND terminal = 0"
-)
-_SUMMARY_MESSAGE_IDS_SQL = (
-    f"SELECT message_id FROM {HYDRATION_QUEUE_TABLE} WHERE kind = ? AND dialog_id = ? AND terminal = 0 "
-    "ORDER BY message_id LIMIT ?"
-)
 _QUEUE_SNAPSHOT_SQL = (
     f"SELECT kind, "
     "SUM(CASE WHEN terminal = 0 THEN 1 ELSE 0 END), "
@@ -422,46 +400,10 @@ class HydrationQueueRepository:
         )
         return cursor.rowcount
 
-    def summarize_for_dialog(
-        self, dialog_id: int, *, max_message_ids: int = DEFAULT_SUMMARY_MESSAGE_IDS
-    ) -> tuple[HydrationQueueSummary, ...]:
-        """Summarize all queued jobs before a dialog-wide purge.
-
-        Aggregates are computed by SQLite so future-due rows are included while
-        only queue coordinates (never message payloads) are read into memory.
-        """
-        if not self.is_available():
-            return ()
-        message_id_cap = max(0, max_message_ids)
-        summaries: list[HydrationQueueSummary] = []
-        for kind in _REGISTERED_HYDRATION_KINDS:
-            row = cast(
-                tuple[object, ...] | None,
-                self._conn.execute(_SUMMARY_AGGREGATE_SQL, (kind, dialog_id)).fetchone(),
-            )
-            if row is None or int(cast(int | str, row[0])) == 0:
-                continue
-            id_rows = cast(
-                list[tuple[object, ...]],
-                self._conn.execute(_SUMMARY_MESSAGE_IDS_SQL, (kind, dialog_id, message_id_cap)).fetchall(),
-            )
-            summaries.append(
-                HydrationQueueSummary(
-                    kind=kind,
-                    dialog_id=dialog_id,
-                    job_count=int(cast(int | str, row[0])),
-                    message_ids=tuple(int(cast(int | str, id_row[0])) for id_row in id_rows),
-                    attempts_min=int(cast(int | str, row[1])),
-                    attempts_max=int(cast(int | str, row[2])),
-                )
-            )
-        return tuple(summaries)
-
 
 __all__ = [
     "HYDRATION_QUEUE_TABLE",
     "HydrationJob",
     "HydrationPriority",
     "HydrationQueueRepository",
-    "HydrationQueueSummary",
 ]

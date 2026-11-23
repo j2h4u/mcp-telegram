@@ -171,7 +171,7 @@ def test_owner_joins_caller_transaction_and_presence_revision_is_independent(
     conn.commit()
     conn.execute("BEGIN")
     assert publish_dialog_identity(conn, 15, DialogIdentityObservation(15, "B", "b", "user", True, "profile", 8), base)
-    conn.execute("UPDATE dialogs SET hidden=1 WHERE dialog_id=15")
+    conn.execute("UPDATE dialogs SET archived=1 WHERE dialog_id=15")
     assert conn.execute("SELECT identity_revision,revision FROM dialogs WHERE dialog_id=15").fetchone() == (1, 1)
     conn.rollback()
     assert conn.execute("SELECT name,identity_revision,revision FROM dialogs WHERE dialog_id=15").fetchone() == (

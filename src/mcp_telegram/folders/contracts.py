@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
+
+from ..auth_scope import TelegramAuthScope
+from ..entity_profile.contracts import ChannelReference, GroupReference, UserReference
+
+FolderPeerReference = UserReference | ChannelReference | GroupReference
 
 RULE_TTL_SECONDS = 900
 DEFAULT_FOLDER_NAMESPACE = "default"
@@ -87,6 +92,8 @@ class FolderRuleObservation:
     token: str
     started_at: int
     complete: bool = True
+    references: tuple[tuple[int, FolderPeerReference], ...] = field(default=(), repr=False)
+    auth_scope: TelegramAuthScope | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +102,8 @@ class FolderRuleUpdate:
     folder_id: int | None = None
     rule: FolderRule | None = None
     order: tuple[int, ...] = ()
+    references: tuple[FolderPeerReference, ...] = field(default=(), repr=False)
+    auth_scope: TelegramAuthScope | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

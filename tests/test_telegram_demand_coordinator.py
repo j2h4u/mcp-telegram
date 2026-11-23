@@ -581,7 +581,7 @@ async def test_retryable_receipt_joins_later_committed_revision() -> None:
 @pytest.mark.parametrize("kind", [DemandKind.DELTA_GAP_FILL, DemandKind.ENTITY_PROFILE_REFRESH])
 async def test_slice_receipt_matches_real_sqlite_owner_commit_after_reopen(tmp_path: Path, kind: DemandKind) -> None:
     path = tmp_path / "owner.db"
-    conn, raw_service = _prepare(path, migrated=True)
+    conn, raw_service = _prepare(path)
     service = cast(DaemonEntityInfoService, raw_service)
     writer = await SQLiteWriter.open(path)
     sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
@@ -1338,7 +1338,7 @@ def _discovery_with_link_wait(
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     channel_id = -1_000_000_000_900
-    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,'channel',0)", (channel_id,))
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(?,'channel')", (channel_id,))
     conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES(?,'access_lost')", (channel_id,))
     conn.execute(
         "INSERT INTO linked_chat_fact_state(channel_id,generation,pending_generation,requested_at,retry_at) "

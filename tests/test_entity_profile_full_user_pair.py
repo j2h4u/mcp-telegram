@@ -18,8 +18,6 @@ from telethon.tl.types import User  # type: ignore[import-untyped]
 
 import mcp_telegram.daemon as daemon
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
-from mcp_telegram.contact_notes.schema import CONTACT_NOTE_RECEIPT_DDL
-from mcp_telegram.contacts.schema import CONTACT_RECEIPT_DDL
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.daemon_entity_info import DaemonEntityInfoService, EntityInfoDeps
 from mcp_telegram.entity_profile.contracts import (
@@ -46,62 +44,6 @@ from tests.helpers import (
     LoudUserProfilePort,
 )
 from tests.sqlite_writer_helpers import inline_writer
-
-
-def _fenced_schema(conn: sqlite3.Connection, *, semantic: bool = True) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE entities (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, name TEXT, username TEXT,
-            name_normalized TEXT, updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL);
-        CREATE TABLE dialogs (
-            dialog_id INTEGER PRIMARY KEY, name TEXT, type TEXT, username TEXT,
-            created INTEGER, hidden INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
-            revision INTEGER NOT NULL DEFAULT 0,
-            identity_observed_at INTEGER, identity_complete INTEGER NOT NULL DEFAULT 0,
-            identity_source TEXT, identity_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entity_details (
-            entity_id INTEGER PRIMARY KEY, detail_json TEXT NOT NULL, fetched_at INTEGER NOT NULL,
-            profile_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE entity_detail_sections (
-            entity_id INTEGER NOT NULL, section TEXT NOT NULL, status TEXT NOT NULL,
-            observed_at INTEGER, reason TEXT, payload_json TEXT, retry_at INTEGER,
-            acquisition_generation INTEGER, acquisition_outcome TEXT, provenance_json TEXT,
-            normalization_version TEXT, observation_started_at INTEGER,
-            observation_completed_at INTEGER, acquisition_identity_json TEXT,
-            PRIMARY KEY(entity_id, section)
-        );
-        CREATE TABLE entity_profile_refresh_state (
-            entity_id INTEGER PRIMARY KEY, status TEXT NOT NULL, retry_at INTEGER,
-            reason TEXT, updated_at INTEGER NOT NULL, next_section TEXT NOT NULL,
-            acquisition_cursor INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0,
-            started_at INTEGER, pair_eligible INTEGER NOT NULL DEFAULT 0,
-            follow_up_required INTEGER NOT NULL DEFAULT 0, profile_revision INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE entity_profile_field_observations (
-            entity_id INTEGER NOT NULL, field TEXT NOT NULL, owner_account_id INTEGER NOT NULL,
-            observation_order INTEGER NOT NULL CHECK (observation_order > 0), observed_at INTEGER NOT NULL,
-            source TEXT NOT NULL CHECK (source IN ('rpc', 'update', 'min')),
-            PRIMARY KEY (entity_id, field)
-        ) WITHOUT ROWID;
-        """
-    )
-    conn.execute(CONTACT_NOTE_RECEIPT_DDL)
-    conn.execute(CONTACT_RECEIPT_DDL)
-    if not semantic:
-        return
-    from mcp_telegram.sync_db import _apply_migration_87, _apply_migration_88
-
-    conn.execute("ALTER TABLE entity_details ADD COLUMN profile_owner_account_id INTEGER")
-    conn.execute("ALTER TABLE entity_details ADD COLUMN profile_observation_scope_json TEXT")
-    conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at INTEGER)")
-    _apply_migration_87(conn, 86)
-    _apply_migration_88(conn, 87)
 
 
 class _PairClient:
@@ -247,22 +189,15 @@ def _prepare(
     *,
     entity_type: str = "user",
     bot: bool = False,
-    migrated: bool = False,
     min_user: bool = False,
 ) -> tuple[sqlite3.Connection, object]:
-    if migrated:
-        ensure_sync_schema(path)
+    ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    if not migrated:
-        _fenced_schema(conn)
     conn.execute("INSERT INTO entities VALUES (?, ?, 'Target', 'target', NULL, 100)", (42, entity_type))
     conn.execute(
         "INSERT INTO entities VALUES (?, 'channel', 'Local Channel', 'local_channel', NULL, 100)", (-1000000000123,)
     )
-    conn.execute("CREATE TABLE IF NOT EXISTS dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER)")
-    updated = conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
-    if updated.rowcount == 0:
-        conn.execute("INSERT INTO dialog_directory_state(singleton,account_id) VALUES (1,99)")
+    conn.execute("UPDATE dialog_directory_state SET account_id=99 WHERE singleton=1")
     conn.commit()
     service = _pair_service(conn, _PairClient(bot=bot, min_user=min_user), enabled=True)
     service._profiles.save_core({"id": 42, "type": entity_type, "name": "Target"}, now=100)  # type: ignore[attr-defined]
@@ -311,7 +246,7 @@ async def test_protective_disconnect_serves_valid_partial_profile_from_local_cac
 ) -> None:
     """A verified progressive cache stays locally useful after protective disconnect."""
     path = tmp_path / "protected-pair.sqlite"
-    conn, seed_service = _prepare(path, migrated=True)
+    conn, seed_service = _prepare(path)
     seed_client = cast(_PairClient, seed_service._deps.client)  # type: ignore[attr-defined]
     coordinator = seed_service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
@@ -535,7 +470,7 @@ async def test_pair_disabled_full_profile_applies_identity_patch_to_canonical_en
 @pytest.mark.asyncio
 async def test_disabled_pair_measurement_survives_restart_at_section_boundary(tmp_path: Path) -> None:
     path = tmp_path / "pair-disabled-restart.sqlite"
-    conn, raw_service = _prepare(path, migrated=True)
+    conn, raw_service = _prepare(path)
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(service._deps, enable_full_user_pair=False)
     coordinator = service.refresh_coordinator

@@ -32,22 +32,21 @@ def seed_entity(  # noqa: PLR0913
     )
 
 
-def seed_dialog(  # noqa: PLR0913
+def seed_dialog(
     conn: sqlite3.Connection,
     *,
     dialog_id: int,
     name: str,
     dialog_type: str = "User",
-    hidden: int = 0,
     snapshot_at: int = 1_700_000_000,
 ) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO dialogs
-            (dialog_id, name, type, hidden, snapshot_at)
-        VALUES (?, ?, ?, ?, ?)
+            (dialog_id, name, type, snapshot_at)
+        VALUES (?, ?, ?, ?)
         """,
-        (dialog_id, name, dialog_type, hidden, snapshot_at),
+        (dialog_id, name, dialog_type, snapshot_at),
     )
 
 

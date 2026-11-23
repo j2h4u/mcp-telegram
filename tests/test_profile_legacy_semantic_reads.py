@@ -1,4 +1,4 @@
-"""Actual v86 migration markers cannot block retained User/Bot profile reads."""
+"""Retained User/Bot profile facts remain readable without acquisition."""
 
 import json
 import sqlite3
@@ -20,16 +20,14 @@ from tests.test_profile_read_integration import registered_validator as register
 
 
 @pytest.mark.parametrize("kind", ["user", "bot"])
-async def test_migrated_legacy_profile_default_read_preserves_facts_without_acquisition(
+async def test_profile_default_read_preserves_facts_without_acquisition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     registered_validator: Draft202012Validator,
     kind: Literal["user", "bot"],
 ) -> None:
-    path = tmp_path / "legacy.db"
-    with monkeypatch.context() as old:
-        old.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 86)
-        sync_db.ensure_sync_schema(path)
+    path = tmp_path / "sync.db"
+    sync_db.ensure_sync_schema(path)
     retained = {
         "schema": 1,
         "id": 42,
@@ -41,7 +39,7 @@ async def test_migrated_legacy_profile_default_read_preserves_facts_without_acqu
     }
     with closing(sqlite3.connect(path)) as seed:
         seed.execute("INSERT INTO entities(id,type,name,updated_at) VALUES(42,?,'Retained',10)", (kind,))
-        seed.execute("INSERT INTO dialogs(dialog_id,type,name,archived,hidden) VALUES(42,?,'Retained',1,1)", (kind,))
+        seed.execute("INSERT INTO dialogs(dialog_id,type,name,archived) VALUES(42,?,'Retained',1)", (kind,))
         seed.execute(
             "INSERT INTO entity_details(entity_id,detail_json,fetched_at,profile_owner_account_id) VALUES(42,?,100,77)",
             (json.dumps(retained),),
@@ -50,7 +48,6 @@ async def test_migrated_legacy_profile_default_read_preserves_facts_without_acqu
             "INSERT INTO entity_detail_sections(entity_id,section,status,observed_at,normalization_version) VALUES(42,'full_profile','fresh',100,'entity-profile-full-user-v1')"
         )
         seed.commit()
-    sync_db.ensure_sync_schema(path)
     reader = sync_db.open_sync_db_reader(path)
     service = _test_service(reader, limits=RefreshLimits(), account_id=77)
     monkeypatch.setattr(service, "_write_profiles", AsyncMock(side_effect=AssertionError("read queued writer")))
@@ -68,9 +65,6 @@ async def test_migrated_legacy_profile_default_read_preserves_facts_without_acqu
 
     monkeypatch.setattr(entity_info, "_bounded_daemon_connection", connection)
     try:
-        assert reader.execute(
-            "SELECT fields_json,coverage_json,provenance_json,source FROM entity_profile_semantic_snapshots WHERE owner_account_id=77 AND entity_id=42"
-        ).fetchone() == ("{}", '{"reason":"legacy_normalization_incomplete"}', "{}", "legacy")
         tool = await entity_info.get_entity_info(entity_info.GetEntityInfo(exact_entity_id=42))
         assert not tool.is_error
         result = server._project_tool_result("get_entity_info", tool, server._CallTelemetry())

@@ -29,9 +29,9 @@ import pytest
 
 from mcp_telegram.daemon_api import DaemonAPIServer, DaemonClientLike
 from mcp_telegram.reading.sqlite_projection import _LIST_DIALOG_MESSAGE_AGGREGATES_SQL, _LIST_DIALOGS_SQL
+from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.sync_read_model import build_sync_read_model
 from tests.daemon_api_policy import make_daemon_api_policy
-from tests.dialog_directory_coverage_fixtures import install_dialog_directory_coverage_schema
 from tests.helpers import (
     LoudChannelProfilePort,
     LoudChatAvatarHistoryPort,
@@ -64,136 +64,12 @@ def _patch_get_peer_id():
 
 @contextmanager
 def _make_db() -> Iterator[sqlite3.Connection]:
-    """In-memory DB with full Phase 44 schema: synced_dialogs, messages,
-    entities, message_forwards, and the dialogs snapshot table + 4 indexes."""
+    """In-memory database with the current schema."""
     conn = sqlite3.connect(":memory:")
     try:
-        conn.execute(
-            """
-            CREATE TABLE synced_dialogs (
-                dialog_id           INTEGER PRIMARY KEY,
-                status              TEXT NOT NULL DEFAULT 'not_synced',
-            history_depth_complete INTEGER NOT NULL DEFAULT 0,
-                last_synced_at      INTEGER,
-                last_event_at       INTEGER,
-                last_delta_checked_at INTEGER,
-                delta_refresh_requested_at INTEGER, delta_refresh_generation INTEGER NOT NULL DEFAULT 0,
-                sync_progress       INTEGER DEFAULT 0,
-                total_messages      INTEGER,
-                access_lost_at      INTEGER,
-                read_inbox_max_id   INTEGER,
-                read_outbox_max_id  INTEGER
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE full_history_enrollment (
-                dialog_id INTEGER PRIMARY KEY,
-                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
-
-                updated_at INTEGER NOT NULL
-            ) WITHOUT ROWID
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE messages (
-                dialog_id           INTEGER NOT NULL,
-                message_id          INTEGER NOT NULL,
-                sent_at             INTEGER NOT NULL,
-                text                TEXT,
-                sender_id           INTEGER,
-                sender_first_name   TEXT,
-                media_kind          TEXT,
-                media_payload       TEXT,
-                reply_to_msg_id     INTEGER,
-                forum_topic_id      INTEGER,
-                is_deleted          INTEGER NOT NULL DEFAULT 0,
-                deleted_at          INTEGER,
-                edit_date           INTEGER,
-                out                 INTEGER NOT NULL DEFAULT 0,
-                is_service          INTEGER NOT NULL DEFAULT 0,
-                post_author         TEXT,
-                PRIMARY KEY (dialog_id, message_id)
-            ) WITHOUT ROWID
-            """
-        )
-        conn.execute(
-            "CREATE INDEX idx_messages_dialog_summary ON messages(dialog_id, is_deleted, is_service, out, message_id)"
-        )
-        conn.execute(
-            """
-            CREATE TABLE entities (
-                id              INTEGER PRIMARY KEY,
-                type            TEXT NOT NULL,
-                name            TEXT,
-                username        TEXT,
-                name_normalized TEXT,
-                updated_at      INTEGER NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_forwards (
-                dialog_id           INTEGER NOT NULL,
-                message_id          INTEGER NOT NULL,
-                fwd_from_peer_id    INTEGER,
-                fwd_from_name       TEXT,
-                fwd_date            INTEGER,
-                fwd_channel_post    INTEGER,
-                PRIMARY KEY (dialog_id, message_id)
-            ) WITHOUT ROWID
-            """
-        )
-        # Phase 44: dialogs snapshot table + 4 indexes
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dialogs (
-                dialog_id               INTEGER PRIMARY KEY,
-                name                    TEXT,
-                type                    TEXT,
-                username                TEXT,
-                archived                INTEGER NOT NULL DEFAULT 0,
-                pinned                  INTEGER NOT NULL DEFAULT 0,
-                members                 INTEGER,
-                created                 INTEGER,
-                last_message_at         INTEGER,
-                snapshot_at             INTEGER,
-                hidden                  INTEGER NOT NULL DEFAULT 0,
-                needs_refresh           INTEGER NOT NULL DEFAULT 0,
-                unread_mentions_count   INTEGER NOT NULL DEFAULT 0,
-                unread_reactions_count  INTEGER NOT NULL DEFAULT 0,
-                unread_count            INTEGER,
-                unread_mark             INTEGER,
-                unread_count_observed_at INTEGER,
-                unread_mark_observed_at INTEGER,
-                draft_text              TEXT,
-                identity_observed_at    INTEGER,
-                identity_complete       INTEGER NOT NULL DEFAULT 0,
-                identity_source         TEXT
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_hidden_pinned ON dialogs(hidden, pinned DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_type ON dialogs(type)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_snapshot_at ON dialogs(snapshot_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_needs_refresh_hidden ON dialogs(needs_refresh, hidden)")
-        conn.execute(
-            """
-            CREATE TABLE own_only_dialogs (
-                dialog_id INTEGER PRIMARY KEY,
-                inclusion_basis TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS topic_catalog_state (dialog_id INTEGER PRIMARY KEY, applicable INTEGER)"
-        )
-        install_dialog_directory_coverage_schema(conn)
+        _apply_migrations(conn)
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        conn.execute("UPDATE dialog_directory_publication SET account_id=42 WHERE singleton=1")
         conn.commit()
         yield conn
     finally:
@@ -226,7 +102,7 @@ def _insert_dialog(
 ) -> None:
     """Insert a row into the dialogs snapshot table."""
     conn.execute(
-        "INSERT INTO dialogs (dialog_id, name, type, hidden) VALUES (?, ?, ?, 0)",
+        "INSERT INTO dialogs (dialog_id, name, type) VALUES (?, ?, ?)",
         (dialog_id, name, type_),
     )
     conn.commit()
@@ -668,12 +544,16 @@ async def test_unread_summary_includes_mention_only_and_reaction_only_rows() -> 
         assert by_id[2]["unread_mark"] is False
 
 
-async def test_unread_summary_excludes_hidden_access_lost_and_zero_rows() -> None:
+async def test_unread_summary_excludes_directory_omissions_access_lost_and_zero_rows() -> None:
     with _make_db() as conn:
-        _insert_dialog(conn, 1, name="Hidden", type_="User")
+        _insert_dialog(conn, 1, name="Omitted", type_="User")
         _insert_dialog(conn, 2, name="Access lost", type_="User")
         _insert_dialog(conn, 3, name="Zero", type_="User")
-        conn.execute("UPDATE dialogs SET hidden=1, unread_count=1 WHERE dialog_id=1")
+        conn.execute("UPDATE dialogs SET unread_count=1 WHERE dialog_id=1")
+        conn.execute(
+            "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+            "VALUES (42,1,'not_returned','completed_directory',100,1)"
+        )
         conn.execute("UPDATE dialogs SET unread_count=1 WHERE dialog_id=2")
         conn.execute(
             "UPDATE dialogs SET unread_count=0, unread_mark=0, unread_mentions_count=0, unread_reactions_count=0 WHERE dialog_id=3"

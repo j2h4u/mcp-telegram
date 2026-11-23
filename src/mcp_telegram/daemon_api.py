@@ -1507,17 +1507,12 @@ class DaemonAPIServer:
 
     def _local_dialog_eligibility(self) -> dict[int, bool]:
         rows = cast(
-            list[tuple[object, object, object]],
+            list[tuple[int]],
             self._conn.execute(
-                "SELECT d.dialog_id,d.hidden,sd.status FROM dialogs d "
-                "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id ORDER BY d.dialog_id"
+                "SELECT d.dialog_id FROM dialogs d WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=d.dialog_id AND lo.state='not_returned')"
             ).fetchall(),
         )
-        return {
-            _coerce_int(dialog_id, 0): not bool(hidden) or status == "access_lost"
-            for dialog_id, hidden, status in rows
-            if _coerce_int(dialog_id, 0) != 0
-        }
+        return {row[0]: True for row in rows}
 
     def _local_dialog_directory(
         self,
@@ -2369,7 +2364,6 @@ class DaemonAPIServer:
             is_group=None if row is None else _automatic_group_type(row[0]),
             members=None if row is None else cast(int | None, row[1]),
             created=None if row is None else cast(int | None, row[2]),
-            hidden=None if row is None or row[3] is None else bool(row[3]),
             coverage_status=coverage,
             retry_at=None if retry_row is None else _coerce_int(retry_row[0], 0),
         )
@@ -2382,7 +2376,7 @@ class DaemonAPIServer:
 
     def _automatic_group_rows(
         self, dialog_id: int, *, conn: sqlite3.Connection | None = None
-    ) -> tuple[tuple[object, object, object, object] | None, tuple[object] | None]:
+    ) -> tuple[tuple[object, object, object] | None, tuple[object] | None]:
         conn = self._conn if conn is None else conn
         row = read_automatic_group_metadata(conn, dialog_id)
         retry_row = cast(
@@ -2464,17 +2458,9 @@ class DaemonAPIServer:
             return _account_protection_error()
         if result.get("error") == "entity_not_observed":
             result.update(self._entity_miss_coverage())
-        if result.get("ok"):
-            data = cast(dict[str, object], result.get("data", {}))
-            entity_id = data.get("id")
-            if isinstance(entity_id, int):
-                data["dialog_placement"] = dialog_placement(
-                    self._conn, entity_id, account_id=self._verified_folder_account()
-                )
         logger.info(
-            "entity_info_dispatch_timing service_s=%.3f dialog_placement_s=%.3f%s",
+            "entity_info_dispatch_timing service_s=%.3f%s",
             fetched_at - started_at,
-            time.perf_counter() - fetched_at,
             _rid(),
         )
         return result

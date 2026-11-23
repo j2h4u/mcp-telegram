@@ -137,8 +137,8 @@ def _seed_topic_dialog(
 ) -> None:
     conn.execute(
         "INSERT INTO dialogs "
-        "(dialog_id,name,type,snapshot_at,hidden,identity_observed_at,identity_complete,identity_source) "
-        "VALUES (?,?,?,1,0,1,1,'directory')",
+        "(dialog_id,name,type,snapshot_at,identity_observed_at,identity_complete,identity_source) "
+        "VALUES (?,?,?,1,1,1,'directory')",
         (dialog_id, name, "supergroup"),
     )
     conn.execute(
@@ -487,7 +487,7 @@ async def test_registered_entity_info_keeps_owned_partial_cache_success_under_pr
 ) -> None:
     monkeypatch.setattr(mcp_server, "_schedule_telemetry", lambda _event: None)
     sync_path = tmp_path / "sync.db"
-    seed_conn, raw_seed_service = _prepare(sync_path, migrated=True)
+    seed_conn, raw_seed_service = _prepare(sync_path)
     request.addfinalizer(seed_conn.close)
     seed_service = cast(DaemonEntityInfoService, raw_seed_service)
     coordinator = seed_service.refresh_coordinator
@@ -765,8 +765,8 @@ async def test_registered_list_messages_unobserved_topic_catalog_is_explicit_und
     )
     sync_conn.execute(
         "INSERT INTO dialogs "
-        "(dialog_id,name,type,snapshot_at,hidden,identity_observed_at,identity_complete,identity_source) "
-        "VALUES (123,'Project','supergroup',1,0,1,1,'directory')"
+        "(dialog_id,name,type,snapshot_at,identity_observed_at,identity_complete,identity_source) "
+        "VALUES (123,'Project','supergroup',1,1,1,'directory')"
     )
     sync_conn.commit()
     daemon._health_status = _active_status

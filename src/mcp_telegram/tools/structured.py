@@ -1,6 +1,7 @@
 """Compatibility imports for the shared structured projection."""
 
 from ..structured import (  # noqa: F401
+    DIALOG_AVAILABILITY_OUTPUT_SCHEMA,
     FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
     MEDIA_OUTPUT_SCHEMA,
     TELEGRAM_CONTENT_OUTPUT_SCHEMA,

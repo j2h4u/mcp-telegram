@@ -33,7 +33,7 @@ async def profile_setup(
     tmp_path: Path, wire: _WireHarness
 ) -> AsyncIterator[tuple[sqlite3.Connection, DaemonEntityInfoService, EntityProfileDemandAdapter]]:
     gate = wire[0]
-    conn, prior = _prepare(tmp_path / "profile.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "profile.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     with write_savepoint(conn):
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")

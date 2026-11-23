@@ -42,6 +42,9 @@ class _Client:
     def claim_image_scope(self, token: ScopeToken) -> bool:
         return self.cell.claim(token)
 
+    async def get_input_entity(self, peer: int) -> int:
+        return peer
+
     async def get_messages(self, *, entity: int, limit: int) -> object:
         assert entity == 55 and limit == 1
         self.calls += 1

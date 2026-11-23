@@ -73,7 +73,7 @@ from telethon.tl.types import (  # type: ignore[import-untyped]
 )
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import AccessLossEvidence, AccessLossResult, set_access_lost, unhide_after_realtime_presence
+from .access_lifecycle import AccessLossEvidence, AccessLossResult, set_access_lost
 from .auth_scope import TelegramAuthScope
 from .channel_full_siblings import (
     ChannelFullSiblingsToken,
@@ -685,9 +685,9 @@ _UPDATE_DIALOG_LAST_MESSAGE_AT_SQL = (
 
 _UPSERT_REALTIME_DM_DIALOG_SQL = """
 INSERT INTO dialogs (
-    dialog_id, last_message_at, snapshot_at, hidden, needs_refresh,
+    dialog_id, last_message_at, snapshot_at, needs_refresh,
     archived, pinned, unread_mentions_count, unread_reactions_count
-) VALUES (?, ?, ?, 0, 1, 0, 0, 0, 0)
+) VALUES (?, ?, ?, 1, 0, 0, 0, 0)
 ON CONFLICT(dialog_id) DO UPDATE SET
     last_message_at = CASE
         WHEN excluded.last_message_at IS NULL THEN dialogs.last_message_at
@@ -1052,7 +1052,6 @@ class EventHandlerManager:
                     observed_at,
                     row_existed_before_presence=row_existed_before_presence,
                 )
-            unhide_after_realtime_presence(conn, dialog_id)
             return outcome
 
     def _publish_dm_identity(  # noqa: PLR0913 - explicit worker connection
@@ -2886,14 +2885,15 @@ class EventHandlerManager:
 
     def _write_folder_update(self, conn: sqlite3.Connection, update: FolderRuleUpdate) -> None:
         with write_transaction(conn):
-            if current_delivered_update() is None:
+            delivery = current_delivered_update()
+            if delivery is None:
                 return
             available = self._delivery_auth_available()
             repository = SQLiteFolderSnapshotRepository(conn)
             if not available:
                 return
             if not repository.apply_supplied_update(
-                update,
+                replace(update, auth_scope=delivery.auth_scope),
                 account_id=cast(int, self._self_id),
                 order=delivered_observation_order(conn),
                 now=delivered_observed_at(),
@@ -3184,11 +3184,7 @@ class EventHandlerManager:
             logger.debug("linked_chat_refresh_no_input_peer dialog_id=%d", channel_id)
             return None
 
-        profile_owner_account_id = self._self_id
-        observation_order = await self._writer.run(allocate_observation_order)
-        full_result = await self._request_linked_chat_full(
-            work, input_channel, profile_owner_account_id, observation_order
-        )
+        full_result = await self._request_linked_chat_full(work, input_channel)
         if full_result is None:
             return None
         return await self._publish_linked_chat_observation(work, generation, siblings_token, full_result, now)
@@ -3197,8 +3193,6 @@ class EventHandlerManager:
         self,
         work: LinkedChatWork,
         input_channel: TypeInputChannel,
-        profile_owner_account_id: int | None,
-        observation_order: int,
     ) -> object | None:
         """Acquire one full-channel result and persist recoverable failure state."""
         channel_id = work.channel_id
@@ -3211,10 +3205,8 @@ class EventHandlerManager:
             RpcAdmissionClosedError,
         ):
             raise
-        except ACCESS_LOST_ERRORS as exc:
-            await self._mark_linked_chat_access_lost(
-                work, int(time.time()), exc, profile_owner_account_id, observation_order
-            )
+        except ACCESS_LOST_ERRORS:
+            await self._writer.run(lambda conn: self._defer_linked_chat_work(conn, work, int(time.time())))
             return None
         except Exception:
             logger.debug("linked_chat_refresh_failed dialog_id=%d", channel_id, exc_info=True)
@@ -3284,37 +3276,6 @@ class EventHandlerManager:
                 flood_wait_seconds=flood_wait_seconds,
             )
             linked_chat_fact_owner.defer(conn, work, retry_at)
-
-    async def _mark_linked_chat_access_lost(
-        self,
-        work: LinkedChatWork,
-        now: int,
-        error: Exception,
-        profile_owner_account_id: int | None,
-        observation_order: int,
-    ) -> None:
-        def _persist_event_0(conn: sqlite3.Connection) -> AccessLossResult:
-            with write_transaction(conn):
-                if linked_chat_fact_owner.capture_generation(conn, work.channel_id) != work.generation:
-                    return AccessLossResult(False, MembershipSignalCounts())
-                return set_access_lost(
-                    conn,
-                    work.channel_id,
-                    now,
-                    reason=type(error).__name__,
-                    profile_owner_account_id=profile_owner_account_id,
-                    observation_order=observation_order,
-                    membership_revision_at=now,
-                    processing_at=int(time.time()),
-                )
-
-        result = await self._writer.run(_persist_event_0)
-        self._observe_access_loss(result.membership_counts)
-        if result.membership_counts.queued or result.membership_counts.coalesced:
-            self._offer(DemandKind.ENTITY_PROFILE_REFRESH)
-        if result.changed:
-            self._synced_dialog_ids.discard(work.channel_id)
-            self._offer(DemandKind.DELTA_ACCESS_PROBE)
 
     @_demand_root(DemandKind.REALTIME_EVENT_ACQUISITION)
     async def on_raw_inbox_read(self, update: _InboxReadUpdateLike | _ChannelInboxReadUpdateLike) -> None:

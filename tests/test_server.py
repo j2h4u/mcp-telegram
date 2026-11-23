@@ -3175,3 +3175,124 @@ def test_list_messages_schema_exposes_current_unassigned_count() -> None:
     assert count["type"] == "integer"
     assert "General" in cast(str, count["description"])
     assert "no_topic_count" not in receipt_properties
+
+
+async def test_registered_folder_references_survive_missing_metadata_and_read_retained_messages(  # noqa: PLR0915, PLR0914
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    from dataclasses import replace
+
+    from telethon import types
+
+    from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
+    from mcp_telegram.folders.sqlite_repository import SQLiteFolderSnapshotRepository
+    from mcp_telegram.folders.telegram_adapter import folder_update_from_native
+    from mcp_telegram.sync_transactions import write_savepoint
+    from tests.account_trace_fixtures import seed_message
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    conn = sqlite3.connect(path)
+    request.addfinalizer(conn.close)
+    scope = TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 99)
+    native = types.DialogFilter(
+        4,
+        types.TextWithEntities("Known", []),
+        [],
+        [
+            types.InputPeerUser(11, 111),
+            types.InputPeerUser(12, 222),
+            types.InputPeerUser(13, 333),
+            types.InputPeerUser(14, 444),
+            types.InputPeerUser(15, 555),
+            types.InputPeerUser(16, 666),
+        ],
+        [],
+    )
+    update = replace(folder_update_from_native(types.UpdateDialogFilter(4, native)), auth_scope=scope)
+    with write_savepoint(conn):
+        assert SQLiteFolderSnapshotRepository(conn).apply_supplied_update(update, account_id=42, order=1, now=100)
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        conn.execute(
+            "UPDATE dialog_directory_publication SET account_id=42,generation=1,observation_started_at=90,observation_completed_at=100 WHERE singleton=1"
+        )
+        conn.execute(
+            "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) VALUES(42,12,'not_returned','completed_directory',100,1)"
+        )
+        seed_message(conn, dialog_id=12, message_id=1, sent_at=100, text="retained message")
+        conn.execute(
+            "UPDATE folder_peer_references SET metadata_state='omitted',metadata_source='telegram_get_peer_dialogs',metadata_observed_at=101 WHERE dialog_id=12"
+        )
+        conn.execute(
+            "UPDATE folder_peer_references SET metadata_state='unresolvable',metadata_source='local_resolution',metadata_observed_at=102,metadata_error_code='local_reference_missing' WHERE dialog_id=13"
+        )
+        conn.execute(
+            "UPDATE folder_peer_references SET metadata_state='denied',metadata_source='telegram_get_peer_dialogs',metadata_observed_at=103,metadata_error_code='ChatAdminRequiredError' WHERE dialog_id=14"
+        )
+        conn.execute("UPDATE folder_peer_references SET metadata_state='retained' WHERE dialog_id=15")
+        conn.execute(
+            "UPDATE folder_peer_references SET metadata_state='returned',metadata_source='telegram_get_peer_dialogs',metadata_observed_at=104 WHERE dialog_id=16"
+        )
+    client = MagicMock()
+    feedback_conn = sqlite3.connect(":memory:")
+    request.addfinalizer(feedback_conn.close)
+    api = make_server(conn=conn, client=client, feedback_conn=feedback_conn)
+    api._runtime_observation_sink = None
+    api.self_id = 42
+    await api._publish_auth_scope(scope)
+    sink = MagicMock()
+    api.bind_demand_sink(sink)
+    socket = tmp_path / "daemon.sock"
+
+    @asynccontextmanager
+    async def connection(*_args: object, **_kwargs: object) -> AsyncIterator[DaemonConnection]:
+        reader, writer = await asyncio.open_unix_connection(str(socket))
+        try:
+            yield DaemonConnection(reader, writer)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    for module in ("discovery", "entity_info", "reading"):
+        monkeypatch.setattr(f"mcp_telegram.tools.{module}.daemon_connection", connection)
+    monkeypatch.setattr(server, "daemon_connection", connection)
+    monkeypatch.setattr(server, "_schedule_telemetry", lambda _event: None)
+    before = conn.total_changes
+    async with await asyncio.start_unix_server(api.handle_client, path=socket):
+        listing = _call_tool_result(await server.call_tool("list_dialogs", {"folder_id": 4, "navigation": "start"}))
+        profile = _call_tool_result(await server.call_tool("get_entity_info", {"exact_entity_id": 11}))
+        messages = _call_tool_result(await server.call_tool("list_messages", {"exact_dialog_id": 12}))
+    for name, result in (("list_dialogs", listing), ("get_entity_info", profile), ("list_messages", messages)):
+        assert result.is_error is False, result
+        schema = cast(dict[str, object], server.tool_by_name[name].output_schema)
+        validators.validator_for(schema)(schema).validate(cast(_TestJson, result.structured_content))
+    listed = cast(dict[str, object], listing.structured_content)
+    dialogs = cast(list[dict[str, object]], listed["dialogs"])
+    assert [row["id"] for row in dialogs] == [11, 12, 13, 14, 15, 16]
+    assert "archived" not in dialogs[0] and "unread_count" not in dialogs[0]
+    assert cast(dict[str, object], dialogs[0]["availability"])["listing"] == {"state": "not_yet_observed"}
+    listing_evidence = cast(dict[str, object], cast(dict[str, object], dialogs[1]["availability"])["listing"])
+    assert listing_evidence["state"] == "not_returned"
+    assert listing_evidence["source"] == "completed_directory" and listing_evidence["generation"] == 1
+    assert cast(dict[str, object], dialogs[0]["availability"])["acquisition"] == {"state": "pending"}
+    omitted = cast(dict[str, object], cast(dict[str, object], dialogs[1]["availability"])["acquisition"])
+    assert omitted["state"] == "omitted" and omitted["source"] == "telegram_get_peer_dialogs"
+    assert "observed_at" in omitted and "error_code" not in omitted
+    unresolved = cast(dict[str, object], cast(dict[str, object], dialogs[2]["availability"])["acquisition"])
+    assert unresolved["state"] == "unresolvable" and unresolved["error_code"] == "local_reference_missing"
+    denied = cast(dict[str, object], cast(dict[str, object], dialogs[3]["availability"])["acquisition"])
+    assert denied["state"] == "denied" and denied["error_code"] == "ChatAdminRequiredError"
+    assert cast(dict[str, object], dialogs[4]["availability"])["acquisition"] == {"state": "retained"}
+    returned = cast(dict[str, object], cast(dict[str, object], dialogs[5]["availability"])["acquisition"])
+    assert returned["state"] == "returned" and returned["source"] == "telegram_get_peer_dialogs"
+    assert "observed_at" in returned
+    details = cast(dict[str, object], profile.structured_content)
+    assert details["type"] == "unknown"
+    assert "archived" not in cast(dict[str, object], details["dialog_placement"])
+    contact = cast(dict[str, object], cast(dict[str, object], details["relationships"])["contact"])
+    assert contact.get("contact") is None and contact.get("mutual_contact") is None
+    message_data = cast(dict[str, object], messages.structured_content)
+    assert "retained message" in str(message_data["messages"])
+    assert conn.total_changes == before
+    assert not client.mock_calls and not sink.mock_calls
+    await api.shutdown_clients()

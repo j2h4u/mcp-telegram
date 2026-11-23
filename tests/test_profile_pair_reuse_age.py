@@ -20,7 +20,7 @@ type AcquiredPair = tuple[sqlite3.Connection, DaemonEntityInfoService, EntityRef
 
 @pytest.fixture
 async def acquired_pair(tmp_path: Path) -> AsyncIterator[AcquiredPair]:
-    conn, service = _prepare(tmp_path / "pair-age.sqlite", migrated=True)
+    conn, service = _prepare(tmp_path / "pair-age.sqlite")
     assert isinstance(service, DaemonEntityInfoService)
     try:
         cursor = service._profiles.next_due_refresh(now=100)

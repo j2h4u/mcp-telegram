@@ -373,3 +373,20 @@ def test_full_history_page_rejects_more_than_protocol_limit() -> None:
         FullHistoryPage(messages=(message,) * 101, total_messages=None, next_before_message_id=1)
     with pytest.raises(ValueError, match="require a next cursor"):
         FullHistoryPage(messages=(message,), total_messages=1, next_before_message_id=None)
+
+
+@pytest.mark.asyncio
+async def test_peer_resolution_denial_does_not_claim_history_denial() -> None:
+    class DeniedPeer(_Client):
+        async def get_input_entity(self, peer: object) -> object:
+            raise ChannelPrivateError(request=None)
+
+    client = DeniedPeer()
+    for call in (
+        lambda: TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=0),
+        lambda: TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False),
+        lambda: TelethonHistoryAccessProbe(client).probe_total_messages(7),
+    ):
+        with pytest.raises(MessageHistoryUnavailableError):
+            await call()
+    assert client.requests == [] and client.get_messages_calls == []

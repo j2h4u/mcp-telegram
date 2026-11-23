@@ -59,6 +59,7 @@ def test_membership_access_fence_rejects_replay_after_restoration() -> None:
             assert loss.changed and loss.membership_counts.queued == 1
             assert not set_access_lost(conn, -5, 21, profile_owner_account_id=42, observation_order=10).changed
             assert record_access_recovery_observation(conn, -5, 20)
+            conn.execute("UPDATE synced_dialogs SET access_next_revalidate_at=999 WHERE dialog_id=-5")
             conn.execute("UPDATE entity_profile_refresh_state SET status='complete' WHERE entity_id=12")
             conn.execute(
                 "UPDATE entity_detail_sections SET status='fresh',payload_json=? WHERE entity_id=12 AND section='common_chats'",
@@ -68,6 +69,9 @@ def test_membership_access_fence_rejects_replay_after_restoration() -> None:
                 conn, -5, 30, profile_owner_account_id=42, observation_order=30, membership_revision_at=30
             )
             assert later.changed and later.membership_counts.queued == 1
+            assert conn.execute(
+                "SELECT access_lost_at,access_next_revalidate_at FROM synced_dialogs WHERE dialog_id=-5"
+            ).fetchone() == (30, None)
             assert not set_access_lost(conn, -5, 31, profile_owner_account_id=42, observation_order=30).changed
             assert record_access_recovery_observation(conn, -5, 40)
             assert restore_access_after_revalidation(conn, -5, 40, expected_observation_order=40)
@@ -92,7 +96,7 @@ def test_nested_lifecycle_savepoint_preserves_outer_write() -> None:
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     seed_full_history_enrollment(conn, 1, enabled=True)
     conn.execute(
-        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')"
+        "INSERT INTO dialogs (dialog_id,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 1, 0, 0, 0, 0, 'x')"
     )
     conn.execute("CREATE TABLE unrelated (value INTEGER)")
     conn.commit()
@@ -118,7 +122,7 @@ def test_access_restore_clears_read_position_retry() -> None:
     )
     seed_full_history_enrollment(conn, 2, enabled=True)
     conn.execute(
-        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (2, 1, 0, 1, 0, 0, 0, 0, 'x')"
+        "INSERT INTO dialogs (dialog_id,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (2, 0, 1, 0, 0, 0, 0, 'x')"
     )
     conn.commit()
     try:
@@ -135,7 +139,7 @@ def test_access_restore_rearms_terminal_reaction_details() -> None:
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (9, 'access_lost')")
     seed_full_history_enrollment(conn, 9, enabled=True)
     conn.execute(
-        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (9, 1, 0, 1, 0, 0, 0, 0, 'x')"
+        "INSERT INTO dialogs (dialog_id,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (9, 0, 1, 0, 0, 0, 0, 'x')"
     )
     conn.executemany(
         "INSERT INTO message_reaction_event_status "
@@ -193,7 +197,7 @@ def test_access_loss_clears_read_position_retry() -> None:
         "VALUES (3, 'synced', 999, 3)"
     )
     conn.execute(
-        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (3, 0, 0, 1, 0, 0, 0, 0, 'x')"
+        "INSERT INTO dialogs (dialog_id,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (3, 0, 1, 0, 0, 0, 0, 'x')"
     )
     conn.commit()
     try:
@@ -211,7 +215,7 @@ def test_durable_event_failure_rolls_back_lifecycle() -> None:
     conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
     seed_full_history_enrollment(conn, 1, enabled=True)
     conn.execute(
-        "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')"
+        "INSERT INTO dialogs (dialog_id,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 1, 0, 0, 0, 0, 'x')"
     )
     conn.commit()
     conn.execute(
@@ -223,7 +227,7 @@ def test_durable_event_failure_rolls_back_lifecycle() -> None:
         with pytest.raises(sqlite3.IntegrityError, match="injected"):
             set_access_lost(conn, 1, 10)
         assert conn.execute("SELECT status FROM synced_dialogs").fetchone() == ("synced",)
-        assert conn.execute("SELECT hidden FROM dialogs").fetchone() == (0,)
+        assert conn.execute("SELECT name FROM dialogs").fetchone() == ("x",)
     finally:
         conn.close()
 
@@ -235,7 +239,7 @@ def test_lifecycle_history_and_operational_logs_are_ordered_and_deduplicated(
     try:
         conn.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (1, 'synced')")
         conn.execute(
-            "INSERT INTO dialogs (dialog_id,hidden,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 0, 1, 0, 0, 0, 0, 'x')"
+            "INSERT INTO dialogs (dialog_id,needs_refresh,snapshot_at,archived,pinned,unread_mentions_count,unread_reactions_count,name) VALUES (1, 0, 1, 0, 0, 0, 0, 'x')"
         )
         conn.commit()
 

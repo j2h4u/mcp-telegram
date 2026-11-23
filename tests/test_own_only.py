@@ -88,35 +88,24 @@ def test_only_personal_channel_discussion_is_included() -> None:
 def test_candidate_query_keeps_rights_classification_out_of_sql() -> None:
     conn = sqlite3.connect(":memory:")
     try:
-        conn.execute(
-            "CREATE TABLE dialogs ("
-            "dialog_id INTEGER PRIMARY KEY,name TEXT,type TEXT,username TEXT,linked_chat_id INTEGER,"
-            "last_message_at INTEGER,hidden INTEGER,identity_observed_at INTEGER,"
-            "identity_complete INTEGER DEFAULT 0,identity_source TEXT,identity_revision INTEGER DEFAULT 0)"
-        )
-        conn.execute("CREATE TABLE entities (id INTEGER PRIMARY KEY,type TEXT,name TEXT,username TEXT)")
-        conn.execute("CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT)")
-        conn.execute(
-            """CREATE TABLE full_history_enrollment (
-                dialog_id INTEGER PRIMARY KEY,
-                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        from mcp_telegram.sync_db import _apply_migrations
 
-                updated_at INTEGER NOT NULL
-            ) WITHOUT ROWID"""
-        )
+        _apply_migrations(conn)
         with write_savepoint(conn):
             conn.executemany(
-                "INSERT INTO dialogs(dialog_id,name,type,linked_chat_id,last_message_at,hidden) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO dialogs(dialog_id,name,type,linked_chat_id,last_message_at) VALUES (?, ?, ?, ?, ?)",
                 [
-                    (1, "dm", "user", None, 10, 0),
-                    (-1000000009001, "channel", "channel", -1000000008001, 20, 0),
-                    (-1000000008001, "discussion", "forum", None, 30, 0),
-                    (-1000000007001, "other", "supergroup", None, 40, 0),
-                    (-1000000006001, "lost", "channel", None, 50, 1),
+                    (1, "dm", "user", None, 10),
+                    (-1000000009001, "channel", "channel", -1000000008001, 20),
+                    (-1000000008001, "discussion", "forum", None, 30),
+                    (-1000000007001, "other", "supergroup", None, 40),
+                    (-1000000006001, "lost", "channel", None, 50),
                 ],
             )
         with write_savepoint(conn):
-            conn.execute("INSERT INTO entities VALUES (1,'bot','Stale profile name','stale_bot')")
+            conn.execute(
+                "INSERT INTO entities(id,type,name,username,updated_at) VALUES (1,'bot','Stale profile name','stale_bot',1)"
+            )
         with write_savepoint(conn):
             conn.execute(
                 "INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'access_lost')",

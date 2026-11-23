@@ -1254,8 +1254,8 @@ async def test_observed_trace_reports_only_current_evidence_dialog_problems(
 ) -> None:
     _server, conn, _client = trace_server
     seed_entity(conn, entity_id=101, name="Alice", username="alice")
-    seed_dialog(conn, dialog_id=-100123, name="Current", dialog_type="Supergroup", hidden=1)
-    seed_dialog(conn, dialog_id=-100124, name="Historical Hidden", dialog_type="Supergroup", hidden=1)
+    seed_dialog(conn, dialog_id=-100123, name="Current", dialog_type="Supergroup")
+    seed_dialog(conn, dialog_id=-100124, name="Historical Hidden", dialog_type="Supergroup")
     seed_synced_dialog(conn, dialog_id=-100123, status="access_lost")
     seed_synced_dialog(conn, dialog_id=-100124, status="access_lost")
     seed_synced_dialog(conn, dialog_id=-100125, status="own_only")
@@ -1269,7 +1269,7 @@ async def test_observed_trace_reports_only_current_evidence_dialog_problems(
     gaps = cast(list[dict[str, object]], data["gaps"])
 
     assert _dict(data["coverage"])["dialogs_considered"] == 1
-    assert {gap["kind"] for gap in gaps} == {"access_lost", "hidden_dialog"}
+    assert {gap["kind"] for gap in gaps} == {"access_lost"}
     assert {gap.get("dialog_id") for gap in gaps} == {-100123}
 
 

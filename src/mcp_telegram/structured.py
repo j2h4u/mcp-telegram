@@ -36,6 +36,52 @@ TELEGRAM_CONTENT_OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+DIALOG_AVAILABILITY_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "listing": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "enum": ["returned", "not_returned", "not_yet_observed"]},
+                "source": {"type": ["string", "null"], "enum": ["completed_directory", None]},
+                "observed_at": {"type": ["integer", "null"]},
+                "generation": {"type": ["integer", "null"]},
+            },
+            "required": ["state", "source", "observed_at", "generation"],
+            "additionalProperties": False,
+        },
+        "acquisition": {
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "enum": ["not_requested", "pending", "retained", "returned", "omitted", "denied", "unresolvable"],
+                },
+                "source": {"type": ["string", "null"], "enum": ["telegram_get_peer_dialogs", "local_resolution", None]},
+                "observed_at": {"type": ["integer", "null"]},
+                "error_code": {"type": ["string", "null"]},
+            },
+            "required": ["state", "source", "observed_at", "error_code"],
+            "additionalProperties": False,
+        },
+        "access": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "enum": ["access_lost", "unknown"]},
+                "scope": {"type": "string", "enum": ["history", "membership", "unknown"]},
+                "reason_code": {"type": ["string", "null"]},
+                "cause": {"type": ["string", "null"]},
+                "observed_at": {"type": ["integer", "null"]},
+            },
+            "required": ["state", "scope", "reason_code", "cause", "observed_at"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["listing", "access", "acquisition"],
+    "additionalProperties": False,
+}
+
+
 FOLDER_SNAPSHOT_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {

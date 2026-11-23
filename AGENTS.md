@@ -27,6 +27,13 @@ knowledge or authorize read-time network access. Failed acquisition does not
 erase last-known facts. Actual clears/deletions, domain validity and account
 isolation still apply; age alone is neither deletion nor an account change.
 
+Every Telegram-observed peer reference, including one supplied by a folder rule,
+is locally addressable before enrichment. Folder enumeration covers all retained
+present membership. Omission from a completed listing is not access denial: it
+neither erases facts nor suppresses independent history intent. Denial of one
+operation does not globally revoke chat access. MCP returns structured listing,
+access and acquisition facts.
+
 Apply supplied updates directly to canonical persistence shared by SQL analytics
 and MCP, not a response-only overlay. Obtain missing or invalidated evidence
 through the existing bounded ingestion owners and classified RPC gate. Do not
@@ -252,6 +259,11 @@ file lists to bound memory, not two copies of the suite. There is no separate
 `unit` recipe. This cadence supersedes historical plans asking for separate
 full unit and coverage runs.
 
+For schema changes, run the complete `tests/test_sync_db.py` module and affected
+migration fixture modules against the current schema before final CI. Historical
+migration-step tests must upgrade to the current schema before invoking current
+runtime consumers.
+
 During development, run affected slices. For new complex logic subject to CRAP,
 run the targeted slice with coverage in that same pass and inspect the changed
 functions' coverage and CRAP using the existing `devtools.crap_threshold` metric
@@ -317,9 +329,11 @@ just runtime-smoke
 just runtime-verify
 ```
 
-Прямой `devtools/mcp_client/cli.py` используй только для точечных диагностических
-запросов, которых нет в готовом рецепте. Не используй `docker exec python3`
-или самодельные MCP-клиенты.
+Для точечных диагностических запросов, которых нет в готовом рецепте, используй
+локальный `devtools/mcp_client/cli.py`; для нескольких запросов в одной MCP-сессии
+используй его режим script. Harness или агрегатор используй, когда проверяешь
+именно этот внешний маршрут клиента. Не используй `docker exec python3` или
+самодельные MCP-клиенты.
 
 ```bash
 # Список доступных tools

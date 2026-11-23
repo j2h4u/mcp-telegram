@@ -86,7 +86,7 @@ async def test_channel_enrollment_holds_cursor_for_unknown_then_resumes_after_pu
         now = int(time.time())
         first, pending = -100200, -100100
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at) VALUES(?, 'channel', 0, 100)",
+            "INSERT INTO dialogs(dialog_id,type,last_message_at) VALUES(?, 'channel', 100)",
             [(first,), (pending,)],
         )
         with conn:
@@ -146,7 +146,7 @@ async def test_projection_lag_enrolls_published_link_after_completed_scan(access
         now = int(time.time())
         channel_a, channel_b = -100300, -100200
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at) VALUES(?, 'channel', 0, 100)",
+            "INSERT INTO dialogs(dialog_id,type,last_message_at) VALUES(?, 'channel', 100)",
             [(channel_a,), (channel_b,)],
         )
         if access_lost:
@@ -259,7 +259,7 @@ async def test_existing_activity_projection_prevents_linked_chat_lag_and_preserv
         now = int(time.time())
         channel_id, peer_id = -100500, -1000000000500
         conn.execute(
-            "INSERT INTO dialogs(dialog_id,type,hidden,last_message_at,linked_chat_id) VALUES(?, 'channel', 0, 100, ?)",
+            "INSERT INTO dialogs(dialog_id,type,last_message_at,linked_chat_id) VALUES(?, 'channel', 100, ?)",
             (channel_id, peer_id),
         )
         conn.commit()
@@ -750,26 +750,9 @@ def test_sweep_peer_once_access_lost_marks_dialog_without_traceback(
                 (dialog_id,),
             ).fetchone(),
         )
-        dialog_row = cast(
-            tuple[int] | None,
-            conn.execute("SELECT hidden FROM dialogs WHERE dialog_id = ?", (dialog_id,)).fetchone(),
-        )
-        access_lost_logs = [record for record in caplog.records if record.message.startswith("access_lost ")]
-
-        assert result.rpc_calls == 2, "an access-lost SearchRequest still counts its attempt"
-        assert result == SweepResult(
-            fetched_ids=[],
-            persisted=0,
-            min_id=None,
-            max_id=None,
-            skip_reason=SkipReason.ACCESS_SKIP,
-        )
-        assert synced_row is not None
-        assert synced_row[0] == "access_lost"
-        assert synced_row[1] is not None
-        assert dialog_row == (1,)
-        assert access_lost_logs
-        assert all(record.exc_info is None for record in access_lost_logs)
+        assert result.rpc_calls == 2
+        assert result.skip_reason is SkipReason.ACCESS_SKIP
+        assert synced_row == ("own_only", None)
 
 
 def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1110,7 +1093,7 @@ def _source_of(conn: sqlite3.Connection, dialog_id: int) -> str | None:
 
 
 def test_enroll_creates_thin_dialogs_row():
-    """enroll_activity_dialog must create a thin dialogs row with needs_refresh=1, hidden=0,
+    """enroll_activity_dialog must create a thin dialogs row with needs_refresh=1,
     name IS NULL for a peer that has no prior dialogs entry."""
     with closing(_make_db()) as conn:
         peer_id = -100777000001
@@ -1120,14 +1103,13 @@ def test_enroll_creates_thin_dialogs_row():
         row = cast(
             tuple[int, int, str | None] | None,
             conn.execute(
-                "SELECT needs_refresh, hidden, name FROM dialogs WHERE dialog_id = ?",
+                "SELECT needs_refresh, name FROM dialogs WHERE dialog_id = ?",
                 (peer_id,),
             ).fetchone(),
         )
         assert row is not None, "enroll_activity_dialog must create a dialogs row"
         assert row[0] == 1, f"needs_refresh must be 1, got {row[0]!r}"
-        assert row[1] == 0, f"hidden must be 0, got {row[1]!r}"
-        assert row[2] is None, f"name must be NULL until reconciliation fills it, got {row[2]!r}"
+        assert row[1] is None, f"name must be NULL until reconciliation fills it, got {row[2]!r}"
 
 
 def test_enroll_does_not_clobber_resolved_dialog():
@@ -1139,8 +1121,8 @@ def test_enroll_does_not_clobber_resolved_dialog():
         # Pre-insert a fully resolved dialogs row
         conn.execute(
             "INSERT INTO dialogs (dialog_id, name, type, needs_refresh, snapshot_at,"
-            " archived, pinned, hidden, unread_mentions_count, unread_reactions_count)"
-            " VALUES (?, 'Resolved Chat', 'user', 0, 1700000000, 0, 0, 0, 0, 0)",
+            " archived, pinned, unread_mentions_count, unread_reactions_count)"
+            " VALUES (?, 'Resolved Chat', 'user', 0, 1700000000, 0, 0, 0, 0)",
             (peer_id,),
         )
         conn.commit()
@@ -1232,118 +1214,9 @@ async def test_access_loss_uses_account_captured_before_search(monkeypatch: pyte
             timeout_s=_TEST_TIMEOUT_S,
             writer=inline_writer(conn),
             profile_owner_account_id=77,
-            access_loss_observer=observed.append,
         )
-        assert (
-            conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
-            != "access_lost"
-        )
-        assert len(observed) == 1 and observed[0].queued == 0
-
-
-@pytest.mark.asyncio
-async def test_access_loss_rolls_back_before_observer_on_membership_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    from telethon.errors import ChannelPrivateError
-
-    with closing(_make_db()) as conn:
-        dialog_id = -100789000003
-        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=int(time.time()))
-        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
-        conn.commit()
-        observed = []
-
-        async def resolve(client: object, dialog_id: int) -> object:
-            return object()
-
-        async def fail_search(client: object, request: object, *, timeout_s: float) -> object:
-            raise ChannelPrivateError(request=None)
-
-        def fail_membership(*args: object, **kwargs: object) -> object:
-            raise RuntimeError("membership failure")
-
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_search)
-        monkeypatch.setattr("mcp_telegram.access_lifecycle.request_membership_refreshes", fail_membership)
-        with pytest.raises(RuntimeError, match="membership failure"):
-            await sweep_peer_once(
-                client=_FakeClient(77),
-                conn=conn,
-                dialog_id=dialog_id,
-                offset_id=0,
-                min_id=0,
-                limit=10,
-                timeout_s=_TEST_TIMEOUT_S,
-                writer=inline_writer(conn),
-                profile_owner_account_id=77,
-                access_loss_observer=observed.append,
-            )
         assert (
             conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone()[0]
             != "access_lost"
         )
         assert observed == []
-
-
-@pytest.mark.asyncio
-async def test_access_loss_preserves_observation_time_when_writer_is_delayed(monkeypatch: pytest.MonkeyPatch) -> None:
-    from collections.abc import Callable
-    from types import SimpleNamespace
-
-    from telethon.errors import ChannelPrivateError
-
-    from mcp_telegram.entity_profile.membership import MembershipChange, MembershipSignalCounts
-    from mcp_telegram.sqlite_writer import SQLiteWriter
-
-    with closing(_make_db()) as conn:
-        dialog_id = -100789000004
-        enroll_activity_dialog(conn, dialog_id, "supergroup", last_activity_at=100)
-        conn.execute("UPDATE dialog_directory_state SET account_id=77 WHERE singleton=1")
-        conn.commit()
-        clock = [100]
-        captured: list[tuple[int, int | None]] = []
-
-        class DelayedWriter:
-            calls = 0
-
-            async def run[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
-                self.calls += 1
-                if self.calls == 2:
-                    clock[0] = 200
-                return operation(conn)
-
-        async def resolve(client: object, dialog_id: int) -> object:
-            return object()
-
-        async def fail_search(client: object, request: object, *, timeout_s: float) -> object:
-            raise ChannelPrivateError(request=None)
-
-        def capture_refresh(
-            db: sqlite3.Connection, owner: int, changes: list[MembershipChange], *, now: int
-        ) -> MembershipSignalCounts:
-            captured.append((now, changes[0].revision_at))
-            return MembershipSignalCounts()
-
-        monkeypatch.setattr(
-            "mcp_telegram.activity_peer_sweep.time", SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
-        )
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
-        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fail_search)
-        monkeypatch.setattr("mcp_telegram.access_lifecycle.request_membership_refreshes", capture_refresh)
-        await sweep_peer_once(
-            client=_FakeClient(77),
-            conn=conn,
-            dialog_id=dialog_id,
-            offset_id=0,
-            min_id=0,
-            limit=10,
-            timeout_s=_TEST_TIMEOUT_S,
-            writer=cast(SQLiteWriter, DelayedWriter()),
-            profile_owner_account_id=77,
-        )
-        assert captured == [(200, 100)]
-        assert conn.execute("SELECT access_lost_at FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-            100,
-        )
-        assert conn.execute(
-            "SELECT occurred_at FROM conversation_history_events WHERE dialog_id=? AND kind='access_lost'", (dialog_id,)
-        ).fetchone() == (100,)

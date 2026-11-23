@@ -131,7 +131,7 @@ class _CompletePairClient(_FailureClient):
 
 
 async def _baseline_then_fail(path: Path, client: _FailureClient) -> tuple[sqlite3.Connection, DaemonEntityInfoService]:
-    conn, raw_service = _prepare(path, migrated=True)
+    conn, raw_service = _prepare(path)
     service = cast(DaemonEntityInfoService, raw_service)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -264,7 +264,7 @@ async def test_service_full_profile_uses_bot_target_and_keeps_personal_channel_i
 
 @pytest.mark.asyncio
 async def test_service_refresh_keeps_canonical_service_type_when_full_user_uses_bot_target(tmp_path: Path) -> None:
-    conn, service = _prepare(tmp_path / "service-refresh.sqlite", entity_type="service", migrated=True)
+    conn, service = _prepare(tmp_path / "service-refresh.sqlite", entity_type="service")
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]
     client.bot = True
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
@@ -345,7 +345,7 @@ async def test_partial_personal_channel_keeps_id_reason_and_no_local_card(tmp_pa
 async def test_file_backed_pair_receipt_ttl_is_strict_across_reopen(tmp_path: Path, now: int) -> None:
     path = tmp_path / "ttl.sqlite"
     ensure_sync_schema(path)
-    conn, raw_service = _prepare(path, migrated=True)
+    conn, raw_service = _prepare(path)
     service = cast(DaemonEntityInfoService, raw_service)
     complete_client = _CompletePairClient()
     service._deps = replace(service._deps, client=complete_client, user_profile_port=complete_client)
@@ -444,9 +444,7 @@ async def test_actual_entity_info_tool_renders_persisted_user_and_bot_profile(
     bot: bool,
     request: pytest.FixtureRequest,
 ) -> None:
-    conn, raw_service = _prepare(
-        tmp_path / f"tool-{entity_type}.sqlite", migrated=True, entity_type=entity_type, bot=bot
-    )
+    conn, raw_service = _prepare(tmp_path / f"tool-{entity_type}.sqlite", entity_type=entity_type, bot=bot)
     request.addfinalizer(conn.close)
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(  # type: ignore[attr-defined]
@@ -496,7 +494,7 @@ async def test_actual_entity_info_tool_renders_persisted_user_and_bot_profile(
 async def test_actual_entity_info_tool_renders_persisted_partial_on_target_kind_mismatch(
     tmp_path: Path, request: pytest.FixtureRequest
 ) -> None:
-    conn, raw_service = _prepare(tmp_path / "tool-mismatch.sqlite", migrated=True, entity_type="bot", bot=True)
+    conn, raw_service = _prepare(tmp_path / "tool-mismatch.sqlite", entity_type="bot", bot=True)
     request.addfinalizer(conn.close)
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(  # type: ignore[attr-defined]

@@ -36,6 +36,7 @@ from ._base import (
 )
 from .contacts import CONTACT_STATE_SCHEMA
 from .structured import (
+    DIALOG_AVAILABILITY_OUTPUT_SCHEMA,
     TELEGRAM_CONTENT_OUTPUT_SCHEMA,
     StructuredWarning,
     TelegramContentKind,
@@ -87,7 +88,7 @@ GET_ENTITY_INFO_OUTPUT_SCHEMA = {
         "dialog_placement": {
             "type": "object",
             "properties": {
-                "archived": {"type": "boolean"},
+                "archived": {"type": ["boolean", "null"]},
                 "folders": {
                     "type": "array",
                     "items": {
@@ -136,6 +137,7 @@ cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["contact_no
     "required": ["state", "expected_version"],
     "additionalProperties": False,
 }
+cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["availability"] = DIALOG_AVAILABILITY_OUTPUT_SCHEMA
 cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["contact"] = CONTACT_STATE_SCHEMA
 cast(dict[str, object], GET_ENTITY_INFO_OUTPUT_SCHEMA["properties"])["common_chats_page"] = _PROFILE_PROPERTIES["page"]
 GET_ENTITY_INFO_OUTPUT_SCHEMA["$defs"] = _PROFILE_DEFINITIONS
@@ -682,6 +684,7 @@ def _entity_structured_content(
         "warnings": _entity_warnings(data),
         "content_fields": _content_fields(data),
         "dialog_placement": _dialog_placement_structured(data.get("dialog_placement")),
+        **({"availability": data["availability"]} if "availability" in data else {}),
         **{
             key: data[key]
             for key in (
@@ -703,7 +706,7 @@ def _dialog_placement_structured(value: object) -> dict[str, object]:
     raw_folders = placement.get("folders")
     folders = raw_folders if isinstance(raw_folders, list) else []
     return {
-        "archived": bool(placement.get("archived", False)),
+        "archived": placement.get("archived"),
         "folders": [
             {
                 "id": int(folder["id"]),

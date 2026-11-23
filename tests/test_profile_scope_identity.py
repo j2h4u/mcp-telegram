@@ -49,7 +49,7 @@ def test_reusable_pair_receipt_stops_at_ttl(tmp_path: Path, monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_service_accepts_same_scope_at_ttl_boundary_without_db_changes(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "service-same-scope.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "service-same-scope.sqlite")
     service = raw_service
     assert isinstance(service, DaemonEntityInfoService)
     coordinator = service.refresh_coordinator

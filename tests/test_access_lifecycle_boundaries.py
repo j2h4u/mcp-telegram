@@ -61,11 +61,11 @@ def test_gate_resolves_sql_names_and_dynamic_f_strings(tmp_path: Path) -> None:
     assert len(gate.boundary_violations(root)) == 3
 
 
-def test_gate_allows_ordinary_hidden_reconciliation(tmp_path: Path) -> None:
+def test_gate_allows_ordinary_directory_reconciliation(tmp_path: Path) -> None:
     root = tmp_path / "mcp_telegram"
     root.mkdir()
     (root / "catalog.py").write_text(
-        "conn.execute('UPDATE dialogs SET hidden = 1, snapshot_at = ? WHERE dialog_id = ?', (now, dialog_id))\n",
+        "conn.execute('UPDATE dialogs SET archived = 1, snapshot_at = ? WHERE dialog_id = ?', (now, dialog_id))\n",
         encoding="utf-8",
     )
     assert gate.boundary_violations(root) == []

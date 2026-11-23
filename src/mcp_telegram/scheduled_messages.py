@@ -12,7 +12,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
@@ -21,8 +21,7 @@ from telethon.errors import ChatAdminRequiredError, RPCError, rpc_errors_dict  #
 from telethon.tl.types import Message as TelegramMessage  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
-from .access_lifecycle import not_access_lost_sql, set_access_lost
-from .entity_profile.membership import MembershipSignalCounts
+from .access_lifecycle import not_access_lost_sql
 from .flood import TelegramRpcThrottled, _raise_if_latched
 from .fts import stem_text
 from .message_contracts import ExtractedMessage
@@ -651,7 +650,6 @@ class ScheduledMessageReconciler:
         policy: ScheduledReconciliationPolicy,
         writer: SQLiteWriter,
         mutation_fence: ScheduledMutationFence | None = None,
-        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
         self._client = client
         self._conn = conn
@@ -660,7 +658,6 @@ class ScheduledMessageReconciler:
         self._verified_account_id: int | None = None
         self._policy = policy
         self._mutation_fence = mutation_fence
-        self._access_loss_observer = access_loss_observer
         self._priority_dialog_id: int | None = None
 
     def bind_account_id(self, account_id: int) -> None:
@@ -963,11 +960,11 @@ class ScheduledMessageReconciler:
             return None
         completed = int(time.time())
         if isinstance(exc, ACCESS_LOST_ERRORS):
-            accepted = await self._mark_inaccessible(attempt, completed, error_type)
+            accepted = await self._block_snapshot(attempt, completed, "access_denied", error_type)
             return "blocked" if accepted else "stale"
         reason = f"scheduled_failure:{category}:{error_type}:{code or 0}:{symbol or '-'}"
         if category == "admin_required":
-            accepted = await self._block_admin_required(attempt, completed, reason)
+            accepted = await self._block_snapshot(attempt, completed, "admin_required", reason)
             return "blocked" if accepted else "stale"
         accepted = await self._record_snapshot_failure(attempt, completed, reason, delay)
         return "retry" if accepted else "stale"
@@ -983,15 +980,15 @@ class ScheduledMessageReconciler:
 
         await self._writer.run(persist)
 
-    async def _block_admin_required(self, attempt: _SnapshotAttempt, now: int, reason: str) -> bool:
+    async def _block_snapshot(self, attempt: _SnapshotAttempt, now: int, block: str, reason: str) -> bool:
         def persist(conn: sqlite3.Connection) -> bool:
             with write_transaction(conn):
                 if not _attempt_current(conn, attempt):
                     return False
                 conn.execute(
-                    "UPDATE scheduled_reconciliation_state SET acquisition_block='admin_required', "
+                    "UPDATE scheduled_reconciliation_state SET acquisition_block=?, "
                     "coverage_reason=?,dirty_generation=dirty_generation+1,updated_at=? WHERE dialog_id=?",
-                    (reason, now, attempt.dialog_id),
+                    (block, reason, now, attempt.dialog_id),
                 )
                 _invalidate_scheduled_target(self._mutation_fence, attempt.owner, attempt.dialog_id)
                 return True
@@ -1011,33 +1008,6 @@ class ScheduledMessageReconciler:
                 return True
 
         return await self._writer.run(persist)
-
-    async def _mark_inaccessible(self, attempt: _SnapshotAttempt, now: int, reason: str) -> bool:
-        def persist(conn: sqlite3.Connection) -> tuple[bool, MembershipSignalCounts | None]:
-            with write_transaction(conn):
-                if not _attempt_current(conn, attempt):
-                    return False, None
-                result = set_access_lost(
-                    conn,
-                    attempt.dialog_id,
-                    now,
-                    reason=reason,
-                    profile_owner_account_id=self._verified_account_id,
-                    observation_order=attempt.order,
-                    membership_revision_at=now,
-                    processing_at=now,
-                )
-                if result.changed:
-                    _invalidate_scheduled_target(self._mutation_fence, attempt.owner, attempt.dialog_id)
-                return result.changed, result.membership_counts
-
-        accepted, counts = await self._writer.run(persist)
-        if counts is not None and self._access_loss_observer is not None:
-            try:
-                self._access_loss_observer(counts)
-            except Exception:  # noqa: BLE001
-                logger.debug("access_loss_observer_failed")
-        return accepted
 
     async def invalidate_continuity(self, dialog_id: int | None, reason: str = "difference_too_long") -> None:
         """Schedule bounded snapshots only after Telegram reports an unrecoverable update gap."""

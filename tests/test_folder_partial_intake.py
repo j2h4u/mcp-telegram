@@ -622,3 +622,43 @@ def test_late_definition_does_not_undo_newer_catalogue_omission(tmp_path: Path) 
         assert [(rule.folder_id, rule.title) for rule in read_folder_rules(conn)] == [(4, "Current")]
     finally:
         conn.close()
+
+
+def test_read_folder_uses_one_sqlite_snapshot_during_writer_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.folders import sqlite_repository
+
+    path = tmp_path / "snapshot.db"
+    ensure_sync_schema(path)
+    reader = sqlite3.connect(path)
+    writer = sqlite3.connect(path)
+    try:
+        reader.execute("PRAGMA journal_mode=WAL")
+        reader.execute("UPDATE telegram_folder_projection_state SET account_id=42 WHERE singleton=1")
+        reader.commit()
+        with write_savepoint(reader):
+            SQLiteFolderSnapshotRepository(reader).apply_supplied_update(
+                folder_update_from_native(_update(4, "Before")), account_id=42, order=10, now=100
+            )
+        reader.commit()
+        original = sqlite_repository.SQLiteFolderSnapshotRepository.read_catalog_version
+
+        def race(repo: sqlite_repository.SQLiteFolderSnapshotRepository) -> object:
+            result = original(repo)
+            if repo._conn is writer:
+                return result
+            with write_savepoint(writer):
+                SQLiteFolderSnapshotRepository(writer).apply_supplied_update(
+                    folder_update_from_native(_update(4, "After")), account_id=42, order=11, now=101
+                )
+            writer.commit()
+            return result
+
+        monkeypatch.setattr(sqlite_repository.SQLiteFolderSnapshotRepository, "read_catalog_version", race)
+        result = read_folder(reader, 42, 4)
+        assert cast(dict[str, object], result["definition"])["title"] == "Before"
+        assert writer.execute("SELECT title FROM telegram_folder_rules WHERE folder_id=4").fetchone() == ("After",)
+    finally:
+        reader.close()
+        writer.close()

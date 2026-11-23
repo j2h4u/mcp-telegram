@@ -43,6 +43,7 @@ EXPECTED_DURABLE_DEMAND_ORDER = (
     DemandKind.FULL_SYNC_PAGE,
     DemandKind.DIALOG_BOOTSTRAP,
     DemandKind.DIALOG_LIGHT_RECONCILIATION,
+    DemandKind.FOLDER_PEER_METADATA,
     DemandKind.ARCHIVE_BACKFILL,
     DemandKind.ARCHIVE_INCREMENTAL,
     DemandKind.COLD_PEER_PAGE,
@@ -103,6 +104,7 @@ def test_demand_registry_has_exact_operation_and_source_coverage() -> None:
         TelegramRpcSource.DIALOG_SYNC: {
             DemandKind.DIALOG_BOOTSTRAP,
             DemandKind.DIALOG_LIGHT_RECONCILIATION,
+            DemandKind.FOLDER_PEER_METADATA,
         },
         TelegramRpcSource.ACTIVITY_ARCHIVE: {DemandKind.ARCHIVE_BACKFILL, DemandKind.ARCHIVE_INCREMENTAL},
         TelegramRpcSource.ACTIVITY_COLD_BACKFILL: {DemandKind.COLD_PEER_PAGE},
@@ -265,7 +267,7 @@ def test_scheduled_mutation_is_explicit_interactive_inline_and_single_send() -> 
 
 def test_durable_demand_order_is_a_literal_complete_contract() -> None:
     assert DURABLE_DEMAND_ORDER == EXPECTED_DURABLE_DEMAND_ORDER
-    assert len(DURABLE_DEMAND_ORDER) == 25
+    assert len(DURABLE_DEMAND_ORDER) == 26
     assert {
         kind for kind, contract in TELEGRAM_DEMAND_CONTRACTS.items() if contract.execution_mode is ExecutionMode.DURABLE
     } == set(EXPECTED_DURABLE_DEMAND_ORDER)

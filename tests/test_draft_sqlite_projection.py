@@ -375,6 +375,7 @@ def test_v74_upgrade_removes_previews_without_promoting_them(tmp_path: Path) -> 
     ensure_sync_schema(database)
     conn = sqlite3.connect(database)
     try:
+        conn.execute("ALTER TABLE dialogs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE dialogs ADD COLUMN draft_text TEXT")
         conn.execute("ALTER TABLE dialog_directory_staging ADD COLUMN draft_text TEXT")
         conn.execute("INSERT INTO dialogs(dialog_id,draft_text) VALUES (200,'old truncated preview')")

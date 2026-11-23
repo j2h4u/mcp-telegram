@@ -32,7 +32,7 @@ async def test_directory_audit_registered_mcp_real_ipc(tmp_path: Path, monkeypat
     daemon, conn, feedback, _ = _local_daemon(tmp_path, object())
     conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
     conn.executemany(
-        "INSERT INTO dialogs(dialog_id,name,type,hidden,last_message_at) VALUES (?,?,?,0,?)",
+        "INSERT INTO dialogs(dialog_id,name,type,last_message_at) VALUES (?,?,?,?)",
         [(1, "one", "user", 100), (2, "two", "user", 100), (42, "self", "user", 100), (50, "bot", "bot", 100)],
     )
     conn.commit()

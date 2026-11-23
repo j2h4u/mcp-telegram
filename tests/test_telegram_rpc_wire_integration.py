@@ -2489,37 +2489,26 @@ async def test_clean_shutdown_contains_only_owned_unknown_read(  # noqa: PLR0914
     assert restored.protection_reason is None and not restored._unresolved()
 
 
-@pytest.mark.parametrize("update_difference", [False, True])
 async def test_daemon_shutdown_settles_sender_before_cancelling_read_caller(  # noqa: PLR0914 - real shutdown and ledger
-    image_wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, update_difference: bool
+    image_wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from mcp_telegram import daemon
     from tests.test_daemon import _ConnectionStub, _typed_ctx
 
     gate, sender, connection, sink = image_wire
-    kind = DemandKind.TELETHON_UPDATE_DIFFERENCE if update_difference else DemandKind.DELTA_GAP_FILL
+    kind = DemandKind.DELTA_GAP_FILL
     selected = WorkRevision(WorkKey(kind, 42, "dialog:11"), "revision")
-    if update_difference:
-        gate._update_loop_owner = asyncio.current_task()
     scope = TelegramRpcScope(
-        TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE if update_difference else TelegramRpcSource.DELTA_SYNC,
+        TelegramRpcSource.DELTA_SYNC,
         demand_contract(kind).service_class,
         time.monotonic() + 10,
         asyncio.current_task(),
         demand_kind=kind,
-        acquisition_kind=AcquisitionKind.UPDATE_DIFFERENCE
-        if update_difference
-        else AcquisitionKind.MESSAGE_HISTORY_PAGE,
+        acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
         attempt_budget=RpcAttemptBudget(2, selected=selected),
         attempt_evidence=RpcAttemptEvidence(),
     )
-    request = (
-        functions.updates.GetChannelDifferenceRequest(
-            types.InputChannel(11, 1), types.ChannelMessagesFilterEmpty(), 1, 10
-        )
-        if update_difference
-        else messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
-    )
+    request = messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0)
     result = sender.send_owned(request, scope)
     state = await sender._send_queue.next_state()
     await sender._prepare_state(state)
@@ -2694,3 +2683,374 @@ async def test_shutdown_does_not_contain_unknown_telegram_mutation(image_wire: _
     receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
     assert receipt["phase"] == "unknown" and "read_retry" not in receipt
     assert record["protection"] == "unresolved_outbound_outcome"
+
+
+@pytest.mark.parametrize("with_floor", [False, True])
+async def test_native_channel_difference_shutdown_recovers_without_durable_work_selection(  # noqa: PLR0914, PLR0915
+    image_wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_floor: bool
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    from mcp_telegram import daemon
+    from tests.test_daemon import _ConnectionStub, _typed_ctx
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    snapshot = box.session_state()
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        assert isinstance(state.request, functions.updates.GetChannelDifferenceRequest)
+        assert state.request.pts == 21
+        owner = cast(telegram_rpc._WireAttempt, sender.require_owned(state).owner)
+        assert owner.scope.attempt_budget is not None and owner.scope.attempt_budget.selected is None
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1 and box.session_state() == snapshot
+        if with_floor:
+            await gate._ensure_safety_ledger().record_floor(time.time() + 3600)
+        ctx = _typed_ctx(
+            client=gate, conn=_ConnectionStub(), background_tasks={loop}, socket_path=tmp_path / "daemon.sock"
+        )
+        gate.set_shutdown_requested(ctx.shutdown_event.is_set)
+
+        async def keep_fixture_connections(_ctx: object) -> None:
+            pass
+
+        monkeypatch.setattr(daemon, "_close_runtime_connections", keep_fixture_connections)
+        ctx.shutdown_request.request("sigterm")
+        await daemon._shutdown_sync_main_context(ctx)
+        assert loop.done() and box.session_state() == snapshot
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert receipt["phase"] == "unknown" and receipt["read_retry"] == {"reason": "clean_shutdown"}
+        assert record["protection"] is None and record["recovery"] is None
+        saved_scope = cast(dict[str, int], record["scope"])
+        restored = TelegramRpcSafetyLedger(gate._safety_store, dc_id=saved_scope["dc_id"], key_id=saved_scope["key_id"])
+        assert restored.protection_reason is None and not restored._unresolved()
+        if with_floor:
+            retry_until = restored.status()["retry_until_utc"]
+            assert isinstance(retry_until, float) and retry_until > time.time() + 3500
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+
+async def test_native_difference_caller_cancellation_is_not_clean_shutdown(image_wire: _WireHarness) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    snapshot = box.session_state()
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        assert isinstance(state.request, functions.updates.GetChannelDifferenceRequest)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+        await asyncio.gather(*sender._observing, return_exceptions=True)
+        await gate.close_rpc_scheduler()
+        assert box.session_state() == snapshot
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+        assert record["protection"] == "unresolved_outbound_outcome"
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+
+@pytest.mark.parametrize("foreign_selection", [False, True])
+async def test_unowned_difference_cannot_use_native_shutdown_recovery(
+    image_wire: _WireHarness, foreign_selection: bool
+) -> None:
+    gate, sender, connection, sink = image_wire
+    selected = (
+        WorkRevision(WorkKey(DemandKind.TELETHON_UPDATE_DIFFERENCE, 43, "dialog:11"), "revision")
+        if foreign_selection
+        else None
+    )
+    scope = TelegramRpcScope(
+        TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE,
+        demand_contract(DemandKind.TELETHON_UPDATE_DIFFERENCE).service_class,
+        time.monotonic() + 10,
+        asyncio.current_task(),
+        demand_kind=DemandKind.TELETHON_UPDATE_DIFFERENCE,
+        acquisition_kind=AcquisitionKind.UPDATE_DIFFERENCE,
+        attempt_budget=RpcAttemptBudget(1, selected=selected),
+        attempt_evidence=RpcAttemptEvidence(),
+    )
+    request = functions.updates.GetChannelDifferenceRequest(
+        types.InputChannel(11, 1), types.ChannelMessagesFilterEmpty(), 21, 10
+    )
+    result = sender.send_owned(request, scope)
+    state = await sender._send_queue.next_state()
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    assert len(sink.frames) == 1
+    await gate.close_rpc_scheduler()
+    with pytest.raises(asyncio.CancelledError):
+        await result
+    encoded = gate._safety_store.load_record()
+    assert encoded is not None
+    record = cast(dict[str, object], json.loads(encoded))
+    receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+    assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+    assert record["protection"] == "unresolved_outbound_outcome"
+
+
+async def test_native_difference_unclean_restart_keeps_unresolved_hold(image_wire: _WireHarness) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    snapshot = box.session_state()
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1 and box.session_state() == snapshot
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        scope = cast(dict[str, int], record["scope"])
+        reopened = TelegramRpcSafetyLedger(gate._safety_store, dc_id=scope["dc_id"], key_id=scope["key_id"])
+        assert reopened._unresolved() and reopened.protection_reason == "unresolved_outbound_outcome"
+    finally:
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+
+
+async def test_native_difference_failed_teardown_keeps_unresolved_hold(
+    wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    from mcp_telegram.state import telegram_session_lease
+
+    gate, sender, connection, sink = wire
+    with telegram_session_lease(tmp_path) as lease:
+        gate.bind_session_lease(lease)
+        box = gate._message_box
+        box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+        gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+        box.try_begin_get_diff(11, "fixture channel gap")
+        snapshot = box.session_state()
+        loop = asyncio.create_task(gate._update_loop())
+        gate._updates_handle = loop
+        try:
+            state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+            await sender._prepare_state(state)
+            assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+            assert len(sink.frames) == 1
+
+            async def fail_drain() -> None:
+                raise RuntimeError("unconfirmed shutdown")
+
+            monkeypatch.setattr(gate, "_drain_cooldown_saves", fail_drain)
+            with pytest.raises(RuntimeError, match="unconfirmed shutdown"):
+                await gate.close_rpc_scheduler()
+            await asyncio.gather(loop, return_exceptions=True)
+            assert box.session_state() == snapshot
+            encoded = gate._safety_store.load_record()
+            assert encoded is not None
+            record = cast(dict[str, object], json.loads(encoded))
+            receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+            assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+            assert record["protection"] == "unresolved_outbound_outcome"
+        finally:
+            if not loop.done():
+                loop.cancel()
+                await asyncio.gather(loop, return_exceptions=True)
+            pin = gate._session_pin
+            if pin is not None:
+                pin._release()
+                gate._session_pin = None
+
+
+@pytest.mark.parametrize("changed", ["account_id", "dc_id", "auth_key_id"])
+async def test_native_difference_shutdown_does_not_contain_stale_scope(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1
+        auth = gate.retained_auth_scope()
+        assert auth is not None
+        stale = replace(auth, **{changed: getattr(auth, changed) + 1})
+        monkeypatch.setattr(gate, "retained_auth_scope", lambda: stale)
+        await gate.close_rpc_scheduler()
+        await asyncio.gather(loop, return_exceptions=True)
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+        assert record["protection"] == "unresolved_outbound_outcome"
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+
+async def test_native_difference_shutdown_does_not_clear_pending_mutation(image_wire: _WireHarness) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        selected = WorkRevision(WorkKey(DemandKind.LIVE_HYDRATION_BATCH, 42, "dialog:11"), "revision")
+        scope = TelegramRpcScope(
+            TelegramRpcSource.FACT_HYDRATION_LIVE,
+            demand_contract(DemandKind.LIVE_HYDRATION_BATCH).service_class,
+            time.monotonic() + 10,
+            asyncio.current_task(),
+            demand_kind=DemandKind.LIVE_HYDRATION_BATCH,
+            acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP,
+            attempt_budget=RpcAttemptBudget(1, selected=selected),
+            attempt_evidence=RpcAttemptEvidence(),
+        )
+        mutation = sender.send_owned(messages.TranscribeAudioRequest(types.InputPeerUser(11, 1), 123), scope)
+        second = await sender._send_queue.next_state()
+        await sender._prepare_state(second)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 2
+        await gate.close_rpc_scheduler()
+        await asyncio.gather(loop, mutation, return_exceptions=True)
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipts = list(cast(dict[str, dict[str, object]], record["intents"]).values())
+        assert len(receipts) == 2
+        assert any(receipt.get("read_retry") == {"reason": "clean_shutdown"} for receipt in receipts)
+        assert any(
+            "TranscribeAudioRequest" in str(receipt["method"]) and "read_retry" not in receipt for receipt in receipts
+        )
+        assert record["protection"] == "unresolved_outbound_outcome"
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+
+@pytest.mark.parametrize("history", [False, True])
+async def test_native_owner_cannot_contain_non_difference_method_on_shutdown(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, history: bool
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    classified = gate._call_classified_difference
+    other = (
+        messages.GetHistoryRequest(types.InputPeerUser(11, 1), 0, None, 0, 1, 0, 0, 0) if history else GetStateRequest()
+    )
+
+    async def substitute(request: object, *, ordered: bool) -> object:
+        assert isinstance(request, functions.updates.GetChannelDifferenceRequest)
+        return await classified(other, ordered=ordered)
+
+    monkeypatch.setattr(gate, "_call_classified_difference", substitute)
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        assert state.request is other
+        owner = cast(telegram_rpc._WireAttempt, sender.require_owned(state).owner)
+        assert owner.scope.owner_task is loop
+        assert owner.scope.attempt_budget is not None and owner.scope.attempt_budget.selected is None
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1
+        await gate.close_rpc_scheduler()
+        await asyncio.gather(loop, return_exceptions=True)
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert receipt["phase"] == "unknown" and "read_retry" not in receipt
+        assert record["protection"] == "unresolved_outbound_outcome"
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+
+async def test_native_account_difference_shutdown_recovers_without_selected_work(image_wire: _WireHarness) -> None:
+    from telethon._updates import SessionState
+    from telethon._updates.messagebox import ENTRY_ACCOUNT
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [])
+    box.try_begin_get_diff(ENTRY_ACCOUNT, "fixture account gap")
+    snapshot = box.session_state()
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        assert isinstance(state.request, functions.updates.GetDifferenceRequest)
+        owner = cast(telegram_rpc._WireAttempt, sender.require_owned(state).owner)
+        assert owner.scope.attempt_budget is not None and owner.scope.attempt_budget.selected is None
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1
+        await gate.close_rpc_scheduler()
+        await asyncio.gather(loop, return_exceptions=True)
+        assert box.session_state() == snapshot
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert receipt["phase"] == "unknown" and receipt["read_retry"] == {"reason": "clean_shutdown"}
+        scope = cast(dict[str, int], record["scope"])
+        reopened = TelegramRpcSafetyLedger(gate._safety_store, dc_id=scope["dc_id"], key_id=scope["key_id"])
+        assert reopened.protection_reason is None and not reopened._unresolved()
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)

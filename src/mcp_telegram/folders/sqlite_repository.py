@@ -22,6 +22,7 @@ from .contracts import (
 )
 from .membership import evaluate, pin_position
 from .ports import FolderSnapshotRepository
+from .references import retain_folder_references
 
 
 class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
@@ -139,6 +140,8 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         row = self._read_rule_state(account_id, folder_id)
         if row is not None and order <= row[1]:
             return True
+        if rule is not None:
+            retain_folder_references(self._conn, account_id, order, rule, update.references, update.auth_scope)
         known_member, value = _retained_rule_value(row, rule)
         self._store_rule_delta(folder_id, value, account_id=account_id, order=order)
         membership_current, visible = _delta_membership(row, order)
@@ -147,6 +150,12 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             folder_id, value if visible else None, canonical is not None and canonical[0] == account_id, now=now
         )
         membership_changed = membership_current and (not known_member or value is None)
+        self._record_delta_projection(update, account_id, order, value, membership_changed)
+        return True
+
+    def _record_delta_projection(
+        self, update: FolderRuleUpdate, account_id: int, order: int, value: FolderRule | None, membership_changed: bool
+    ) -> None:
         self._conn.execute(
             "UPDATE telegram_folder_projection_state SET account_id=?,catalog_revision=catalog_revision+1,"
             "membership_revision=membership_revision+?,coverage_status=CASE WHEN ? THEN 'unavailable' ELSE coverage_status END,"
@@ -160,7 +169,6 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
             (str(order),),
         )
         _refine_supplied_receipt(self._conn, update, account_id, order, () if value is None else (value,))
-        return True
 
     def _read_rule_state(
         self, account_id: int, folder_id: int
@@ -202,9 +210,17 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
         self._conn.execute(
             "DELETE FROM telegram_folder_local_members WHERE namespace='filter' AND folder_id=?", (folder_id,)
         )
-        if value is not None and has_directory:
-            members = _evaluate_rules(
-                self._conn, (value,), _canonical_facts(self._conn), _published_main_pins(self._conn), now=now
+        if value is not None:
+            members = (
+                _evaluate_rules(
+                    self._conn, (value,), _canonical_facts(self._conn), _published_main_pins(self._conn), now=now
+                )
+                if has_directory
+                else tuple(
+                    FolderMembership(value.namespace, value.folder_id, dialog_id, state, pin_position(value, dialog_id))
+                    for dialog_id in value.explicit_ids
+                    if (state := evaluate(value, DialogFacts(dialog_id), now=now)) is not MembershipState.ABSENT
+                )
             )
             self._conn.executemany(
                 "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state,pin_position) VALUES (?,?,?,?,?)",
@@ -291,17 +307,13 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
                 "UPDATE telegram_folder_projection_state SET account_id=? WHERE singleton=1", (account_id,)
             )
             observation = self._merge_snapshot_order(observation, observation_order)
+            self._retain_snapshot_references(observation, account_id, observation_order)
             complete = self._snapshot_complete(observation.rules, account_id, observation_order, membership_revision)
             self._merge_snapshot_rules(
                 observation.rules, account_id=account_id, order=observation_order, complete_enumeration=complete
             )
             if canonical is None:
-                self._conn.execute(
-                    "UPDATE telegram_folder_projection_state SET accepted_rule_token=?,rule_observation_started_at=?,"
-                    "rule_enumeration_complete=?,coverage_status='unavailable',last_attempt_at=?,last_outcome='success',"
-                    "next_retry_at=NULL,consecutive_failures=0 WHERE singleton=1",
-                    (observation.token, observation.started_at, int(complete), completed_at),
-                )
+                self._project_without_directory(observation, complete, completed_at)
                 return None
             _, generation, canonical_observed_at = canonical
             observation = self._merged_observation(observation, account_id, observation_order)
@@ -314,6 +326,24 @@ class SQLiteFolderSnapshotRepository(FolderSnapshotRepository):
                 complete=complete,
             )
             return generation
+
+    def _retain_snapshot_references(self, observation: FolderRuleObservation, account_id: int, order: int) -> None:
+        for rule in observation.rules:
+            row = self._read_rule_state(account_id, rule.folder_id) if rule.namespace == "filter" else None
+            if row is None or order >= row[1]:
+                refs = tuple(ref for folder_id, ref in observation.references if folder_id == rule.folder_id)
+                retain_folder_references(self._conn, account_id, order, rule, refs, observation.auth_scope)
+
+    def _project_without_directory(self, observation: FolderRuleObservation, complete: bool, completed_at: int) -> None:
+        self._conn.execute("DELETE FROM telegram_folder_local_members")
+        for rule in read_folder_rules(self._conn):
+            self._replace_rule_members(rule.folder_id, rule, False, now=completed_at)
+        self._conn.execute(
+            "UPDATE telegram_folder_projection_state SET accepted_rule_token=?,rule_observation_started_at=?,"
+            "rule_enumeration_complete=?,coverage_status='unavailable',last_attempt_at=?,last_outcome='success',"
+            "next_retry_at=NULL,consecutive_failures=0 WHERE singleton=1",
+            (observation.token, observation.started_at, int(complete), completed_at),
+        )
 
     def _merge_snapshot_order(self, observation: FolderRuleObservation, order: int) -> FolderRuleObservation:
         last_order = _int_state(self._state("filter_order_observation_order")) or 0
@@ -657,7 +687,12 @@ def _evaluate_rules(
             list[tuple[int, int | None]],
             # A published dialog can lack optional eligibility facts. It must
             # still be represented in three-valued folder membership.
-            conn.execute("SELECT dialog_id,archived FROM dialogs WHERE hidden=0").fetchall(),
+            conn.execute(
+                "SELECT d.dialog_id,d.archived FROM dialogs d WHERE NOT EXISTS "
+                "(SELECT 1 FROM dialog_listing_observations l WHERE l.dialog_id=d.dialog_id "
+                "AND l.account_id=(SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1) "
+                "AND l.state='not_returned')"
+            ).fetchall(),
         )
     }
     result: list[FolderMembership] = []

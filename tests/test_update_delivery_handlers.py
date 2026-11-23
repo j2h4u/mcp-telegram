@@ -42,7 +42,12 @@ class _EditEvent:
 def _seed(path: Path, dialog_id: int, *, hidden: bool = False) -> None:
     with closing(_open_sync_db(path)) as conn:
         kind = "user" if dialog_id > 0 else "group"
-        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,?,?)", (dialog_id, kind, int(hidden)))
+        conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(?,?)", (dialog_id, kind))
+        if hidden:
+            conn.execute(
+                "INSERT INTO dialog_listing_observations VALUES (99,?,'not_returned','completed_directory',1,1)",
+                (dialog_id,),
+            )
         conn.execute("INSERT INTO entities(id,type,updated_at) VALUES(?,?,1)", (dialog_id, kind))
         conn.execute(
             "INSERT INTO synced_dialogs(dialog_id,status,delta_message_id) VALUES(?,'synced',10)", (dialog_id,)
@@ -241,7 +246,7 @@ async def test_required_canonical_write_failure_replays_tg98_cases_1_to_4(  # no
         assert _saved(client) == baseline
         assert reader.execute("SELECT message_id,text,is_deleted FROM messages").fetchall() == [(5, "original", 0)]
         candidates = [row[0] for row in reader.execute(_SELECT_SYNCED_DIALOGS_FOR_DELTA_SQL)]
-        assert (-7 in candidates) is (scenario != "hidden_new")
+        assert -7 in candidates
 
         port = None
         if scenario == "visible_new":
