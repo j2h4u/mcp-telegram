@@ -1391,7 +1391,10 @@ async def test_gap_scan_marks_deleted(
     sync_db: _SQLiteConnection,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """Gap scan marks message absent in Telegram (None returned) as is_deleted=1."""
+    """Gap scan marks an explicit empty ID after a same-peer control."""
+    from telethon.tl import types
+    from telethon.tl.types import messages
+
     dialog_id = 2001
     insert_synced_dialog(sync_db, dialog_id)
     # Pre-insert 3 messages
@@ -1402,10 +1405,14 @@ async def test_gap_scan_marks_deleted(
     _bind_gap_scope(mock_client, manager)
     manager.register()
 
-    # client.get_messages returns: msg10 present, msg20 absent (None), msg30 present
-    msg10 = build_mock_message(id=10)
-    msg30 = build_mock_message(id=30)
-    mock_client.get_messages = AsyncMock(return_value=[msg10, None, msg30])
+    peer = types.PeerUser(dialog_id)
+    response = messages.Messages(
+        [types.Message(10, peer, None, ""), types.MessageEmpty(20, None), types.Message(30, peer, None, "")],
+        [],
+        [],
+        [],
+    )
+    mock_client.side_effect = AsyncMock(return_value=response)
 
     deleted_count = await manager.run_dm_gap_scan()
 
@@ -1431,13 +1438,11 @@ async def test_gap_scan_rejected_peer_keeps_message_and_clears_context(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     _bind_gap_scope(mock_client, manager)
 
-    async def reject(entity: int, *, ids: list[int]) -> object:
-        assert entity == dialog_id
-        assert ids == [20]
+    async def reject(request: object) -> object:
         assert current_peer_target() == dialog_id
         raise PeerAccessRejectedError("peer_access_lost")
 
-    mock_client.get_messages = AsyncMock(side_effect=reject)
+    mock_client.side_effect = reject
     with pytest.raises(PeerAccessRejectedError):
         await manager.run_dm_gap_scan_page(dialog_id, [20])
     assert current_peer_target() is None
@@ -1729,11 +1734,13 @@ async def test_gap_scan_only_synced(
 
     scanned: list[object] = []
 
-    async def _get_messages(entity: object, ids: object) -> list[object]:
-        scanned.append(entity)
-        return [None] * len(ids)  # return Nones (all "deleted") — not relevant to test
+    async def lookup(request: object) -> object:
+        from mcp_telegram.peer_access import current_peer_target
 
-    mock_client.get_messages = _get_messages
+        scanned.append(current_peer_target())
+        return None
+
+    mock_client.side_effect = lookup
 
     manager = make_manager(mock_client, sync_db, shutdown_event)
     _bind_gap_scope(mock_client, manager)
@@ -2635,3 +2642,154 @@ async def test_same_second_partial_to_complete_edit_archives_partial_once(
     assert sync_db.execute(
         "SELECT rich_message FROM messages WHERE dialog_id=? AND message_id=197", (dialog_id,)
     ).fetchone() == (capture_rich_message(after),)
+
+
+@pytest.mark.asyncio
+async def test_channel_deletion_verification_uses_explicit_empty_ids(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from telethon.tl import types
+    from telethon.tl.types import messages
+
+    from mcp_telegram.sqlite_writer import SQLiteWriter
+
+    dialog_id = -1000000000042
+    insert_synced_dialog(sync_db, dialog_id)
+    for message_id in (10, 20, 30, 90):
+        insert_message(sync_db, dialog_id, message_id=message_id, text="retained")
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
+    peer = types.PeerChannel(42)
+    mock_client.retained_draft_peer = MagicMock(return_value=types.InputPeerChannel(42, 1))
+    mock_client.return_value = messages.Messages(
+        [types.MessageEmpty(20, None), types.Message(90, peer, None, "control")], [], [], []
+    )
+
+    async def response(request: object) -> object:
+        return mock_client.return_value
+
+    mock_client.side_effect = response
+    db_path = sync_db.execute("PRAGMA database_list").fetchone()[2]
+    writer = await SQLiteWriter.open(db_path)
+    manager._writer = writer
+    try:
+        result = await manager.verify_channel_deletions(dialog_id, (10, 20, 30), 90)
+        assert result == {"requested": 3, "newly_marked": 1, "not_marked": 2}
+        assert sync_db.execute(
+            "SELECT message_id FROM messages WHERE dialog_id=? AND is_deleted=1", (dialog_id,)
+        ).fetchall() == [(20,)]
+    finally:
+        await writer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_channel_deletion_verification_rolls_back_if_scope_changes_during_write(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from telethon.tl import types
+    from telethon.tl.types import messages
+
+    dialog_id = -1000000000042
+    insert_synced_dialog(sync_db, dialog_id)
+    for message_id in (20, 90):
+        insert_message(sync_db, dialog_id, message_id=message_id, text="retained")
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
+    mock_client.claim_image_scope = MagicMock(side_effect=[True, True, False])
+    mock_client.retained_draft_peer = MagicMock(return_value=types.InputPeerChannel(42, 1))
+    result = messages.Messages(
+        [types.MessageEmpty(20, None), types.Message(90, types.PeerChannel(42), None, "control")], [], [], []
+    )
+
+    async def response(request: object) -> object:
+        return result
+
+    mock_client.side_effect = response
+    with pytest.raises(RuntimeError, match="scope changed"):
+        await manager.verify_channel_deletions(dialog_id, (20,), 90)
+    assert sync_db.execute(
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=20", (dialog_id,)
+    ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_channel_deletion_verification_without_retained_peer_does_not_send(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    dialog_id = -1000000000042
+    insert_synced_dialog(sync_db, dialog_id)
+    for message_id in (20, 90):
+        insert_message(sync_db, dialog_id, message_id=message_id, text="retained")
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
+    mock_client.retained_draft_peer.return_value = None
+    with pytest.raises(RuntimeError, match="channel identity unavailable"):
+        await manager.verify_channel_deletions(dialog_id, (20,), 90)
+    mock_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_channel_deletion_verification_preserves_newer_observation(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from telethon.tl import types
+    from telethon.tl.types import messages
+
+    from mcp_telegram.observation_order import allocate_observation_order
+
+    dialog_id = -1000000000042
+    insert_synced_dialog(sync_db, dialog_id)
+    for message_id in (20, 90):
+        insert_message(sync_db, dialog_id, message_id=message_id, text="retained")
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
+    mock_client.retained_draft_peer.return_value = types.InputPeerChannel(42, 1)
+
+    async def response(request: object) -> object:
+        order = allocate_observation_order(sync_db)
+        sync_db.execute(
+            "INSERT INTO message_observations(dialog_id,message_id,observation_order,is_deleted) VALUES(?,?,?,0) "
+            "ON CONFLICT(dialog_id,message_id) DO UPDATE SET observation_order=excluded.observation_order",
+            (dialog_id, 20, order),
+        )
+        sync_db.commit()
+        return messages.Messages(
+            [types.MessageEmpty(20, None), types.Message(90, types.PeerChannel(42), None, "control")], [], [], []
+        )
+
+    mock_client.side_effect = response
+    result = await manager.verify_channel_deletions(dialog_id, (20,), 90)
+    assert result == {"requested": 1, "newly_marked": 0, "not_marked": 1}
+    assert sync_db.execute(
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=20", (dialog_id,)
+    ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_channel_deletion_verification_rejects_account_change(
+    mock_client: MagicMock, sync_db: _SQLiteConnection, shutdown_event: asyncio.Event
+) -> None:
+    from telethon.tl import types
+    from telethon.tl.types import messages
+
+    dialog_id = -1000000000042
+    insert_synced_dialog(sync_db, dialog_id)
+    for message_id in (20, 90):
+        insert_message(sync_db, dialog_id, message_id=message_id, text="retained")
+    manager = make_manager(mock_client, sync_db, shutdown_event)
+    _bind_gap_scope(mock_client, manager)
+    mock_client.retained_draft_peer.return_value = types.InputPeerChannel(42, 1)
+
+    async def response(request: object) -> object:
+        sync_db.execute("UPDATE dialog_directory_state SET account_id=43 WHERE singleton=1")
+        sync_db.commit()
+        return messages.Messages(
+            [types.MessageEmpty(20, None), types.Message(90, types.PeerChannel(42), None, "control")], [], [], []
+        )
+
+    mock_client.side_effect = response
+    result = await manager.verify_channel_deletions(dialog_id, (20,), 90)
+    assert result == {"requested": 1, "newly_marked": 0, "not_marked": 1}
+    assert sync_db.execute(
+        "SELECT is_deleted FROM messages WHERE dialog_id=? AND message_id=20", (dialog_id,)
+    ).fetchone() == (0,)
