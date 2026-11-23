@@ -3461,6 +3461,7 @@ class _WireAttempt:
     observed_write_returns: int = 0
     observed_result: bool = False
     shutdown_read_candidate: bool = False
+    difference_claimed: bool = False
     enqueue_trace: list[tuple[ResendCause, int | None]] = field(default_factory=list)
     enqueue_truncated: int = 0
     last_rejection: BudgetRejection | None = None
@@ -5929,9 +5930,11 @@ class TelegramRpcGate(TelegramClient):
 
     def _record_difference_claim(self, owner: _WireAttempt) -> None:
         if self._is_update_difference_owner(owner) and ".GetDifferenceRequest:" in owner.method:
+            owner.difference_claimed = True
             self._account_difference_claim = owner
             cast(GateMessageBox, self._message_box).observe_difference_claim(None)
         elif self._is_update_difference_owner(owner) and owner.difference_channel_id is not None:
+            owner.difference_claimed = True
             self._channel_difference_claim = owner
             cast(GateMessageBox, self._message_box).observe_difference_claim(owner.difference_channel_id)
 
@@ -6157,7 +6160,7 @@ class TelegramRpcGate(TelegramClient):
             and attempt.claimed
             and rpc_effect(attempt.method) is RpcEffect.NONMUTATING_READ
             and self._ordinary_read_owner(attempt)
-            and self._verified_read_budget(attempt)
+            and self._shutdown_read_ownership(attempt)
         ):
             return
         ledger = self._ensure_safety_ledger()
@@ -6245,8 +6248,21 @@ class TelegramRpcGate(TelegramClient):
             and not owner.scheduled_mutation
         )
 
-    def _verified_read_budget(self, owner: _WireAttempt) -> bool:
-        scope = owner.scope
+    def _shutdown_read_ownership(self, owner: _WireAttempt) -> bool:
+        if owner.revoked:
+            return False
+        if self._verified_read_budget(owner):
+            return True
+        return bool(
+            owner.difference_claimed
+            and owner.scope.attempt_budget is not None
+            and owner.scope.attempt_budget.selected is None
+            and owner.scope.demand_kind is DemandKind.TELETHON_UPDATE_DIFFERENCE
+            and owner.scope.acquisition_kind is AcquisitionKind.UPDATE_DIFFERENCE
+            and self._verified_read_scope()
+        )
+
+    def _verified_read_scope(self) -> bool:
         ledger = self._ensure_safety_ledger()
         auth = self.retained_auth_scope()
         return bool(
@@ -6256,9 +6272,17 @@ class TelegramRpcGate(TelegramClient):
             and ledger.verified_account_id == auth.account_id
             and cast(dict[str, object], ledger._record["scope"])["key_id"] == auth.auth_key_id
             and cast(dict[str, object], ledger._record["scope"])["dc_id"] == auth.dc_id
-            and scope.attempt_budget is not None
-            and scope.attempt_budget.selected is not None
-            and scope.attempt_budget.selected.key.account_id == auth.account_id
+        )
+
+    def _verified_read_budget(self, owner: _WireAttempt) -> bool:
+        auth = self.retained_auth_scope()
+        budget = owner.scope.attempt_budget
+        return bool(
+            self._verified_read_scope()
+            and auth is not None
+            and budget is not None
+            and budget.selected is not None
+            and budget.selected.key.account_id == auth.account_id
         )
 
     def _record_read_budget_failure(self, owner: _WireAttempt, error: BaseException) -> None:
