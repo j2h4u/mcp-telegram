@@ -187,6 +187,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "message_images/worker.py",  # Classifies selected vendor RPC errors without transport access.
             "telegram_gateway.py",
             "telegram_rpc.py",
+            "telegram_rich_diagnostics.py",  # Classifies decoded native message responses without I/O.
             "telegram_update_admission.py",  # Gate-owned vendor gap bookkeeping; no network dispatch.
             "telegram_delivery.py",  # Versioned local TL recovery serialization, no acquisition.
             "telegram_update_ring.py",  # Bounded in-memory retention of decoded TL notifications.

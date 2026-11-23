@@ -532,7 +532,12 @@ depends_on = ["mcp_telegram.telegram_demand", "mcp_telegram.image_authorization"
 [[modules]]
 path = "mcp_telegram.telegram_rpc"
 layer = "telegram_gateway"
-depends_on = ["mcp_telegram.telegram_update_ring", "mcp_telegram.message_delivery_observations", "mcp_telegram.contacts.intake", "mcp_telegram.contact_notes.intake", "mcp_telegram.folders.intake", "mcp_telegram.native_write_fence", "mcp_telegram.peer_access", "mcp_telegram.state", "mcp_telegram.image_authorization", "mcp_telegram.telegram_image_download", "mcp_telegram.auth_scope", "mcp_telegram.delivered_update", "mcp_telegram.telegram_delivery", "mcp_telegram.update_delivery", "mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_progress", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_recovery", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_transport", "mcp_telegram.telegram_update_admission", "mcp_telegram.scheduled_write_fence"]
+depends_on = ["mcp_telegram.telegram_rich_diagnostics", "mcp_telegram.telegram_update_ring", "mcp_telegram.message_delivery_observations", "mcp_telegram.contacts.intake", "mcp_telegram.contact_notes.intake", "mcp_telegram.folders.intake", "mcp_telegram.native_write_fence", "mcp_telegram.peer_access", "mcp_telegram.state", "mcp_telegram.image_authorization", "mcp_telegram.telegram_image_download", "mcp_telegram.auth_scope", "mcp_telegram.delivered_update", "mcp_telegram.telegram_delivery", "mcp_telegram.update_delivery", "mcp_telegram.flood", "mcp_telegram.request_timing", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_progress", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_recovery", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.telegram_transport", "mcp_telegram.telegram_update_admission", "mcp_telegram.scheduled_write_fence"]
+[[modules]]
+path = "mcp_telegram.telegram_rich_diagnostics"
+layer = "telegram_gateway"
+depends_on = []
+
 [[modules]]
 path = "mcp_telegram.telegram_update_admission"
 layer = "telegram_gateway"
