@@ -1520,6 +1520,7 @@ def test_v94_lost_complete_baseline_requires_refresh_after_restore(
     from mcp_telegram.access_lifecycle import restore_access_after_revalidation
     from mcp_telegram.scheduled_commands import ScheduledCommandError, _current_state
 
+    current_schema_version = sync_db._CURRENT_SCHEMA_VERSION
     path = tmp_path / "lost-upgrade.db"
     monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 94)
     ensure_sync_schema(path)
@@ -1552,6 +1553,12 @@ def test_v94_lost_complete_baseline_requires_refresh_after_restore(
         assert connection.execute(
             "SELECT text FROM scheduled_messages WHERE dialog_id=123 AND message_id=11"
         ).fetchone() == ("retained",)
+    finally:
+        connection.close()
+    monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", current_schema_version)
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    try:
         assert restore_access_after_revalidation(connection, 123, 30)
         with pytest.raises(ScheduledCommandError, match="baseline"):
             _current_state(connection, 42, 123, None)

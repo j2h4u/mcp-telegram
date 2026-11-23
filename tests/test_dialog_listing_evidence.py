@@ -1,9 +1,13 @@
 """Completed directory listing evidence stays separate from retained facts."""
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 
+import pytest
+
+import mcp_telegram.sync_db as sync_db
 from mcp_telegram.dialog_availability import read_dialog_availabilities
 from mcp_telegram.dialog_directory import _DirectoryState, _publish_directory_absence
 from mcp_telegram.sync_db import ensure_sync_schema
@@ -73,69 +77,64 @@ def test_access_evidence_is_account_scoped_and_new_episode_retires_old_cause(tmp
     conn.close()
 
 
-def test_migration_does_not_turn_legacy_hidden_into_listing_evidence(tmp_path: Path) -> None:
+def test_migration_does_not_turn_legacy_hidden_into_listing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "sync.db"
-    ensure_sync_schema(path)
-    conn = sqlite3.connect(path)
-    conn.execute("ALTER TABLE dialogs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
-    conn.execute("INSERT INTO dialogs(dialog_id,name,hidden) VALUES(1,'retained',1)")
-    conn.execute("DROP INDEX idx_dialogs_pinned")
-    conn.execute("DROP INDEX idx_dialogs_needs_refresh")
-    conn.executemany(
-        "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at,access_next_revalidate_at) VALUES (?, 'access_lost', 10, 9999999999)",
-        [(2,), (3,), (4,), (5,)],
-    )
-    conn.execute(
-        "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,access_change_cause) VALUES ('access_lost',10,'observed',3,'removed_by_admin')"
-    )
-    conn.execute("UPDATE dialog_directory_state SET account_id=10")
-    conn.execute("UPDATE synced_dialogs SET access_lost_at=20 WHERE dialog_id=5")
-    conn.execute(
-        "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,reason_code,access_change_cause) VALUES ('access_lost',10,'observed',5,'Removed','removed_by_admin')"
-    )
-    conn.execute(
-        "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,reason_code) VALUES ('access_lost',20,'observed',5,'LaterDenial')"
-    )
-    conn.executemany(
-        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (5,?,?)",
-        [("access_state", 3), ("access_recovery_witness", 2)],
-    )
-    conn.executemany(
-        "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (4,?,7)",
-        [("access_state",), ("access_recovery_witness",)],
-    )
-    conn.execute("ALTER TABLE synced_dialogs DROP COLUMN access_loss_event_seq")
-    conn.execute("ALTER TABLE synced_dialogs DROP COLUMN access_loss_scope")
-    conn.execute("ALTER TABLE synced_dialogs DROP COLUMN access_scope_observed_at")
-    conn.execute("DROP TABLE dialog_listing_observations")
-    conn.execute("ALTER TABLE dialog_directory_baseline DROP COLUMN baseline_exists")
-    conn.execute("DELETE FROM schema_version WHERE version=104")
-    conn.commit()
-    conn.close()
-    ensure_sync_schema(path)
-    conn = sqlite3.connect(path)
-    assert conn.execute("SELECT dialog_id,name FROM dialogs").fetchall() == [(1, "retained")]
-    assert conn.execute("SELECT * FROM dialog_listing_observations").fetchall() == []
-    columns = cast(list[tuple[int, str, str, int, object, int]], conn.execute("PRAGMA table_info(dialogs)").fetchall())
-    assert "hidden" not in {row[1] for row in columns}
-    rows = cast(
-        list[tuple[int, str, str | None, int]],
+    with monkeypatch.context() as historical:
+        historical.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 103)
+        ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("INSERT INTO dialogs(dialog_id,name,hidden) VALUES(1,'retained',1)")
+        conn.executemany(
+            "INSERT INTO synced_dialogs(dialog_id,status,access_lost_at,access_next_revalidate_at) VALUES (?, 'access_lost', 10, 9999999999)",
+            [(2,), (3,), (4,), (5,)],
+        )
         conn.execute(
-            "SELECT dialog_id,status,access_loss_scope,access_next_revalidate_at FROM synced_dialogs ORDER BY dialog_id"
-        ).fetchall(),
-    )
-    assert rows[0][0:3] == (2, "access_lost", None) and rows[0][3] < 9999999999
-    assert rows[1] == (3, "access_lost", "membership", 9999999999)
-    assert rows[2] == (4, "access_lost", None, 9999999999)
-    assert rows[3][0:3] == (5, "access_lost", None) and rows[3][3] < 9999999999
-    assert read_dialog_availabilities(conn, 10, [5])[5]["access"] == {
-        "state": "access_lost",
-        "scope": "unknown",
-        "reason_code": "LaterDenial",
-        "cause": None,
-        "observed_at": 20,
-    }
-    conn.close()
+            "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,access_change_cause) VALUES ('access_lost',10,'observed',3,'removed_by_admin')"
+        )
+        conn.execute("UPDATE dialog_directory_state SET account_id=10")
+        conn.execute("UPDATE synced_dialogs SET access_lost_at=20 WHERE dialog_id=5")
+        conn.execute(
+            "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,reason_code,access_change_cause) VALUES ('access_lost',10,'observed',5,'Removed','removed_by_admin')"
+        )
+        conn.execute(
+            "INSERT INTO conversation_history_events(kind,occurred_at,time_basis,dialog_id,reason_code) VALUES ('access_lost',20,'observed',5,'LaterDenial')"
+        )
+        conn.executemany(
+            "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (5,?,?)",
+            [("access_state", 3), ("access_recovery_witness", 2)],
+        )
+        conn.executemany(
+            "INSERT INTO dialog_fact_observations(dialog_id,field,observation_order) VALUES (4,?,7)",
+            [("access_state",), ("access_recovery_witness",)],
+        )
+        conn.commit()
+    ensure_sync_schema(path)
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT dialog_id,name FROM dialogs").fetchall() == [(1, "retained")]
+        assert conn.execute("SELECT * FROM dialog_listing_observations").fetchall() == []
+        columns = cast(
+            list[tuple[int, str, str, int, object, int]], conn.execute("PRAGMA table_info(dialogs)").fetchall()
+        )
+        assert "hidden" not in {row[1] for row in columns}
+        rows = cast(
+            list[tuple[int, str, str | None, int]],
+            conn.execute(
+                "SELECT dialog_id,status,access_loss_scope,access_next_revalidate_at FROM synced_dialogs ORDER BY dialog_id"
+            ).fetchall(),
+        )
+        assert rows[0][0:3] == (2, "access_lost", None) and rows[0][3] < 9999999999
+        assert rows[1] == (3, "access_lost", "membership", 9999999999)
+        assert rows[2] == (4, "access_lost", None, 9999999999)
+        assert rows[3][0:3] == (5, "access_lost", None) and rows[3][3] < 9999999999
+        assert read_dialog_availabilities(conn, 10, [5])[5]["access"] == {
+            "state": "access_lost",
+            "scope": "unknown",
+            "reason_code": "LaterDenial",
+            "cause": None,
+            "observed_at": 20,
+        }
 
 
 async def test_listing_witness_is_atomic_across_writer_and_reader_snapshot(tmp_path: Path) -> None:

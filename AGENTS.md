@@ -259,6 +259,11 @@ file lists to bound memory, not two copies of the suite. There is no separate
 `unit` recipe. This cadence supersedes historical plans asking for separate
 full unit and coverage runs.
 
+For schema changes, run the complete `tests/test_sync_db.py` module and affected
+migration fixture modules against the current schema before final CI. Historical
+migration-step tests must upgrade to the current schema before invoking current
+runtime consumers.
+
 During development, run affected slices. For new complex logic subject to CRAP,
 run the targeted slice with coverage in that same pass and inspect the changed
 functions' coverage and CRAP using the existing `devtools.crap_threshold` metric
@@ -324,9 +329,11 @@ just runtime-smoke
 just runtime-verify
 ```
 
-Прямой `devtools/mcp_client/cli.py` используй только для точечных диагностических
-запросов, которых нет в готовом рецепте. Не используй `docker exec python3`
-или самодельные MCP-клиенты.
+Для точечных диагностических запросов, которых нет в готовом рецепте, используй
+локальный `devtools/mcp_client/cli.py`; для нескольких запросов в одной MCP-сессии
+используй его режим script. Harness или агрегатор используй, когда проверяешь
+именно этот внешний маршрут клиента. Не используй `docker exec python3` или
+самодельные MCP-клиенты.
 
 ```bash
 # Список доступных tools
