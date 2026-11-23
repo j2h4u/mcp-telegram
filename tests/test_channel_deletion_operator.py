@@ -95,7 +95,7 @@ def test_cli_forwards_one_local_batch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     @asynccontextmanager
     async def connection(**kwargs: object) -> AsyncIterator[Connection]:
-        assert kwargs == {"timeout_seconds": 45.0}
+        assert kwargs == {}
         yield Connection()
 
     monkeypatch.setattr(client, "daemon_connection", connection)

@@ -1551,11 +1551,11 @@ class DaemonAPIServer:
                 "message": "Verified account or deletion verifier unavailable.",
             }
         try:
-            with demand_context(DemandKind.MCP_REMOTE_ACQUISITION, deadline=time.monotonic() + 30.0):
+            with demand_context(DemandKind.MCP_REMOTE_ACQUISITION) as demand:
                 with _preserve_or_rpc_scope(
                     TelegramRpcSource.MCP_INTERACTIVE, acquisition_kind=AcquisitionKind.MESSAGE_LOOKUP
                 ):
-                    async with asyncio.timeout(30.0):
+                    async with asyncio.timeout_at(demand.admission_deadline):
                         with rpc_attempt_budget(RpcAttemptBudget(1)):
                             result = await verifier(
                                 cast(int, dialog_id), tuple(cast(list[int], ids)), cast(int, control)

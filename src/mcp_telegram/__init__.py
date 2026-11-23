@@ -50,7 +50,7 @@ def verify_channel_deletions(
     from .daemon_client import DaemonNotRunningError, daemon_connection
 
     async def request() -> dict[str, object]:
-        async with daemon_connection(timeout_seconds=45.0) as conn:
+        async with daemon_connection() as conn:
             return await conn.verify_channel_deletions(
                 dialog_id=dialog_id, message_ids=message_ids, control_id=control_id
             )
