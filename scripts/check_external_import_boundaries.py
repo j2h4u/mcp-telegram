@@ -173,6 +173,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "folders/reference_demand.py",  # Native peer lookup through the shared gateway.
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",
+            "message_deletion_evidence.py",  # Classifies supplied Telegram deletion evidence without acquisition.
             "media_hydration.py",  # Bounded rich-message acquisition through the shared RPC gateway.
             "reactions/telegram_adapter.py",
             "rich_authoring.py",  # Constructs native rich inputs without client or network access.

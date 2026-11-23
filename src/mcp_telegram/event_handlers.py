@@ -139,6 +139,7 @@ from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
 from .message_deletion_evidence import classify_channel_lookup, classify_dm_lookup, valid_channel_verification
 from .message_delivery_observations import observe_current
 from .messages.sqlite_bundle import (
+    all_messages_retained,
     find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
     list_undeleted_message_ids,
@@ -669,6 +670,16 @@ _SELECT_SYNCED_ONLY_SQL = (
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.status = 'synced'"
 )
+
+
+def _eligible_for_deletion_verification(conn: sqlite3.Connection, dialog_id: int) -> bool:
+    """Require active history enrollment and a fully synchronized dialog."""
+    status = cast(
+        tuple[str] | None,
+        conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
+    )
+    return full_history_enabled(conn, dialog_id) and status is not None and status[0] == "synced"
+
 
 # ---------------------------------------------------------------------------
 # Phase 42 SQL — dialogs event writes. Body metadata remains UPDATE-only;
@@ -3497,21 +3508,9 @@ class EventHandlerManager:
             with write_transaction(conn):
                 if not self._client.claim_image_scope(scope) or bound_profile_account(conn) != self._self_id:
                     raise RuntimeError("account scope changed")
-                status = cast(
-                    tuple[str] | None,
-                    conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
-                )
-                if not full_history_enabled(conn, dialog_id) or status is None or status[0] != "synced":
+                if not _eligible_for_deletion_verification(conn, dialog_id):
                     raise RuntimeError("dialog history unavailable")
-                placeholders = ",".join("?" for _ in ids)
-                count = cast(
-                    tuple[int] | None,
-                    conn.execute(
-                        f"SELECT count(*) FROM messages WHERE dialog_id=? AND is_deleted=0 AND message_id IN ({placeholders})",
-                        (dialog_id, *ids),
-                    ).fetchone(),
-                )
-                if count is None or count[0] != len(ids):
+                if not all_messages_retained(conn, dialog_id, ids):
                     raise ValueError("requested messages are not retained")
                 return allocate_observation_order(conn)
 
@@ -3530,11 +3529,7 @@ class EventHandlerManager:
             with write_transaction(conn):
                 if not self._client.claim_image_scope(scope) or bound_profile_account(conn) != self._self_id:
                     return 0
-                status = cast(
-                    tuple[str] | None,
-                    conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
-                )
-                if not full_history_enabled(conn, dialog_id) or status is None or status[0] != "synced":
+                if not _eligible_for_deletion_verification(conn, dialog_id):
                     return 0
                 marked = 0
                 for message_id in evidence.deleted_ids:

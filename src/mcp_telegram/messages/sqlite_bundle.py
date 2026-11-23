@@ -422,6 +422,19 @@ def mark_message_deleted(conn: sqlite3.Connection, dialog_id: int, message_id: i
     return cursor.rowcount > 0
 
 
+def all_messages_retained(conn: sqlite3.Connection, dialog_id: int, message_ids: Sequence[int]) -> bool:
+    """Check that every requested key has a retained nondeleted message."""
+    placeholders = ",".join("?" for _ in message_ids)
+    row = cast(
+        tuple[int] | None,
+        conn.execute(
+            f"SELECT count(*) FROM messages WHERE dialog_id=? AND is_deleted=0 AND message_id IN ({placeholders})",
+            (dialog_id, *message_ids),
+        ).fetchone(),
+    )
+    return row is not None and row[0] == len(message_ids)
+
+
 def find_unique_nonchannel_message_dialogs(conn: sqlite3.Connection, message_ids: Sequence[int]) -> dict[int, int]:
     """Resolve only unique cached keys in Telegram's nonchannel ID namespace."""
     unique_ids = tuple(dict.fromkeys(int(message_id) for message_id in message_ids))
