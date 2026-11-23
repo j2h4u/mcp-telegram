@@ -361,7 +361,11 @@ class FactHydrationDemandAdapter(DurableDemandAdapter):
         if rich_composition_repair_revision(self._worker._conn) != selected.revision:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         now = self._worker._clock()
-        await self._worker._run_due_repairs(now, int(now))
+        accepted = await self._worker._run_due_repairs(
+            now, int(now), expected_rich_revision=selected.revision, expected_account_id=selected.key.account_id
+        )
+        if accepted is None:
+            return SliceOutcome(selected, SliceOutcomeKind.STALE)
         revision = rich_composition_repair_revision(self._worker._conn) or "complete"
         if revision != selected.revision:
             return SliceOutcome(selected, SliceOutcomeKind.PROGRESSED, revision)
@@ -591,23 +595,42 @@ class MessageFactHydrationWorker:
             self._conn, job.dialog_id, job.message_id
         )
 
-    async def _run_due_repairs(self, clock_now: float, effective_now: int) -> None:
+    async def _run_due_repairs(
+        self,
+        clock_now: float,
+        effective_now: int,
+        *,
+        expected_rich_revision: str | None = None,
+        expected_account_id: int | None = None,
+    ) -> bool | None:
         if clock_now < self.next_repair_at:
-            return
+            return False
 
         def repair(
             conn: sqlite3.Connection,
-        ) -> tuple[
-            bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]
-        ]:
+        ) -> (
+            tuple[bool, tuple[HydrationRepairCursor | None, HydrationRepairCursor | None, HydrationRepairCursor | None]]
+            | None
+        ):
             if conn.in_transaction:
                 raise RuntimeError("fact hydration repair requires no open transaction")
             with write_transaction(conn):
+                if expected_account_id is not None and bound_profile_account(conn) != expected_account_id:
+                    return None
+                if (
+                    expected_rich_revision is not None
+                    and rich_composition_repair_revision(conn) != expected_rich_revision
+                ):
+                    return None
                 return self._run_repair_producers(conn, effective_now)
 
-        has_more, cursors = await self._writer.run(repair)
+        result = await self._writer.run(repair)
+        if result is None:
+            return None
+        has_more, cursors = result
         self._repair_cursors = cursors if has_more else (None, None, None)
         self.next_repair_at = clock_now if has_more else self._clock() + self._interval_seconds
+        return True
 
     def _run_repair_producers(
         self, conn: sqlite3.Connection, effective_now: int

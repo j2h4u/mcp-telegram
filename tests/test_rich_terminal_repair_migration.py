@@ -50,7 +50,9 @@ def test_v105_reopens_only_current_unclassified_recent_backfill(
     conn.commit()
     conn.close()
     before = int(time.time())
-    ensure_sync_schema(path)
+    with monkeypatch.context() as version:
+        version.setattr(schema, "_CURRENT_SCHEMA_VERSION", 105)
+        ensure_sync_schema(path)
     after = int(time.time())
     conn = _open_sync_db(path)
     rows = cast(

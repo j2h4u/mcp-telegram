@@ -44,6 +44,7 @@ async def test_rich_repair_persists_cursor_through_real_writer(tmp_path: Path) -
 
     def seed(db: sqlite3.Connection) -> None:
         with write_transaction(db):
+            db.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
             db.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (1,'synced')")
             db.execute("INSERT INTO full_history_enrollment VALUES (1,1,1)")
             db.execute(
