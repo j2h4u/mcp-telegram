@@ -294,6 +294,7 @@ async def test_partial_rich_owner_publishes_full_response_to_canonical_message(d
 @pytest.mark.parametrize("partial", [True, False])
 async def test_batch_keeps_partial_jobs_for_individual_expansion(db: sqlite3.Connection, partial: bool) -> None:
     _seed_dialog(db)
+    db.execute("UPDATE rich_dialog_repairs SET cursor=-1 WHERE dialog_id=1")
     for message_id in (1, 2, 3):
         _seed_message(db, message_id)
     db.execute("UPDATE messages SET sent_at=1777593600")
@@ -496,6 +497,7 @@ async def test_batch_failure_preserves_all_queued_facts(db: sqlite3.Connection, 
 @pytest.mark.asyncio
 async def test_empty_queue_repair_demand_seeds_and_finishes_without_idle_writes(db: sqlite3.Connection) -> None:
     _seed_dialog(db)
+    db.execute("UPDATE rich_dialog_repairs SET cursor=-1 WHERE dialog_id=1")
     _seed_message(db, 1)
     db.execute("UPDATE messages SET sent_at=1777593600 WHERE message_id=1")
     db.execute(
@@ -1335,6 +1337,7 @@ def test_rich_history_cutoff_and_bounded_obsolete_cleanup(db: sqlite3.Connection
     from mcp_telegram.messages.sqlite_hydration_jobs import rich_composition_repair_revision
 
     _seed_dialog(db)
+    db.execute("UPDATE rich_dialog_repairs SET cursor=-1 WHERE dialog_id=1")
     for message_id in range(1, 7):
         _seed_message(db, message_id)
     db.execute("UPDATE messages SET sent_at=1777593600 WHERE message_id=3")

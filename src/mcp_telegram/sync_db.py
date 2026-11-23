@@ -17,14 +17,19 @@ from .dialog_classification import (
 from .hydration_queue import RICH_COMPOSITION_KIND, HydrationOutcome, HydrationPriority
 from .models import DialogType
 from .observation_order import hydration_observation_current
-from .rich_hydration_policy import rich_composition_automatic_eligible, rich_composition_hydration_eligible
+from .rich_hydration_policy import (
+    _RICH_AUTOMATIC_ELIGIBILITY_SQL,
+    rich_composition_automatic_eligible,
+    rich_composition_hydration_eligible,
+)
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
 _DIALOG_LISTING_EVIDENCE_MIGRATION = 104
 _RICH_TERMINAL_REPAIR_MIGRATION = 105
-_CURRENT_SCHEMA_VERSION = _RICH_TERMINAL_REPAIR_MIGRATION
+_RICH_ELIGIBILITY_REPAIR_MIGRATION = 106
+_CURRENT_SCHEMA_VERSION = _RICH_ELIGIBILITY_REPAIR_MIGRATION
 _TODO_MEDIA_MIGRATION = 103
 _RICH_COMPOSITION_MIGRATION = 102
 _TOPIC_ATTRIBUTION_CORRECTION_MIGRATION = 101
@@ -5122,6 +5127,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
         current = _apply_migration_104(conn, current)
     if _CURRENT_SCHEMA_VERSION >= _RICH_TERMINAL_REPAIR_MIGRATION:
         current = _apply_migration_105(conn, current)
+    if _CURRENT_SCHEMA_VERSION >= _RICH_ELIGIBILITY_REPAIR_MIGRATION:
+        current = _apply_migration_106(conn, current)
     logger.info("sync_db migrations applied through version %d", _CURRENT_SCHEMA_VERSION)
 
 
@@ -5194,6 +5201,47 @@ _FOLDER_PEER_REFERENCES_DDL = (
     "metadata_observed_at INTEGER, metadata_source TEXT, metadata_error_code TEXT, "
     "metadata_candidate TEXT NOT NULL DEFAULT 'native', PRIMARY KEY(account_id,dialog_id)) WITHOUT ROWID"
 )
+
+
+def _apply_migration_106(conn: sqlite3.Connection, current: int) -> int:
+    """Seed existing orphaned facts and schedule bounded per-dialog eligibility repairs."""
+    request = (
+        "INSERT INTO rich_dialog_repairs(dialog_id,cursor,generation) VALUES (NEW.dialog_id,0,1) "
+        "ON CONFLICT(dialog_id) DO UPDATE SET cursor=0,generation=generation+1; "
+    )
+    return _apply_migration(
+        conn,
+        current,
+        _RICH_ELIGIBILITY_REPAIR_MIGRATION,
+        [
+            "CREATE TABLE rich_dialog_repairs (dialog_id INTEGER PRIMARY KEY, cursor INTEGER NOT NULL, generation INTEGER NOT NULL)",
+            "CREATE TRIGGER rich_repair_enrollment_insert AFTER INSERT ON full_history_enrollment "
+            "WHEN NEW.enabled=1 AND EXISTS (SELECT 1 FROM synced_dialogs s WHERE s.dialog_id=NEW.dialog_id AND s.status IN ('syncing','synced')) BEGIN "
+            + request
+            + "END",
+            "CREATE TRIGGER rich_repair_enrollment_update AFTER UPDATE OF enabled ON full_history_enrollment "
+            "WHEN OLD.enabled<>1 AND NEW.enabled=1 AND EXISTS (SELECT 1 FROM synced_dialogs s WHERE s.dialog_id=NEW.dialog_id AND s.status IN ('syncing','synced')) BEGIN "
+            + request
+            + "END",
+            "CREATE TRIGGER rich_repair_status_insert AFTER INSERT ON synced_dialogs "
+            "WHEN NEW.status IN ('syncing','synced') AND EXISTS (SELECT 1 FROM full_history_enrollment e WHERE e.dialog_id=NEW.dialog_id AND e.enabled=1) BEGIN "
+            + request
+            + "END",
+            "CREATE TRIGGER rich_repair_status_update AFTER UPDATE OF status ON synced_dialogs "
+            "WHEN OLD.status NOT IN ('syncing','synced') AND NEW.status IN ('syncing','synced') AND EXISTS (SELECT 1 FROM full_history_enrollment e WHERE e.dialog_id=NEW.dialog_id AND e.enabled=1) BEGIN "
+            + request
+            + "END",
+            "INSERT OR IGNORE INTO hydration_jobs(kind,dialog_id,message_id,due_at,attempts,priority,message_sent_at,terminal) "
+            "SELECT 'rich_composition',m.dialog_id,m.message_id,CAST(strftime('%s','now') AS INTEGER),0,0,m.sent_at,0 "
+            "FROM messages m INDEXED BY idx_messages_rich_unknown "
+            "JOIN synced_dialogs s ON s.dialog_id=m.dialog_id AND s.status IN ('syncing','synced') "
+            "JOIN full_history_enrollment e ON e.dialog_id=m.dialog_id AND e.enabled=1 "
+            "WHERE m.rich_message IS NULL AND m.is_deleted=0 AND "
+            + _RICH_AUTOMATIC_ELIGIBILITY_SQL
+            + " AND NOT EXISTS (SELECT 1 FROM hydration_jobs h WHERE h.kind='rich_composition' "
+            "AND h.dialog_id=m.dialog_id AND h.message_id=m.message_id)",
+        ],
+    )
 
 
 def _apply_migration_105(conn: sqlite3.Connection, current: int) -> int:

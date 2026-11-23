@@ -22,6 +22,7 @@ from ..observation_order import hydration_observation_current
 from ..rich_hydration_policy import (
     _FACT_HYDRATION_ELIGIBILITY_SQL,
     _RICH_AUTOMATIC_DATE_SQL,
+    _RICH_AUTOMATIC_ELIGIBILITY_SQL,
     fact_hydration_eligible,
     rich_composition_hydration_eligible,
 )
@@ -251,7 +252,7 @@ def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: 
     if not state.get("cleanup_done", False):
         return False
     if state["done"]:
-        return False
+        return _repair_rich_dialog(conn, due_at=due_at, max_jobs=max_jobs)
     cursor = _rich_repair_cursor(state["cursor"])
     rows = cast(
         list[_RepairRow],
@@ -269,7 +270,7 @@ def repair_rich_composition_hydration_jobs(conn: sqlite3.Connection, *, due_at: 
         examined,
         kind=RICH_COMPOSITION_KIND,
         due_at=due_at,
-        eligibility="m.is_deleted=0 AND m.rich_message IS NULL AND " + _RICH_AUTOMATIC_DATE_SQL,
+        eligibility="m.rich_message IS NULL AND " + _RICH_AUTOMATIC_ELIGIBILITY_SQL,
     )
     has_more = len(rows) > max_jobs
     state.update(cursor=tuple(examined[-1]) if examined else state["cursor"], done=not has_more)
@@ -290,7 +291,8 @@ def rich_composition_repair_revision(conn: sqlite3.Connection) -> str | None:
     if not state.get("cleanup_done", False):
         return None
     if state["done"]:
-        return None
+        target = _rich_dialog_target(conn)
+        return None if target is None else repr(target)
     cursor = _rich_repair_cursor(state["cursor"])
     candidate = cast(
         tuple[int, int, int] | None,
@@ -302,7 +304,53 @@ def rich_composition_repair_revision(conn: sqlite3.Connection) -> str | None:
             cursor,
         ).fetchone(),
     )
-    return None if candidate is None else repr((state["cursor"], tuple(candidate)))
+    return repr((state["cursor"], None if candidate is None else tuple(candidate)))
+
+
+def _rich_dialog_target(conn: sqlite3.Connection) -> tuple[int, int, int] | None:
+    return cast(
+        tuple[int, int, int] | None,
+        conn.execute(
+            "SELECT r.dialog_id,r.cursor,r.generation FROM rich_dialog_repairs r "
+            "JOIN synced_dialogs s ON s.dialog_id=r.dialog_id AND s.status IN ('syncing','synced') "
+            "JOIN full_history_enrollment e ON e.dialog_id=r.dialog_id AND e.enabled=1 "
+            "WHERE r.cursor>=0 ORDER BY r.dialog_id LIMIT 1"
+        ).fetchone(),
+    )
+
+
+def _repair_rich_dialog(conn: sqlite3.Connection, *, due_at: int, max_jobs: int) -> bool:
+    """Scan one eligible dialog in bounded PK order inside the writer transaction."""
+    target = _rich_dialog_target(conn)
+    if target is None:
+        return False
+    dialog_id, cursor, generation = target
+    rows = cast(
+        list[tuple[int, int]],
+        conn.execute(
+            "SELECT message_id,sent_at FROM messages WHERE dialog_id=? AND message_id>? ORDER BY message_id LIMIT ?",
+            (dialog_id, cursor, max_jobs + 1),
+        ).fetchall(),
+    )
+    examined = rows[:max_jobs]
+    _enqueue_repair_rows(
+        conn,
+        [(sent_at, dialog_id, message_id) for message_id, sent_at in examined],
+        kind=RICH_COMPOSITION_KIND,
+        due_at=due_at,
+        eligibility=_RICH_AUTOMATIC_ELIGIBILITY_SQL,
+    )
+    if len(rows) > max_jobs:
+        conn.execute(
+            "UPDATE rich_dialog_repairs SET cursor=? WHERE dialog_id=? AND cursor=? AND generation=?",
+            (examined[-1][0], dialog_id, cursor, generation),
+        )
+    else:
+        conn.execute(
+            "UPDATE rich_dialog_repairs SET cursor=-1 WHERE dialog_id=? AND cursor=? AND generation=?",
+            (dialog_id, cursor, generation),
+        )
+    return _rich_dialog_target(conn) is not None
 
 
 def transcription_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
@@ -489,6 +537,13 @@ def _reconcile_rich_composition_job(
         HydrationPriority.BACKFILL,
     )
     if message.rich_message is None:
+        _enqueue_repair_rows(
+            conn,
+            [(message.sent_at, message.dialog_id, message.message_id)],
+            kind=RICH_COMPOSITION_KIND,
+            due_at=due_at,
+            eligibility="m.rich_message IS NULL AND " + _RICH_AUTOMATIC_ELIGIBILITY_SQL,
+        )
         return
     if rich_composition_hydration_eligible(conn, message.dialog_id, message.message_id):
         queue.enqueue(job)

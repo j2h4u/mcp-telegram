@@ -1714,3 +1714,26 @@ def test_received_same_second_rich_edit_is_archived(conn: sqlite3.Connection) ->
         assert conn.execute("SELECT old_rich_message FROM message_versions WHERE message_id=336").fetchone() == (
             old.message.rich_message,
         )
+
+
+def test_recent_unknown_rich_persistence_queues_once_and_retains_terminal(conn: sqlite3.Connection) -> None:
+    _make_hydration_eligible(conn)
+    unknown = _message(701, text="fixture", sent_at=1777593600)
+    old = _message(702, text="fixture", sent_at=1777593599)
+    known = _message(703, text="fixture", sent_at=1777593600)
+    known.message = replace(known.message, formatting_text="fixture", rich_message="null")
+    replay = replace(known, message=replace(known.message, rich_message=None))
+    with write_transaction(conn):
+        insert_messages_with_fts(conn, [known])
+        insert_messages_with_fts(conn, [unknown, old, replay])
+        assert conn.execute("SELECT rich_message FROM messages WHERE message_id=703").fetchone() == ("null",)
+        assert conn.execute(
+            "SELECT message_id,priority,terminal FROM hydration_jobs WHERE kind='rich_composition'"
+        ).fetchall() == [(701, 0, 0)]
+        conn.execute(
+            "UPDATE hydration_jobs SET attempts=4,terminal=1,last_outcome='terminal_error',last_error_code='missing_response' WHERE kind='rich_composition'"
+        )
+        insert_messages_with_fts(conn, [unknown])
+    assert conn.execute(
+        "SELECT message_id,attempts,terminal,last_error_code FROM hydration_jobs WHERE kind='rich_composition'"
+    ).fetchall() == [(701, 4, 1, "missing_response")]

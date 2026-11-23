@@ -21,7 +21,16 @@ def queue_snapshots(conn: sqlite3.Connection, now: int, *, paused: bool) -> list
         conn.execute("SELECT value FROM daemon_state WHERE key='rich_composition_hydration_cursor'").fetchone(),
     )
     state = cast(dict[str, object], json.loads(row[0])) if row else {}
-    scan_complete = state.get("done") is True and state.get("cleanup_done") is True
+    pending_dialog = cast(
+        tuple[int] | None,
+        conn.execute(
+            "SELECT 1 FROM rich_dialog_repairs r "
+            "JOIN synced_dialogs s ON s.dialog_id=r.dialog_id AND s.status IN ('syncing','synced') "
+            "JOIN full_history_enrollment e ON e.dialog_id=r.dialog_id AND e.enabled=1 "
+            "WHERE r.cursor>=0 LIMIT 1"
+        ).fetchone(),
+    )
+    scan_complete = state.get("done") is True and state.get("cleanup_done") is True and pending_dialog is None
     result: list[dict[str, object]] = []
     for kind in KINDS:
         group = groups.get(kind)
