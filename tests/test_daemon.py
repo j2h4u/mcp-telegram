@@ -977,9 +977,7 @@ async def test_classified_startup_identity_mismatch_preserves_directory_rows(
     conn = _open_sync_db(db_path)
     try:
         conn.execute("UPDATE dialog_directory_state SET account_id=100")
-        conn.execute(
-            "INSERT INTO dialogs(dialog_id,name,type,unread_count,snapshot_at,hidden) VALUES (7,'kept','user',4,1,0)"
-        )
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,unread_count,snapshot_at) VALUES (7,'kept','user',4,1)")
         conn.commit()
     finally:
         conn.close()

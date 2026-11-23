@@ -140,7 +140,7 @@ def test_sqlite_reads_preserve_scopes_and_metadata_defaults() -> None:
             == conn.execute("SELECT id, name, username, name_normalized FROM entities WHERE id = 7").fetchone()
         )
         assert coverage_fragments(conn, target_user_id=7)[0]["status"] == "partial"
-        assert dialog_metadata(conn, 999) == {"dialog_type": "unknown", "status": "not_synced", "hidden": False}
+        assert dialog_metadata(conn, 999) == {"dialog_type": "unknown", "status": "not_synced"}
     finally:
         conn.close()
 

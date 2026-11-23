@@ -84,7 +84,9 @@ def _read_identity_aggregate(
             "SUM(CASE WHEN COALESCE(d.identity_complete, 0) <> 1 THEN 1 ELSE 0 END), "
             "MIN(CASE WHEN COALESCE(d.identity_complete, 0) = 1 THEN d.identity_observed_at END), "
             "MIN(d.identity_observed_at) "
-            "FROM dialogs d WHERE d.hidden=0"
+            "FROM dialogs d WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations l "
+            "JOIN dialog_directory_state s ON s.singleton=1 AND s.account_id=l.account_id "
+            "WHERE l.dialog_id=d.dialog_id AND l.state='not_returned')"
         ).fetchone(),
     )
 

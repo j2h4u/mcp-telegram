@@ -55,7 +55,7 @@ async def test_sweep_retains_only_response_target_identity(
         _apply_migrations(conn)
         conn.execute("UPDATE dialog_directory_state SET account_id=1 WHERE singleton=1")
         conn.commit()
-        conn.execute("INSERT INTO dialogs(dialog_id,hidden) VALUES(?,1)", (dialog_id,))
+        conn.execute("INSERT INTO dialogs(dialog_id) VALUES(?)", (dialog_id,))
         conn.commit()
         enable_runtime_writes(conn)
         calls: list[object] = []
@@ -86,9 +86,8 @@ async def test_sweep_retains_only_response_target_identity(
         assert result.completed
         assert result.skip_reason is (SkipReason.NONE if with_message else SkipReason.HISTORY_FLOOR)
         assert len(calls) == 1
-        assert conn.execute("SELECT name,hidden FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        assert conn.execute("SELECT name FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
             "Real Name" if isinstance(target, User) else "Real Group",
-            1,
         )
         assert conn.execute("SELECT 1 FROM dialogs WHERE dialog_id=999").fetchone() is None
         assert not conn.in_transaction

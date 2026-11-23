@@ -469,6 +469,11 @@ class CanonicalDialogDirectory:
             "SELECT ?, dialog_id, revision, identity_revision, 0 FROM dialogs",
             (generation,),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO dialog_directory_baseline(generation,dialog_id,baseline_revision,baseline_identity_revision,seen,baseline_exists) "
+            "SELECT ?,dialog_id,0,0,0,0 FROM folder_peer_references WHERE account_id=(SELECT account_id FROM dialog_directory_state WHERE singleton=1)",
+            (generation,),
+        )
         # These keys describe the last *published* directory observation.
         # Starting (or later failing) a generation records only its attempt;
         # callers keep seeing the coherent prior publication until replacement.
@@ -1042,8 +1047,7 @@ class CanonicalDialogDirectory:
             "WHERE staged.generation=? AND staged.dialog_id=current.dialog_id AND staged.baseline_revision=dialog.revision",
             (generation,),
         )
-        # A previously hidden row can be re-seen after absence handling
-        # removed its facts row. Restore that row under the same revision fence.
+        # Insert missing eligibility facts under the same revision fence.
         conn.execute(
             "INSERT INTO dialog_directory_facts(dialog_id,category,archived,unread,mute_until,observed_at) "
             "SELECT staged.dialog_id,staged.eligibility_category,"
@@ -1074,7 +1078,7 @@ class CanonicalDialogDirectory:
             "unread_count_observed_at=CASE WHEN staged.unread_count_observation_order IS NULL AND staged.unread_count IS NOT NULL AND (current.unread_count_observed_at IS NULL OR current.unread_count_observed_at < staged.snapshot_at) THEN staged.snapshot_at ELSE current.unread_count_observed_at END, "
             "unread_mark=CASE WHEN staged.unread_mark_observation_order IS NULL AND staged.unread_mark IS NOT NULL AND (current.unread_mark_observed_at IS NULL OR current.unread_mark_observed_at < staged.snapshot_at) THEN staged.unread_mark ELSE current.unread_mark END, "
             "unread_mark_observed_at=CASE WHEN staged.unread_mark_observation_order IS NULL AND staged.unread_mark IS NOT NULL AND (current.unread_mark_observed_at IS NULL OR current.unread_mark_observed_at < staged.snapshot_at) THEN staged.snapshot_at ELSE current.unread_mark_observed_at END, "
-            f"hidden=CASE WHEN {not_access_lost_sql('current.dialog_id')} THEN 0 ELSE current.hidden END "
+            "needs_refresh=current.needs_refresh "
             "FROM dialog_directory_staging AS staged WHERE staged.generation=? AND staged.dialog_id=current.dialog_id "
             "AND staged.baseline_revision=current.revision",
             (generation,),
@@ -1093,11 +1097,11 @@ class CanonicalDialogDirectory:
         )
         inserted_ids = {dialog_id for (dialog_id,) in inserted_rows}
         conn.execute(
-            "INSERT INTO dialogs(dialog_id,archived,pinned,members,created,last_message_at,snapshot_at,hidden,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,read_inbox_max_id,read_outbox_max_id) "
+            "INSERT INTO dialogs(dialog_id,archived,pinned,members,created,last_message_at,snapshot_at,needs_refresh,unread_mentions_count,unread_reactions_count,unread_count,unread_mark,unread_count_observed_at,unread_mark_observed_at,read_inbox_max_id,read_outbox_max_id) "
             "SELECT staged.dialog_id,staged.archived,"
             "CASE WHEN EXISTS (SELECT 1 FROM dialog_directory_pins pin WHERE pin.generation=staged.generation AND pin.folder_id=0 AND pin.dialog_id=staged.dialog_id) THEN 1 ELSE 0 END,"
             "staged.members,staged.created,staged.last_message_at,"
-            "staged.snapshot_at,0,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
+            "staged.snapshot_at,0,staged.unread_mentions_count,staged.unread_reactions_count,staged.unread_count,staged.unread_mark,"
             "CASE WHEN staged.unread_count IS NULL THEN NULL ELSE staged.snapshot_at END,"
             "CASE WHEN staged.unread_mark IS NULL THEN NULL ELSE staged.snapshot_at END,"
             "staged.read_inbox_max_id,staged.read_outbox_max_id FROM dialog_directory_staging AS staged "
@@ -1206,7 +1210,12 @@ class CanonicalDialogDirectory:
 
     @staticmethod
     def _visible_count(conn: sqlite3.Connection) -> int:
-        row = cast(tuple[object] | None, conn.execute("SELECT COUNT(*) FROM dialogs WHERE hidden=0").fetchone())
+        row = cast(
+            tuple[object] | None,
+            conn.execute(
+                "SELECT COUNT(*) FROM dialogs d WHERE NOT EXISTS (SELECT 1 FROM dialog_listing_observations l JOIN dialog_directory_state s ON s.singleton=1 AND s.account_id=l.account_id WHERE l.dialog_id=d.dialog_id AND l.state='not_returned')"
+            ).fetchone(),
+        )
         return _required_int(row[0], "directory visible count") if row is not None else 0
 
     @staticmethod
@@ -1438,25 +1447,24 @@ def _publish_staged_read_cursors(conn: sqlite3.Connection, generation: int) -> N
 
 def _publish_directory_absence(conn: sqlite3.Connection, state: _DirectoryState, generation: int) -> None:
     require_write_transaction(conn)
-    observed_at = state.observation_started_at
-    if observed_at is None:
-        raise RuntimeError("complete directory generation has no observation start")
+    if state.observation_started_at is None or state.account_id is None:
+        raise RuntimeError("complete directory generation has no account or observation start")
     conn.execute(
-        "DELETE FROM dialog_directory_facts WHERE EXISTS ("
-        "SELECT 1 FROM dialog_directory_baseline baseline JOIN dialogs current ON current.dialog_id=baseline.dialog_id "
-        "WHERE baseline.generation=? AND baseline.dialog_id=dialog_directory_facts.dialog_id "
-        "AND baseline.seen=0 AND baseline.baseline_revision=current.revision "
-        "AND current.hidden=0)",
-        (generation,),
+        "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+        "SELECT ?,baseline.dialog_id,CASE WHEN baseline.seen=1 THEN 'returned' ELSE 'not_returned' END,"
+        "'completed_directory',?,? FROM dialog_directory_baseline baseline "
+        "LEFT JOIN dialogs d ON d.dialog_id=baseline.dialog_id "
+        "WHERE baseline.generation=? AND (d.dialog_id IS NULL OR (baseline.baseline_exists=1 AND d.revision=baseline.baseline_revision) OR baseline.seen=1) "
+        "ON CONFLICT(account_id,dialog_id) DO UPDATE SET state=excluded.state,source=excluded.source,"
+        "observed_at=excluded.observed_at,generation=excluded.generation",
+        (state.account_id, state.observation_started_at, generation, generation),
     )
     conn.execute(
-        "UPDATE dialogs AS current SET hidden=1, snapshot_at=? "
-        "WHERE current.hidden=0 AND EXISTS ("
-        "SELECT 1 FROM dialog_directory_baseline baseline "
-        "WHERE baseline.generation=? AND baseline.dialog_id=current.dialog_id "
-        "AND baseline.seen=0 AND baseline.baseline_revision=current.revision) "
-        f"AND {not_access_lost_sql('current.dialog_id')}",
-        (observed_at, generation),
+        "INSERT INTO dialog_listing_observations(account_id,dialog_id,state,source,observed_at,generation) "
+        "SELECT ?,dialog_id,'returned','completed_directory',?,? FROM dialog_directory_staging WHERE generation=? "
+        "ON CONFLICT(account_id,dialog_id) DO UPDATE SET state=excluded.state,source=excluded.source,"
+        "observed_at=excluded.observed_at,generation=excluded.generation",
+        (state.account_id, state.observation_started_at, generation, generation),
     )
 
 

@@ -31,8 +31,8 @@ def test_set_access_lost_atomic(sync_db: sqlite3.Connection) -> None:
     with sync_db:
         sync_db.execute("INSERT INTO synced_dialogs (dialog_id, status) VALUES (?, 'syncing')", (dialog_id,))
         sync_db.execute(
-            "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, snapshot_at, hidden, needs_refresh) "
-            "VALUES (?, 'Test', 'user', 0, 0, ?, 0, 0)",
+            "INSERT INTO dialogs (dialog_id, name, type, archived, pinned, snapshot_at, needs_refresh) "
+            "VALUES (?, 'Test', 'user', 0, 0, ?, 0)",
             (dialog_id, now - 1000),
         )
 
@@ -44,9 +44,8 @@ def test_set_access_lost_atomic(sync_db: sqlite3.Connection) -> None:
         "access_lost",
         now,
     )
-    assert sync_db.execute("SELECT hidden, snapshot_at FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-        1,
-        now,
+    assert sync_db.execute("SELECT snapshot_at FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        now - 1000,
     )
 
 

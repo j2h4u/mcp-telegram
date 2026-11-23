@@ -26,7 +26,7 @@ async def test_profile_waits_for_physical_claim_then_commits_self_pair(  # noqa:
     tmp_path: Path, wire: _WireHarness, response: str
 ) -> None:
     gate, sender, connection, sink = wire
-    conn, prior = _prepare(tmp_path / "profile.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "profile.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     _prepare_self(conn)
     writer = await SQLiteWriter.open(tmp_path / "profile.sqlite")

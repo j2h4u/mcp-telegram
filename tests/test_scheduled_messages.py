@@ -382,7 +382,7 @@ async def test_reconciliation_without_own_only_context_does_not_sweep_all_synced
 @pytest.mark.asyncio
 async def test_candidates_cover_directory_peers_and_archived_dialogs(conn: sqlite3.Connection) -> None:
     conn.executemany(
-        "INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES (?,?,1,1)",
+        "INSERT INTO dialogs(dialog_id,type,archived) VALUES (?,?,1)",
         [(7, "user"), (8, "bot"), (-9, "chat"), (-1_000_000_000_10, "channel")],
     )
     conn.commit()
@@ -566,7 +566,7 @@ def test_realtime_updates_coalesce_into_one_dirty_dialog(conn: sqlite3.Connectio
 @pytest.mark.asyncio
 async def test_reconciliation_processes_only_one_bounded_slice(conn: sqlite3.Connection) -> None:
     conn.executemany(
-        "INSERT INTO dialogs(dialog_id, type, hidden) VALUES (?, 'user', 0)",
+        "INSERT INTO dialogs(dialog_id, type) VALUES (?, 'user')",
         [(dialog_id,) for dialog_id in range(1, 6)],
     )
     conn.executemany(
@@ -634,7 +634,7 @@ async def test_concurrent_event_prevents_stale_snapshot_apply(conn: sqlite3.Conn
 
 @pytest.mark.asyncio
 async def test_continuity_gap_fences_snapshot_when_recovery_is_already_pending(conn: sqlite3.Connection) -> None:
-    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(42,'user',0)")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(42,'user')")
     conn.execute(
         "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,dirty_since,dirty_generation,updated_at,"
         "coverage_state,coverage_reason) VALUES(42,0,0,1,0,'unknown','baseline_unknown')"
@@ -731,7 +731,7 @@ def test_scheduled_discovery_status_wakes_for_unseeded_candidate_after_reopen(tm
     db_path = tmp_path / "cold-start.db"
     ensure_sync_schema(db_path)
     conn = _open_sync_db(db_path)
-    conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
+    conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
     conn.execute(
         "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (42, ?, 1)",
         ('["direct_message"]',),
@@ -795,7 +795,7 @@ async def test_scheduled_seed_receipt_allows_later_unseeded_candidate_under_real
                     self.shutdown.set()
 
     def enroll(dialog_id: int) -> None:
-        conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (?, 'user', 0)", (dialog_id,))
+        conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (?, 'user')", (dialog_id,))
         conn.execute(
             "INSERT INTO own_only_dialogs(dialog_id, inclusion_basis, updated_at) VALUES (?, ?, 1)",
             (dialog_id, '["direct_message"]'),
@@ -856,7 +856,7 @@ async def test_scheduled_seed_binds_account_before_directory_generation_exists(
     ).fetchone() == (42, None)
 
     conn.execute("UPDATE dialog_directory_publication SET account_id=42,generation=7 WHERE singleton=1")
-    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(43,'user',0)")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(43,'user')")
     conn.commit()
     published_seed = adapter.status(time.time())
     assert published_seed is not None and published_seed.selected is not None
@@ -1153,7 +1153,7 @@ async def test_scheduled_repair_adapter_runs_only_repair_rows_with_precise_scope
 async def test_scheduled_discovery_adapter_runs_only_discovery_rows_with_precise_scope(
     conn: sqlite3.Connection,
 ) -> None:
-    conn.execute("INSERT INTO dialogs(dialog_id, type, hidden) VALUES (42, 'user', 0)")
+    conn.execute("INSERT INTO dialogs(dialog_id, type) VALUES (42, 'user')")
     conn.execute(
         "INSERT INTO scheduled_reconciliation_state(dialog_id, repair_due_at, discovery_due_at, updated_at) "
         "VALUES (42, NULL, 0, 0)"
@@ -1326,7 +1326,7 @@ async def test_incomplete_scheduled_response_never_advances_authoritative_absenc
 ) -> None:
     now = 1_800_000_000
     monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: now)
-    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(42,'user',0)")
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(42,'user')")
     conn.execute(
         "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
         "VALUES(42,0,0,0)"
@@ -1374,7 +1374,7 @@ async def test_incomplete_scheduled_response_never_advances_authoritative_absenc
 @pytest.mark.asyncio
 async def test_access_loss_marks_scheduled_coverage_inaccessible(conn: sqlite3.Connection) -> None:
     dialog_id = -1_000_000_000_042
-    conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES(?,'channel',0)", (dialog_id,))
+    conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(?,'channel')", (dialog_id,))
     conn.execute(
         "INSERT INTO scheduled_reconciliation_state(dialog_id,repair_due_at,discovery_due_at,updated_at) "
         "VALUES(?,NULL,0,0)",
@@ -1393,13 +1393,13 @@ async def test_access_loss_marks_scheduled_coverage_inaccessible(conn: sqlite3.C
     await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
 
     assert conn.execute(
-        "SELECT coverage_state,coverage_reason,repair_due_at,discovery_due_at "
-        "FROM scheduled_reconciliation_state WHERE dialog_id=?",
+        "SELECT acquisition_block,coverage_reason FROM scheduled_reconciliation_state WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == ("unknown", None, None, 0)
-    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
-        "access_lost",
-    )
+    ).fetchone() == ("access_denied", "ChannelPrivateError")
+    assert conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() is None
+    assert len(client.requests) == 1
+    await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+    assert len(client.requests) == 1
 
 
 def test_permission_block_persists_and_only_changed_rights_rearm(tmp_path: Path) -> None:
@@ -1520,6 +1520,7 @@ def test_v94_lost_complete_baseline_requires_refresh_after_restore(
     from mcp_telegram.access_lifecycle import restore_access_after_revalidation
     from mcp_telegram.scheduled_commands import ScheduledCommandError, _current_state
 
+    current_schema_version = sync_db._CURRENT_SCHEMA_VERSION
     path = tmp_path / "lost-upgrade.db"
     monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", 94)
     ensure_sync_schema(path)
@@ -1552,6 +1553,12 @@ def test_v94_lost_complete_baseline_requires_refresh_after_restore(
         assert connection.execute(
             "SELECT text FROM scheduled_messages WHERE dialog_id=123 AND message_id=11"
         ).fetchone() == ("retained",)
+    finally:
+        connection.close()
+    monkeypatch.setattr(sync_db, "_CURRENT_SCHEMA_VERSION", current_schema_version)
+    ensure_sync_schema(path)
+    connection = _open_sync_db(path)
+    try:
         assert restore_access_after_revalidation(connection, 123, 30)
         with pytest.raises(ScheduledCommandError, match="baseline"):
             _current_state(connection, 42, 123, None)

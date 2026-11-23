@@ -73,6 +73,7 @@ from .sqlite_projection import (
     _DIALOG_DIRECTORY_PAGE_SQL,
     _DIALOG_DIRECTORY_UPPER_SQL,
     _FETCH_UNREAD_MESSAGES_SQL,
+    _FOLDER_DIALOG_ROWS_SQL,
     _GET_READ_POSITION_SQL,
     _LIST_DIALOG_MESSAGE_AGGREGATES_SQL,
     _LIST_DIALOGS_SQL,
@@ -1184,12 +1185,19 @@ class ReadingService:
         conn: sqlite3.Connection,
         request: _ListDialogsRequest,
         dialog_filter: _ListDialogsFilter,
+        req: dict,
     ) -> list[Mapping[str, object]]:
         params = {
             "archived_filter": 0 if request.exclude_archived else None,
             "pinned_filter": 0 if request.ignore_pinned else None,
         }
-        rows = _fetchall_rows(conn.execute(_LIST_DIALOGS_SQL, params))
+        folder_id = req.get("folder_id")
+        if folder_id is not None and folder_id != 1:
+            params.update(account_id=req.get("verified_account_id"), folder_id=folder_id)
+            sql = _FOLDER_DIALOG_ROWS_SQL + " ORDER BY d.pinned DESC, d.last_message_at DESC, m.dialog_id ASC"
+        else:
+            sql = _LIST_DIALOGS_SQL
+        rows = _fetchall_rows(conn.execute(sql, params))
         return [cast(Mapping[str, object], row) for row in rows]
 
     @staticmethod
@@ -1404,7 +1412,7 @@ class ReadingService:
             "type": row["type"],
             "topic_capability": row["topic_capability"],
             "last_message_at": row["last_message_at"],
-            "archived": bool(row["archived"]),
+            "archived": None if row["archived"] is None else bool(row["archived"]),
             # Telegram-authoritative dialog fact. NULL means this snapshot has
             # not observed a count; never infer it from local message rows.
             "unread_count": _object_to_int_or_none(row["unread_count"]),
@@ -1414,8 +1422,8 @@ class ReadingService:
             "access_lost_at": row["access_lost_at"],
             "unread_in": None,
             "unread_out": None,
-            "unread_mentions_count": _object_to_int(row["unread_mentions_count"], 0),
-            "unread_reactions_count": _object_to_int(row["unread_reactions_count"], 0),
+            "unread_mentions_count": _object_to_int_or_none(row["unread_mentions_count"]),
+            "unread_reactions_count": _object_to_int_or_none(row["unread_reactions_count"]),
             **ReadingService._dialog_lifecycle_fields(row, scheduled_summary, inclusion_basis),
         }
         if DialogType.parse(_object_to_str_or_none(row["type"])) == DialogType.USER:
@@ -3603,25 +3611,46 @@ class ReadingService:
             "archived_filter": 0 if request.exclude_archived else None,
             "pinned_filter": 0 if request.ignore_pinned else None,
         }
+        folder_id = req.get("folder_id")
+        folder_query = folder_id is not None and folder_id != 1
+        if folder_query:
+            params.update(account_id=account, folder_id=folder_id)
+        upper, after = ReadingService._directory_page_bounds(conn, req, params, folder_query, (account, fingerprint))
+        if upper is None:
+            return [], None
+        page_sql = (
+            _FOLDER_DIALOG_ROWS_SQL
+            + " AND m.dialog_id <= :upper_id"
+            + (" AND m.dialog_id > :after_id" if after is not None else "")
+            + " ORDER BY m.dialog_id ASC LIMIT 501"
+            if folder_query
+            else (_DIALOG_DIRECTORY_FIRST_PAGE_SQL if after is None else _DIALOG_DIRECTORY_PAGE_SQL)
+        )
+        return _fetchall_rows(
+            conn.execute(
+                page_sql,
+                {**params, "after_id": after, "upper_id": upper},
+            )
+        ), upper
+
+    @staticmethod
+    def _directory_page_bounds(
+        conn: sqlite3.Connection, req: dict, params: dict, folder_query: bool, navigation_scope: tuple[int, str]
+    ) -> tuple[int | None, int | None]:
+        account, fingerprint = navigation_scope
         navigation = req.get("navigation")
-        upper: int | None
-        after: int | None
         if navigation not in (None, "start"):
             cursor = decode_dialog_directory_navigation(navigation)
             if cursor.account_id != account or cursor.fingerprint != fingerprint:
                 raise ValueError("Navigation token belongs to a different account or selection")
-            upper, after = cursor.upper_dialog_id, cursor.last_dialog_id
-        else:
-            result = cast(tuple[int | None], conn.execute(_DIALOG_DIRECTORY_UPPER_SQL, params).fetchone())
-            upper, after = result[0], None
-        if upper is None:
-            return [], None
-        return _fetchall_rows(
-            conn.execute(
-                _DIALOG_DIRECTORY_FIRST_PAGE_SQL if after is None else _DIALOG_DIRECTORY_PAGE_SQL,
-                {**params, "after_id": after, "upper_id": upper},
-            )
-        ), upper
+            return cursor.upper_dialog_id, cursor.last_dialog_id
+        upper_sql = (
+            "SELECT MAX(dialog_id) FROM (" + _FOLDER_DIALOG_ROWS_SQL + ")"
+            if folder_query
+            else _DIALOG_DIRECTORY_UPPER_SQL
+        )
+        result = cast(tuple[int | None], conn.execute(upper_sql, params).fetchone())
+        return result[0], None
 
     def _directory_account_coverage(self, conn: sqlite3.Connection, account: int, directory: dict) -> dict[str, object]:
         result = self._scheduled_account_coverage(conn, account_id=account)
@@ -3696,7 +3725,7 @@ class ReadingService:
         rows = cast(
             list[tuple[int, object]],
             conn.execute(
-                "SELECT d.dialog_id, COALESCE(f.archived,d.archived) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE d.hidden=0 AND d.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
+                "SELECT d.dialog_id, COALESCE(f.archived,d.archived) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE d.dialog_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))",
                 (json.dumps(ids),),
             ).fetchall(),
         )
@@ -3788,18 +3817,7 @@ class ReadingService:
         ids: list[int],
         data: dict,
     ) -> None:
-        folder_id = req.get("folder_id")
-        folders = folders_by_dialog(conn, ids, account_id=account) if folder_id != 1 else {}
-        for dialog in data["dialogs"]:
-            dialog_id = dialog["id"]
-            placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog_id, [])
-            dialog.update(
-                folder_ids=[item["id"] for item in placements], folders=placements, is_self=dialog_id == account
-            )
-        data["folder_snapshot"] = folder_snapshot(
-            conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900), account_id=account
-        )
-        data["folder_membership_unknown_count"] = self._directory_folder_unknown_count(conn, folder_id, account)
+        self._decorate_dialog_facts(conn, req, account, account, data)
         data["navigation"] = {
             "has_more": has_more,
             "order": "dialog_id_asc",
@@ -3821,7 +3839,7 @@ class ReadingService:
             return cast(
                 tuple[int],
                 conn.execute(
-                    "SELECT COUNT(*) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE d.hidden=0 AND COALESCE(f.archived,d.archived) IS NULL"
+                    "SELECT COUNT(*) FROM dialogs d LEFT JOIN dialog_directory_facts f USING(dialog_id) WHERE COALESCE(f.archived,d.archived) IS NULL"
                 ).fetchone(),
             )[0]
         owner = cast(
@@ -3829,7 +3847,7 @@ class ReadingService:
             conn.execute("SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1").fetchone(),
         )
         if account_id is None or owner is None or owner[0] != account_id:
-            return cast(tuple[int], conn.execute("SELECT COUNT(*) FROM dialogs WHERE hidden=0").fetchone())[0]
+            return cast(tuple[int], conn.execute("SELECT COUNT(*) FROM dialogs").fetchone())[0]
         namespace = "default" if folder_id == 0 else "filter"
         return cast(
             tuple[int],
@@ -3910,7 +3928,7 @@ class ReadingService:
         dialog_filter = self._prepare_list_dialogs_filter(request.filter_raw)
         scheduled_summary, scheduled_coverage = self._legacy_scheduled_coverage(conn, directory_coverage)
         own_basis: dict[int, tuple[str, ...]] = self._own_only_basis_by_dialog(conn)
-        sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter)
+        sql_rows = self._fetch_list_dialog_rows(conn, request, dialog_filter, req)
         if not sql_rows:
             count_total = count_dialog_rows(conn)
             return self._empty_list_dialogs_response(
@@ -4005,17 +4023,28 @@ class ReadingService:
         return selected if raw_limit is None else selected[: _clamp(_coerce_int(raw_limit, 100), 1, 500)]
 
     def _decorate_legacy_dialogs(self, conn: sqlite3.Connection, req: dict, data: dict) -> None:
+        verified = req.get("verified_account_id")
+        account = verified if type(verified) is int and verified > 0 else None
+        self._decorate_dialog_facts(conn, req, account, self._deps.self_id, data)
+
+    def _decorate_dialog_facts(
+        self, conn: sqlite3.Connection, req: dict, account: int | None, self_id: int | None, data: dict
+    ) -> None:
+        from ..dialog_availability import read_dialog_availabilities
+
         folder = req.get("folder_id")
         folder_id = None if folder is None else int(folder)
         ids = [dialog["id"] for dialog in data["dialogs"]]
-        verified = req.get("verified_account_id")
-        account = verified if type(verified) is int and verified > 0 else None
         folders = folders_by_dialog(conn, ids, account_id=account) if folder_id != 1 else {}
+        availability = read_dialog_availabilities(conn, account, ids) if account is not None else {}
         for dialog in data["dialogs"]:
-            placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog["id"], [])
-            dialog["folder_ids"] = [item["id"] for item in placements]
-            dialog["folders"] = placements
-            dialog["is_self"] = dialog["id"] == self._deps.self_id
+            dialog_id = dialog["id"]
+            placements = [{"id": 1, "title": "Archived"}] if folder_id == 1 else folders.get(dialog_id, [])
+            dialog.update(
+                folder_ids=[item["id"] for item in placements], folders=placements, is_self=dialog_id == self_id
+            )
+            if dialog_id in availability:
+                dialog["availability"] = availability[dialog_id]
         data["folder_snapshot"] = folder_snapshot(
             conn, stale_after_seconds=req.get("folder_snapshot_stale_after_seconds", 900), account_id=account
         )

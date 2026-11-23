@@ -25,7 +25,7 @@ def test_finite_cohort_reconciles_all_candidates_and_then_stays_idle(
     conn = make_synced_db()
     with write_savepoint(conn):
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,type,name,hidden,archived) VALUES (?,?,?,1,1)",
+            "INSERT INTO dialogs(dialog_id,type,name,archived) VALUES (?,?,?,1)",
             ((peer, "bot" if peer % 2 else "user", f"Peer {peer}") for peer in range(1, 448)),
         )
         conn.executemany(
@@ -121,7 +121,7 @@ async def test_delivered_private_peer_admits_before_history_disabled_filter(
 
     conn = make_synced_db()
     with write_savepoint(conn):
-        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES(42,'user',1,1)")
+        conn.execute("INSERT INTO dialogs(dialog_id,type,archived) VALUES(42,'user',1)")
         conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES(42,0,1)")
     manager = make_manager(MagicMock(), conn, asyncio.Event())
     manager._self_id = 77

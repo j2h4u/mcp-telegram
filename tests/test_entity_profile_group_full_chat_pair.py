@@ -20,12 +20,13 @@ from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
 from mcp_telegram.entity_profile.repository import EntitySectionCommit
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.image_authorization import ScopeCell, ScopeToken
+from mcp_telegram.sync_db import _apply_migrations
 from mcp_telegram.telegram_demand import RpcAttemptBudgetExhaustedError, RpcReadTimeoutError
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.telethon_dialog import observe_dialog_identity
 from tests.demand_adapter_helpers import run_ready_slice
 from tests.helpers import ClientChatAvatarHistoryPort
-from tests.test_entity_profile_full_user_pair import _fenced_schema, _pair_service
+from tests.test_entity_profile_full_user_pair import _pair_service
 
 
 def _full_chat(
@@ -167,10 +168,8 @@ class _GroupProfilePort:
 
 def _service() -> tuple[sqlite3.Connection, DaemonEntityInfoService, _GroupClient]:
     conn = sqlite3.connect(":memory:")
-    _fenced_schema(conn, semantic=False)
-    conn.executescript(
-        "CREATE TABLE dialog_directory_state(singleton INTEGER PRIMARY KEY, account_id INTEGER); INSERT INTO dialog_directory_state VALUES(1,42); CREATE TABLE dialog_fact_observations(dialog_id INTEGER,field TEXT,observation_order INTEGER,PRIMARY KEY(dialog_id,field));"
-    )
+    _apply_migrations(conn)
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
     conn.execute("INSERT INTO entities VALUES (-123, 'group', 'Group', NULL, NULL, 1)")
     conn.commit()
     client = _GroupClient(_full_chat())
@@ -308,9 +307,9 @@ async def test_group_pair_sections_share_the_observation_boundary() -> None:
 
 
 @pytest.mark.asyncio
-async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() -> None:
+async def test_group_profile_refresh_fills_missing_dialog_created_once() -> None:
     conn, service, client = _service()
-    conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
+    conn.execute("INSERT INTO dialogs(dialog_id, created) VALUES (-123, NULL)")
     client.created = 1_700_000_000
     conn.commit()
 
@@ -328,7 +327,7 @@ async def test_group_profile_refresh_fills_missing_hidden_dialog_created_once() 
 
 def test_rejected_group_profile_cursor_cannot_mutate_dialog_created() -> None:
     conn, service, _client = _service()
-    conn.execute("INSERT INTO dialogs(dialog_id, created, hidden) VALUES (-123, NULL, 1)")
+    conn.execute("INSERT INTO dialogs(dialog_id, created) VALUES (-123, NULL)")
     cursor = service._profiles.next_due_refresh(now=100)  # type: ignore[attr-defined]
     assert cursor is not None
     conn.execute("UPDATE entity_profile_refresh_state SET generation=generation+1 WHERE entity_id=-123")
@@ -431,10 +430,10 @@ async def test_ordinary_completion_follow_up_starts_one_fenced_generation() -> N
     await run_ready_slice(adapter)
     detail_revision = conn.execute("SELECT profile_revision FROM entity_details WHERE entity_id=-123").fetchone()[0]
     assert conn.execute(
-        "SELECT generation, profile_revision, next_section, acquisition_cursor, follow_up_required "
+        "SELECT generation, profile_revision, acquisition_cursor, follow_up_required "
         "FROM entity_profile_refresh_state WHERE entity_id=-123"
-    ).fetchone() == (2, detail_revision, "avatar_history", 0, 0)
-    assert client.calls == ["full_chat", "search", "full_chat"]
+    ).fetchone() == (2, detail_revision, 0, 0)
+    assert client.calls == ["full_chat", "search"]
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 
@@ -597,7 +596,7 @@ async def test_group_pair_follow_up_carries_detail_revision_into_next_generation
         "FROM entity_profile_refresh_state WHERE entity_id=-123"
     ).fetchone() == ("pending", 2, detail_revision, "full_profile", 0, 0)
     await run_ready_slice(adapter)
-    assert client.calls == ["full_chat", "search", "full_chat"]
+    assert client.calls == ["full_chat", "search"]
     await service.shutdown()  # type: ignore[attr-defined]
     conn.close()
 

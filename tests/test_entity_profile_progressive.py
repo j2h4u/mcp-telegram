@@ -149,7 +149,18 @@ def _sections_schema(conn: sqlite3.Connection) -> None:
     with write_savepoint(conn):
         conn.execute(CONTACT_NOTE_RECEIPT_DDL)
         conn.execute(CONTACT_RECEIPT_DDL)
-        conn.execute("CREATE TABLE IF NOT EXISTS synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS dialog_listing_observations (account_id INTEGER, dialog_id INTEGER, state TEXT, source TEXT, observed_at INTEGER, generation INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS folder_peer_references (account_id INTEGER, dialog_id INTEGER, metadata_state TEXT, metadata_source TEXT, metadata_observed_at INTEGER, metadata_error_code TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_history_events (seq INTEGER PRIMARY KEY, dialog_id INTEGER, kind TEXT, reason_code TEXT, access_change_cause TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL, access_lost_at INTEGER, access_loss_scope TEXT, access_scope_observed_at INTEGER, access_loss_event_seq INTEGER)"
+        )
         conn.execute(
             """CREATE TABLE entity_detail_sections (
                 entity_id INTEGER NOT NULL, section TEXT NOT NULL, status TEXT NOT NULL,
@@ -702,7 +713,7 @@ async def test_channel_progressive_link_overlay_replaces_stale_and_unresolved_wi
     try:
         stale = {"id": -10043, "type": DialogType.CHANNEL.value, "linked_chat_id": -10088}
         sections: dict[str, dict[str, object]] = {section: {"status": "fresh"} for section in PROFILE_SECTIONS}
-        result = await service._progressive_result(-10043, stale, sections, now=100)
+        result = service._progressive_result(-10043, stale, sections, now=100)
         assert cast(dict[str, object], result["data"])["linked_chat_id"] is None
     finally:
         await service.shutdown()
@@ -803,7 +814,7 @@ async def test_durable_profile_publication_wakes_cold_adapter_for_local_link_enr
     linked_chat_id = -1000000000777
     with write_savepoint(conn):
         conn.execute(
-            "INSERT INTO dialogs(dialog_id, type, hidden, last_message_at) VALUES (?, 'channel', 0, 100)",
+            "INSERT INTO dialogs(dialog_id, type, last_message_at) VALUES (?, 'channel', 100)",
             (channel_id,),
         )
     with write_savepoint(conn):
@@ -2151,6 +2162,33 @@ async def test_local_read_keeps_existing_durable_refresh_enrollment_unchanged() 
         assert conn.total_changes == changes_before
         coordinator = service.refresh_coordinator
         assert coordinator is not None and coordinator.queue_depth == 0
+    finally:
+        await service.shutdown()
+        conn.close()
+
+
+async def test_known_folder_reference_is_inspectable_before_metadata() -> None:
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.execute(
+        "INSERT INTO folder_peer_references(account_id,dialog_id,kind,observation_order) VALUES(42,99,'user',1)"
+    )
+    conn.commit()
+    service = _test_service(conn, limits=RefreshLimits(), account_id=42)
+    service._deps = replace(service._deps, self_id=42)
+    try:
+        response = await service.get_entity_info({"entity_id": 99})
+        assert response["ok"] is True, response
+        data = cast(dict[str, object], response["data"])
+        assert data["type"] == "unknown"
+        assert cast(dict[str, object], data["dialog_placement"])["archived"] is None
+        wire = _entity_structured_content(
+            data=data, args=GetEntityInfo(exact_entity_id=99), entity_id=99, display_name="99", resolution="exact_id"
+        )
+        relationships = cast(dict[str, object], wire["relationships"])
+        contact = cast(dict[str, object], relationships["contact"])
+        assert contact["contact"] is None
+        assert contact["mutual_contact"] is None
     finally:
         await service.shutdown()
         conn.close()

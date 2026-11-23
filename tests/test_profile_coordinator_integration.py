@@ -40,7 +40,7 @@ class _CompletionRecorder:
 
 @pytest.mark.asyncio
 async def test_profile_slice_runs_under_real_coordinator_root_and_accepts_its_receipt(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "profile-coordinator.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "profile-coordinator.sqlite")
     service = raw_service
     shutdown = asyncio.Event()
     client = cast(_PairClient, service._deps.client)  # type: ignore[attr-defined]

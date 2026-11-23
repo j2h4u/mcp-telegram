@@ -42,7 +42,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AsyncExitStack, ExitStack
+from contextlib import AsyncExitStack, ExitStack, closing
 from contextvars import Context
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -1494,7 +1494,16 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         claim_scope=client.claim_image_scope,
     )
     group_profile_port = TelethonGroupProfileGateway(client)
-    user_profile_port = TelethonUserProfileGateway(client)
+    from .folders.references import read_folder_reference
+
+    reference_db_row = cast(tuple[int, str, str], conn.execute("PRAGMA database_list").fetchone())
+    reference_db_path = Path(reference_db_row[2])
+
+    def retained_reference(dialog_id: int) -> object:
+        with closing(open_sync_db_reader(reference_db_path)) as reader:
+            return read_folder_reference(reader, dialog_id, client.retained_auth_scope())
+
+    user_profile_port = TelethonUserProfileGateway(client, retained_reference=retained_reference)
     folder_receipts = FolderReceiptOwner(writer, client)
     client.register_native_write_domain(
         "folder",
@@ -1531,7 +1540,7 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
         capture_scope=client.capture_image_scope,
         claim_scope=client.claim_image_scope,
     )
-    channel_profile_port = TelethonChannelProfileGateway(client)
+    channel_profile_port = TelethonChannelProfileGateway(client, retained_reference=retained_reference)
     user_avatar_history_port = TelethonUserAvatarHistoryGateway(client)
     chat_avatar_history_port = TelethonChatAvatarHistoryGateway(client)
 
@@ -1650,9 +1659,6 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
             conn,
             shutdown_event,
             writer=writer,
-            access_loss_observer=lambda counts: rpc_admission_observer.observe_membership(
-                counts.as_observation(), source="access_loss"
-            ),
             handlers=(
                 MediaFactHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
                 RichCompositionHydrationHandler(batch_size=scheduling.fact_hydration.batch_size),
@@ -2053,7 +2059,6 @@ def _build_demand_runtime(
             activity_rpc_timeout_seconds=ctx.scheduling.activity_rpc_timeout_seconds,
         ),
         mutation_fence=ctx.scheduled_mutation_fence,
-        access_loss_observer=partial(_observe_access_loss, ctx.rpc_admission_observer),
     )
     if ctx.api_server.self_id is not None:
         scheduled_reconciler.bind_account_id(ctx.api_server.self_id)

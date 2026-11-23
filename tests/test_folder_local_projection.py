@@ -370,7 +370,7 @@ def test_default_uses_catalog_and_main_pin_order(tmp_path: Path) -> None:
                 [(40, "group", 0, 0, 0, 10), (10, "bot", 0, 1, 0, 10)],
             )
         with write_savepoint(conn):
-            conn.executemany("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (?, 'group', 0)", [(40,), (10,)])
+            conn.executemany("INSERT INTO dialogs(dialog_id,type) VALUES (?, 'group')", [(40,), (10,)])
         with write_savepoint(conn):
             conn.executemany(
                 "INSERT INTO dialog_directory_published_pins(folder_id,dialog_id,position) VALUES (0,?,?)",
@@ -390,7 +390,7 @@ def test_visible_dialog_without_eligibility_facts_is_not_omitted(tmp_path: Path)
     conn = _conn(tmp_path / "sync.db")
     try:
         with write_savepoint(conn):
-            conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (77,'user',0)")
+            conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (77,'user')")
         repo = SQLiteFolderSnapshotRepository(conn)
         default = FolderRule(0, "All chats", DEFAULT_FOLDER_NAMESPACE, FolderRuleKind.DEFAULT)
         filtered = FolderRule(2, "Contacts", categories=frozenset({DialogCategory.CONTACT}))
@@ -407,7 +407,7 @@ def test_default_excludes_archived_dialogs_and_marks_unknown_archive_unknown(tmp
     try:
         with write_savepoint(conn):
             conn.executemany(
-                "INSERT INTO dialogs(dialog_id,type,hidden,archived) VALUES (?,'user',0,?)",
+                "INSERT INTO dialogs(dialog_id,type,archived) VALUES (?,'user',?)",
                 [(1, 0), (2, 1), (3, 0)],
             )
         with write_savepoint(conn):
@@ -444,7 +444,7 @@ def test_mute_expiry_reprojects_without_rule_rpc(tmp_path: Path) -> None:
         with write_savepoint(conn):
             conn.execute("INSERT INTO dialog_directory_facts VALUES (1,'contact',0,1,200,10)")
         with write_savepoint(conn):
-            conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (1,'user',0)")
+            conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (1,'user')")
         repo = SQLiteFolderSnapshotRepository(conn)
         rule = FolderRule(1, "Unmuted", categories=frozenset({DialogCategory.CONTACT}), exclude_muted=True)
         repo.project_observation(_observation(rule), completed_at=100)

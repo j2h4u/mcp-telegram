@@ -52,7 +52,7 @@ async def test_api_enrollment_entities_and_trace_use_owner(tmp_path: Path) -> No
         assert (await service._resolve_trace_username("bob"))["account_id"] == 8
         result = await service._trace_enrich_one_candidate(
             target_user_id=7,
-            candidate={"dialog_id": 222, "topic_id": None, "strategy": "hidden"},
+            candidate={"dialog_id": 222, "topic_id": None, "strategy": "unsupported"},
             max_per_dialog=1,
             deadline_ms=1000,
             deadline_at=time.monotonic() + 1,

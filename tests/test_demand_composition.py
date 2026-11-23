@@ -52,6 +52,7 @@ from mcp_telegram.event_handlers import UpdateProcessingBarrier
 from mcp_telegram.fact_hydration import FactHydrationDemandAdapter
 from mcp_telegram.folders.contracts import FolderRuleObservation
 from mcp_telegram.folders.ports import FolderSnapshotRepository
+from mcp_telegram.folders.reference_demand import FolderPeerMetadataDemandAdapter
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.image_authorization import ActiveSources
 from mcp_telegram.message_fact_refresh import (
@@ -316,7 +317,7 @@ def composition_dependencies(
         cast(sqlite3.Connection, objects["conn"]).close()
 
 
-def test_access_loss_observer_reaches_each_durable_producer(
+def test_access_loss_observer_reaches_history_access_producers(
     composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
 ) -> None:
     class Observer:
@@ -335,8 +336,6 @@ def test_access_loss_observer_reaches_each_durable_producer(
         cast(DeltaGapFillDemandAdapter, adapters[DemandKind.DELTA_GAP_FILL])._access_loss_observer,
         cast(DeltaAccessProbeDemandAdapter, adapters[DemandKind.DELTA_ACCESS_PROBE])._access_loss_observer,
         cast(FullSyncDemandAdapter, adapters[DemandKind.FULL_SYNC_PAGE])._access_loss_observer,
-        cast(HotActivityDemandAdapter, adapters[DemandKind.HOT_ACTIVITY_PAGE]).access_loss_observer,
-        cast(ColdPeerPageDemandAdapter, adapters[DemandKind.COLD_PEER_PAGE]).access_loss_observer,
     )
     for callback in callbacks:
         assert callback is not None
@@ -363,6 +362,7 @@ def test_adapter_map_is_exact_against_literal_25_kind_class_map(
         DemandKind.FULL_SYNC_PAGE: FullSyncDemandAdapter,
         DemandKind.DIALOG_BOOTSTRAP: CanonicalDialogDirectoryDemandAdapter,
         DemandKind.DIALOG_LIGHT_RECONCILIATION: DialogLightReconciliationDemandAdapter,
+        DemandKind.FOLDER_PEER_METADATA: FolderPeerMetadataDemandAdapter,
         DemandKind.ARCHIVE_BACKFILL: ArchiveBackfillDemandAdapter,
         DemandKind.ARCHIVE_INCREMENTAL: ArchiveIncrementalDemandAdapter,
         DemandKind.COLD_PEER_PAGE: ColdPeerPageDemandAdapter,
@@ -378,7 +378,7 @@ def test_adapter_map_is_exact_against_literal_25_kind_class_map(
         DemandKind.SELF_PROFILE_MAINTENANCE: SelfProfileMaintenanceDemandAdapter,
         DemandKind.LINKED_CHAT_REFRESH: LinkedChatFactDemandAdapter,
     }
-    assert len(expected) == 25
+    assert len(expected) == 26
     assert set(adapters) == set(expected)
     assert {kind: type(adapter) for kind, adapter in adapters.items()} == expected
     assert all(getattr(adapter, "demand_kind", None) is kind for kind, adapter in adapters.items())

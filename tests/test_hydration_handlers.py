@@ -1045,17 +1045,17 @@ def test_transcription_apply_marks_malformed_results_terminal(
     assert db.execute("SELECT terminal FROM hydration_jobs").fetchone() == (1,)
 
 
-def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
+def test_denied_hydration_only_settles_requested_jobs(
     db: sqlite3.Connection,
 ) -> None:
     _seed_dialog(db, 1)
     _seed_dialog(db, 2)
     _seed_message(db, 1, dialog_id=1)
     _seed_message(db, 2, dialog_id=1)
-    _seed_message(db, 3, dialog_id=2)
+    _seed_message(db, 3, dialog_id=1)
     first = _enqueue(db, MEDIA_METADATA_KIND, 1, dialog_id=1, attempts=1)
     second = _enqueue(db, MEDIA_METADATA_KIND, 2, dialog_id=1, attempts=2)
-    third = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 3, dialog_id=2, attempts=1)
+    third = _enqueue(db, TRANSCRIPTION_HYDRATION_KIND, 3, dialog_id=1, attempts=1)
     db.commit()
     with write_transaction(db):
         queue = HydrationQueueRepository(db)
@@ -1078,29 +1078,29 @@ def test_access_loss_marks_dialogs_and_purges_all_active_hydration_jobs(
         backfill_debt_limit=1,
     )
 
-    outcome = worker._handle_access_lost(
+    outcome = worker._handle_batch_error(
         db,
-        cast(HydrationHandler, SimpleNamespace(kind=MEDIA_METADATA_KIND)),
-        [first, second, third],
-        [first, second, third],
+        cast(HydrationHandler, SimpleNamespace(kind=MEDIA_METADATA_KIND, is_terminal_error=lambda exc: False)),
+        [first, second],
+        [first, second],
         (
             HydrationDropObservation("ineligible", 99, TRANSCRIPTION_HYDRATION_KIND, 2, 0),
             HydrationDropObservation("ineligible", 100, None, 2, 0),
         ),
         ChatForbiddenError(request=None),
         20,
+        observation_order=0,
+        attempt_budget=None,
+        attempts_before_request=None,
+        scope=None,
     )
 
-    assert outcome.dropped == 5
-    assert dict(outcome.dropped_by_kind) == {
-        MEDIA_METADATA_KIND: 2,
-        TRANSCRIPTION_HYDRATION_KIND: 2,
-    }
+    assert outcome.dropped == 4
     assert db.execute("SELECT dialog_id, status, access_lost_at FROM synced_dialogs ORDER BY dialog_id").fetchall() == [
-        (1, "access_lost", 20),
-        (2, "access_lost", 20),
+        (1, "synced", None),
+        (2, "synced", None),
     ]
-    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE terminal = 0").fetchone() == (0,)
+    assert db.execute("SELECT COUNT(*) FROM hydration_jobs WHERE terminal = 0").fetchone() == (1,)
 
 
 @pytest.mark.asyncio

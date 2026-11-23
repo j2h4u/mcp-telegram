@@ -136,7 +136,7 @@ def test_reconcile_backfills_large_cohort_without_waiters_and_survives_restart(t
     _peer(conn, 301, kind="service")
     _peer(conn, 302, kind="group")
     with write_savepoint(conn):
-        conn.execute("UPDATE dialogs SET hidden=1,archived=1 WHERE dialog_id=240")
+        conn.execute("UPDATE dialogs SET archived=1 WHERE dialog_id=240")
     assert repo.reconcile_history_profiles(now=200, limit=32, pair_mode="enabled", self_id=None) == 0
     admitted = 0
     while count := repo.reconcile_history_profiles(now=200, limit=32, pair_mode="enabled", self_id=7):

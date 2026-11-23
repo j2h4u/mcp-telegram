@@ -19,16 +19,18 @@ from ..hydration_queue import (
 )
 from ..media_fact import MediaFact, decode_media_fact, encode_media_payload, is_transcribable_telegram_media
 from ..observation_order import hydration_observation_current
+from ..rich_hydration_policy import (
+    _FACT_HYDRATION_ELIGIBILITY_SQL,
+    _RICH_AUTOMATIC_DATE_SQL,
+    fact_hydration_eligible,
+    rich_composition_hydration_eligible,
+)
+from ..rich_hydration_policy import (
+    rich_composition_automatic_eligible as rich_composition_automatic_eligible,
+)
 
-# Automatic recovery is limited to messages sent or edited since May 2026.
-_RICH_AUTOMATIC_DATE_SQL = "(m.sent_at >= 1777593600 OR COALESCE(m.edit_date, 0) >= 1777593600)"
 _EMPTY_MEDIA_PAYLOAD = "{}"
 _FACT_HYDRATION_EMPTY_KINDS = frozenset(("contact", "other", "todo"))
-_FACT_HYDRATION_ELIGIBILITY_SQL = (
-    "SELECT 1 FROM synced_dialogs sd "
-    "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
-    "WHERE sd.dialog_id = ? AND sd.status IN ('syncing', 'synced')"
-)
 _TRANSCRIBABLE_MEDIA_SQL = (
     "(json_valid(m.media_payload) "
     "AND json_type(CASE WHEN json_valid(m.media_payload) THEN m.media_payload ELSE '{}' END) = 'object' "
@@ -119,11 +121,6 @@ def _is_canonical_media_pair(kind: object, payload: object, *, fact: MediaFact |
     return isinstance(payload, str) and decoded is not None and encode_media_payload(decoded) == payload
 
 
-def fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int) -> bool:
-    """Return whether the dialog currently permits full-history hydration."""
-    return conn.execute(_FACT_HYDRATION_ELIGIBILITY_SQL, (dialog_id,)).fetchone() is not None
-
-
 def media_fact_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Return whether one unresolved media message may be hydrated now."""
     return (
@@ -149,31 +146,6 @@ def rich_composition_is_unknown(conn: sqlite3.Connection, dialog_id: int, messag
         ).fetchone(),
     )
     return row is not None and row[0] is None
-
-
-def rich_composition_hydration_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
-    """Only retained, undeleted unknown compositions in enrolled dialogs need recovery."""
-    return (
-        conn.execute(
-            "SELECT 1 FROM messages m WHERE m.dialog_id=? AND m.message_id=? "
-            "AND m.is_deleted=0 AND (m.rich_message IS NULL OR json_extract(m.rich_message,'$.part')=1) "
-            "AND EXISTS (" + _FACT_HYDRATION_ELIGIBILITY_SQL + ")",
-            (dialog_id, message_id, dialog_id),
-        ).fetchone()
-        is not None
-    )
-
-
-def rich_composition_automatic_eligible(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
-    """Retain partial compositions of any age, and recent unknown compositions."""
-    return (
-        conn.execute(
-            "SELECT 1 FROM messages m WHERE m.dialog_id=? AND m.message_id=? AND "
-            "(m.rich_message IS NOT NULL OR " + _RICH_AUTOMATIC_DATE_SQL + ")",
-            (dialog_id, message_id),
-        ).fetchone()
-        is not None
-    )
 
 
 def request_rich_composition_repair(

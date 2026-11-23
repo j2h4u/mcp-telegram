@@ -177,6 +177,7 @@ class DemandKind(StrEnum):
     FULL_SYNC_PAGE = "full_sync_page"
     DIALOG_BOOTSTRAP = "dialog_bootstrap"
     DIALOG_LIGHT_RECONCILIATION = "dialog_light_reconciliation"
+    FOLDER_PEER_METADATA = "folder_peer_metadata"
     ARCHIVE_BACKFILL = "archive_backfill"
     ARCHIVE_INCREMENTAL = "archive_incremental"
     COLD_PEER_PAGE = "cold_peer_page"
@@ -218,6 +219,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.FULL_SYNC_PAGE,
     DemandKind.DIALOG_BOOTSTRAP,
     DemandKind.DIALOG_LIGHT_RECONCILIATION,
+    DemandKind.FOLDER_PEER_METADATA,
     DemandKind.ARCHIVE_BACKFILL,
     DemandKind.ARCHIVE_INCREMENTAL,
     DemandKind.COLD_PEER_PAGE,
@@ -233,7 +235,7 @@ DURABLE_DEMAND_ORDER: tuple[DemandKind, ...] = (
     DemandKind.DRAFT_SNAPSHOT,
     DemandKind.LINKED_CHAT_REFRESH,
 )
-_EXPECTED_DURABLE_DEMAND_COUNT = 25
+_EXPECTED_DURABLE_DEMAND_COUNT = 26
 
 
 class ExecutionMode(StrEnum):
@@ -968,6 +970,12 @@ _DEMAND_CONTRACTS: dict[DemandKind, DemandContract] = {
         TelegramRpcSource.DIALOG_SYNC,
         _DURABLE,
         max_rpc_attempts_per_slice=8,
+    ),
+    DemandKind.FOLDER_PEER_METADATA: _contract(
+        DemandKind.FOLDER_PEER_METADATA,
+        TelegramRpcSource.DIALOG_SYNC,
+        _DURABLE,
+        max_rpc_attempts_per_slice=1,
     ),
     DemandKind.ARCHIVE_BACKFILL: _contract(
         DemandKind.ARCHIVE_BACKFILL,

@@ -24,7 +24,7 @@ from tests.test_demand_composition import composition_dependencies as compositio
 
 def _seed_dialog(conn: sqlite3.Connection) -> None:
     with write_transaction(conn):
-        conn.execute("INSERT INTO dialogs(dialog_id,type,hidden) VALUES (42,'user',0)")
+        conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES (42,'user')")
 
 
 async def _run_local_seed(adapter: DurableDemandAdapter) -> WorkRevision:

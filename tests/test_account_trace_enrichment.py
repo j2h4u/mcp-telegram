@@ -359,7 +359,7 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(
     assert strategies["group"] == "author_search"
     assert strategies["channel"] == "signature_only"
 
-    seed_dialog(conn, dialog_id=-2001, name="Hidden", dialog_type="Group", hidden=1)
+    seed_dialog(conn, dialog_id=-2001, name="Hidden", dialog_type="Group")
     seed_synced_dialog(conn, dialog_id=-2001)
     seed_dialog(conn, dialog_id=-2002, name="Lost", dialog_type="Group")
     seed_synced_dialog(conn, dialog_id=-2002, status="access_lost")
@@ -374,7 +374,6 @@ def test_trace_candidate_dialogs_are_bounded_visible_and_strategy_labeled(
     )
 
     ids = [candidate["dialog_id"] for candidate in candidates]
-    assert -2001 not in ids
     assert -2002 not in ids
     assert len(candidates) == 10
     assert candidates == _trace_candidate_dialogs(

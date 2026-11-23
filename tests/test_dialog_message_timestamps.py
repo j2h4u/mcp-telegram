@@ -24,7 +24,8 @@ async def test_dialog_list_uses_only_stored_message_time_and_keeps_observation_t
         )
         result = await make_server(conn)._list_dialogs({})
         rows = result["data"]["dialogs"]
-        assert [row["id"] for row in rows] == [1, 2, 3, 4, 5, 6]
+        # Unknown pin status sorts after all known unpinned dialogs.
+        assert [row["id"] for row in rows] == [1, 2, 4, 5, 3, 6]
         by_id = {row["id"]: row for row in rows}
         assert [by_id[dialog_id]["last_message_at"] for dialog_id in (1, 2, 3, 4, 5, 6)] == [
             100,

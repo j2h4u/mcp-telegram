@@ -125,15 +125,15 @@ def folder_summaries(conn: FolderReadConnection, *, account_id: int | None) -> l
             conn.execute(
                 """SELECT f.folder_id,
                           f.title,
-                          COUNT(d.dialog_id),
-                          COALESCE(SUM(CASE WHEN COALESCE(d.unread_count, 0) > 0 THEN 1 ELSE 0 END), 0),
-                          COALESCE(SUM(COALESCE(d.unread_count, 0)), 0),
+                          COUNT(fm.dialog_id),
+                          CASE WHEN COUNT(fm.dialog_id) <> COUNT(d.unread_count) THEN NULL ELSE COALESCE(SUM(CASE WHEN d.unread_count > 0 THEN 1 ELSE 0 END), 0) END,
+                          CASE WHEN COUNT(fm.dialog_id) <> COUNT(d.unread_count) THEN NULL ELSE COALESCE(SUM(d.unread_count), 0) END,
                           MAX(d.last_message_at),
                           (SELECT COUNT(*) FROM telegram_folder_local_members unknown
                            WHERE unknown.namespace=f.namespace AND unknown.folder_id=f.folder_id AND unknown.state='unknown')
                    FROM telegram_folder_rules AS f
                    LEFT JOIN telegram_folder_local_members AS fm ON fm.namespace=f.namespace AND fm.folder_id=f.folder_id AND fm.state='present'
-                   LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id AND d.hidden=0
+                   LEFT JOIN dialogs AS d ON d.dialog_id = fm.dialog_id
                    WHERE f.deleted=0 AND f.catalog_member IS NOT 0 AND f.account_id=? AND f.account_id=(
                        SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1)
                    GROUP BY f.namespace, f.folder_id, f.title, f.source_position
@@ -153,8 +153,8 @@ def folder_summaries(conn: FolderReadConnection, *, account_id: int | None) -> l
             "id": int(folder_id),
             "title": str(title),
             "dialog_count": int(dialog_count),
-            "unread_dialog_count": int(unread_dialog_count),
-            "unread_count": int(unread_count),
+            "unread_dialog_count": None if unread_dialog_count is None else int(unread_dialog_count),
+            "unread_count": None if unread_count is None else int(unread_count),
             "last_message_at": None if last_message_at is None else int(last_message_at),
             "unknown_membership_count": int(unknown_membership_count),
         }
@@ -175,7 +175,6 @@ def folders_by_dialog(
                 """SELECT f.folder_id, f.title, m.dialog_id
                    FROM telegram_folder_rules AS f
                    JOIN telegram_folder_local_members AS m ON m.namespace=f.namespace AND m.folder_id=f.folder_id
-                   JOIN dialogs AS d ON d.dialog_id=m.dialog_id AND d.hidden=0
                    WHERE m.state='present'
                    AND f.deleted=0 AND f.catalog_member IS NOT 0 AND f.account_id=? AND f.account_id=(
                        SELECT account_id FROM telegram_folder_projection_state WHERE singleton=1)
@@ -223,6 +222,6 @@ def dialog_placement(conn: FolderReadConnection, dialog_id: int, *, account_id: 
             raise
         rows = []
     return {
-        "archived": bool(archived_row[0]) if archived_row is not None else False,
+        "archived": bool(archived_row[0]) if archived_row is not None and archived_row[0] is not None else None,
         "folders": [{"id": int(row[0]), "title": str(row[1])} for row in rows],
     }

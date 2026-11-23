@@ -59,7 +59,9 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "drafts/ports.py",  # Transaction-local projection binding to the shared SQLite owner.
             "dialog_sync.py",
             "dialog_directory.py",
+            "dialog_targeted_metadata.py",  # Guarded targeted dialog publication.
             "dialog_directory_coverage.py",
+            "dialog_availability.py",  # Account-scoped availability reads.
             "entity_store.py",
             "event_handlers.py",
             "fact_hydration.py",
@@ -75,6 +77,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "contacts/refresh.py",  # Bounded contact catalogue publication.
             "contacts/repository.py",  # Local account-scoped contact catalogue.
             "contacts/state.py",  # Canonical contact command-state projection.
+            "folders/references.py",  # Canonical account-scoped folder references.
+            "folders/reference_demand.py",  # Bounded metadata acquisition and writer callbacks.
             "folders/command_receipts.py",  # Durable folder attempt and verification receipts.
             "folders/commands.py",  # Folder command owner and writer-bound preclaim.
             "folders/sqlite_repository.py",
@@ -85,6 +89,8 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "message_history/identity_intake.py",  # Account-fenced history identity transaction owner.
             "history_enrollment.py",
             "hydration_queue.py",
+            "observation_order.py",  # SQLite observation fence.
+            "rich_hydration_policy.py",  # Shared hydration eligibility queries.
             "hydration_progress.py",  # Read-only queue snapshots and scan-completion evidence.
             "image_authorization.py",  # Connection-bound active-target revocation registry.
             "peer_access.py",  # Connection-bound peer access revocation registry.
@@ -147,6 +153,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "daemon_entity_info.py",
             "dialog_sync.py",
             "dialog_directory.py",
+            "dialog_targeted_metadata.py",  # Guarded targeted dialog publication.
             "dialog_directory_tl.py",
             "drafts/telethon_adapter.py",
             "drafts/snapshot.py",  # Private native composition codec and request construction.
@@ -163,6 +170,7 @@ ALLOWED_IMPORTER_PATHS: Mapping[str, frozenset[str]] = {
             "contacts/refresh.py",  # Bounded native contact catalogue acquisition.
             "folders/commands.py",  # Native folder reconstruction through the sole gateway.
             "folders/telegram_adapter.py",
+            "folders/reference_demand.py",  # Native peer lookup through the shared gateway.
             "entity_profile/updates.py",  # Normalizes supplied Telegram updates; never acquires remotely.
             "messages/telegram_adapter.py",
             "media_hydration.py",  # Bounded rich-message acquisition through the shared RPC gateway.

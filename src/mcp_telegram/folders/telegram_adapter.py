@@ -11,6 +11,7 @@ from telethon.tl import types as tl  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import GetDialogFiltersRequest  # type: ignore[import-untyped]
 from telethon.tl.types import DialogFilter, DialogFilterChatlist, DialogFilterDefault  # type: ignore[import-untyped]
 
+from ..entity_profile.contracts import ChannelReference, GroupReference, UserReference
 from ..flood import TelegramRpcThrottled
 from ..message_composition import normalize_telegram_fact
 from .contracts import (
@@ -37,6 +38,19 @@ def _peer_ids(peers: object) -> tuple[int, ...]:
     if not isinstance(peers, (list, tuple)):
         raise TypeError("folder peer list is unavailable")
     return tuple(int(telethon_utils.get_peer_id(peer)) for peer in peers)
+
+
+def _references(folder: object) -> tuple[UserReference | ChannelReference | GroupReference, ...]:
+    references: list[UserReference | ChannelReference | GroupReference] = []
+    for attr in ("include_peers", "pinned_peers", "exclude_peers"):
+        for peer in cast(Sequence[object], getattr(folder, attr, ())):
+            if isinstance(peer, tl.InputPeerUser):
+                references.append(UserReference(peer.user_id, peer.access_hash))
+            elif isinstance(peer, tl.InputPeerChannel):
+                references.append(ChannelReference(int(telethon_utils.get_peer_id(peer)), peer.access_hash))
+            elif isinstance(peer, tl.InputPeerChat):
+                references.append(GroupReference(-peer.chat_id))
+    return tuple(references)
 
 
 def _categories(folder: object) -> frozenset[DialogCategory]:
@@ -104,7 +118,9 @@ def folder_update_from_native(update: object) -> FolderRuleUpdate:
         rule = None if update.filter is None else _folder_rule(update.filter, None)
         if update.filter is not None and (rule is None or not rule.complete or rule.folder_id != update.id):
             return FolderRuleUpdate("invalid")
-        return FolderRuleUpdate("filter", folder_id=update.id, rule=rule)
+        return FolderRuleUpdate(
+            "filter", folder_id=update.id, rule=rule, references=() if rule is None else _references(update.filter)
+        )
     if isinstance(update, tl.UpdateDialogFilterOrder):
         return FolderRuleUpdate("order", order=tuple(update.order))
     return FolderRuleUpdate("invalid")
@@ -147,7 +163,13 @@ class TelethonTelegramFolderGateway(TelegramFolderGateway):
             rule for position, item in enumerate(raw_filters) if (rule := _folder_rule(item, position)) is not None
         )
         complete = len(rules) == len(raw_filters) and all(rule.complete for rule in rules)
-        return FolderRuleObservation(rules, _observation_token(rules), started_at, complete)
+        references = tuple(
+            (rule.folder_id, ref)
+            for item in raw_filters
+            if (rule := _folder_rule(item, None)) is not None
+            for ref in _references(item)
+        )
+        return FolderRuleObservation(rules, _observation_token(rules), started_at, complete, references)
 
 
 def _as_int(value: object) -> int:

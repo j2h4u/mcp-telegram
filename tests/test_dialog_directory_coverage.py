@@ -75,7 +75,9 @@ def test_coverage_identity_column_fault_propagates() -> None:
             "CREATE TABLE dialog_directory_state ("
             "singleton INTEGER PRIMARY KEY, status TEXT, reason TEXT, observation_started_at INTEGER)"
         )
-        conn.execute("CREATE TABLE dialogs (hidden INTEGER, identity_complete INTEGER)")
+        conn.execute("CREATE TABLE dialogs (dialog_id INTEGER, identity_complete INTEGER)")
+        conn.execute("CREATE TABLE dialog_listing_observations (dialog_id INTEGER, account_id INTEGER, state TEXT)")
+        conn.execute("ALTER TABLE dialog_directory_state ADD COLUMN account_id INTEGER")
         with pytest.raises(sqlite3.OperationalError, match="no such column: d.identity_observed_at"):
             read_dialog_directory_coverage(conn)
     finally:
@@ -92,7 +94,7 @@ def test_published_directory_age_uses_acquisition_start_at_exact_stale_boundary(
             (9000,),
         )
         conn.execute(
-            "INSERT INTO dialogs(dialog_id,type,identity_complete,identity_observed_at,hidden) VALUES (1,'user',1,100,0)"
+            "INSERT INTO dialogs(dialog_id,type,identity_complete,identity_observed_at) VALUES (1,'user',1,100)"
         )
         assert read_dialog_directory_coverage(conn, now=999).to_wire()["status"] == "complete"
         assert read_dialog_directory_coverage(conn, now=999).to_wire()["age_seconds"] == 899
@@ -129,8 +131,13 @@ def test_lookup_coverage_uses_only_visible_published_candidates_and_exposes_reas
         )
         conn.execute("UPDATE dialog_directory_state SET status='incomplete',reason='ordinary:TimeoutError'")
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,type,identity_complete,identity_observed_at,hidden) VALUES (?,?,?,?,?)",
-            [(1, "user", 1, 100, 0), (2, "user", 0, None, 1), (3, "unknown", 0, None, 1)],
+            "INSERT INTO dialogs(dialog_id,type,identity_complete,identity_observed_at) VALUES (?,?,?,?)",
+            [(1, "user", 1, 100), (2, "user", 0, None), (3, "unknown", 0, None)],
+        )
+        conn.execute("UPDATE dialog_directory_state SET account_id=10")
+        conn.executemany(
+            "INSERT INTO dialog_listing_observations VALUES (10,?,'not_returned','completed_directory',100,3)",
+            [(2,), (3,)],
         )
         conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (2,'access_lost')")
         coverage = read_dialog_directory_coverage(conn, now=200)

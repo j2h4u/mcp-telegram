@@ -11,8 +11,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
-from .access_lifecycle import set_access_lost
-from .entity_profile.membership import MembershipSignalCounts
 from .entity_profile.repository import bound_profile_account
 from .flood import TelegramRpcThrottled
 from .hydration_queue import (
@@ -23,7 +21,6 @@ from .hydration_queue import (
     HydrationOutcome,
     HydrationPriority,
     HydrationQueueRepository,
-    HydrationQueueSummary,
 )
 from .image_authorization import ScopeToken
 from .messages.sqlite_bundle import ReceivedMessageScopeChangedError, persist_received_messages
@@ -172,7 +169,6 @@ class _BatchOutcome:
     retried: int = 0
     dropped: int = 0
     stopped: bool = False
-    dropped_by_kind: tuple[tuple[str, int], ...] = ()
     committed_revision: str | None = None
     terminal_revision: str | None = None
     deferred_error: Exception | None = None
@@ -444,14 +440,12 @@ class MessageFactHydrationWorker:
         backfill_debt_limit: int,
         clock: Callable[[], float] = time.time,
         profile_owner_account_id: int | None = None,
-        access_loss_observer: Callable[[MembershipSignalCounts], None] | None = None,
     ) -> None:
         del circuit_retry_seconds, retry_delay_seconds
         self._client = client
         self._conn = conn
         self._writer = writer
         self._profile_owner_account_id = profile_owner_account_id
-        self._access_loss_observer = access_loss_observer
         self._shutdown_event = shutdown_event
         self._handlers: dict[str, HydrationHandler] = {}
         for handler in handlers:
@@ -676,7 +670,6 @@ class MessageFactHydrationWorker:
             return _BatchOutcome(dropped=len(preflight_observations))
         if scope is not None and not cast(_ScopeClient, self._client).claim_image_scope(scope):
             raise ReceivedMessageScopeChangedError
-        owner = self._profile_owner_account_id
         attempts_before_request = None if attempt_budget is None else attempt_budget.attempts
         assert observation_order is not None
         failure: Exception | None = None
@@ -706,7 +699,6 @@ class MessageFactHydrationWorker:
                 observation_order,
                 attempt_budget,
                 attempts_before_request,
-                owner,
                 scope,
                 reaction_boundary,
             )
@@ -777,7 +769,6 @@ class MessageFactHydrationWorker:
         observation_order: int,
         attempt_budget: RpcAttemptBudget | None,
         attempts_before_request: int | None,
-        owner: int | None,
         scope: ScopeToken | None,
         reaction_boundary: ReactionObservationBoundary | None,
     ) -> _BatchOutcome:
@@ -788,8 +779,7 @@ class MessageFactHydrationWorker:
             handler, started, observation_order, failed=failure is not None, scope=scope
         )
         if failure is not None:
-            membership_counts: list[MembershipSignalCounts] = []
-            outcome = await self._writer.run(
+            return await self._writer.run(
                 lambda conn: self._handle_batch_error(
                     conn,
                     handler,
@@ -801,13 +791,9 @@ class MessageFactHydrationWorker:
                     observation_order=observation_order,
                     attempt_budget=attempt_budget,
                     attempts_before_request=attempts_before_request,
-                    owner=owner,
-                    membership_counts=membership_counts,
                     scope=scope,
                 )
             )
-            self._report_access_loss(membership_counts)
-            return outcome
         return await self._writer.run(
             lambda conn: self._apply_batch_result(
                 conn,
@@ -830,15 +816,6 @@ class MessageFactHydrationWorker:
         if scope is None or scope.scope.account_id != self._profile_owner_account_id:
             raise RuntimeError("media hydration scope unavailable")
         return scope
-
-    def _report_access_loss(self, observations: Sequence[MembershipSignalCounts]) -> None:
-        if self._access_loss_observer is None:
-            return
-        for counts in observations:
-            try:
-                self._access_loss_observer(counts)
-            except Exception:  # noqa: BLE001 - telemetry cannot change queue ownership
-                logger.debug("access_loss_observer_failed")
 
     async def _requeue_obsolete_observations(
         self,
@@ -875,8 +852,6 @@ class MessageFactHydrationWorker:
         observation_order: int,
         attempt_budget: RpcAttemptBudget | None,
         attempts_before_request: int | None,
-        owner: int | None,
-        membership_counts: list[MembershipSignalCounts],
         scope: ScopeToken | None,
     ) -> _BatchOutcome:
         if isinstance(
@@ -926,20 +901,6 @@ class MessageFactHydrationWorker:
                 )
                 self._require_media_scope(conn, scope)
             raise exc
-        if isinstance(exc, ACCESS_LOST_ERRORS):
-            return self._handle_access_lost(
-                conn,
-                handler,
-                batch,
-                started,
-                preflight_observations,
-                exc,
-                effective_now,
-                observation_order=observation_order,
-                owner=owner,
-                membership_counts=membership_counts,
-                scope=scope,
-            )
         return self._handle_request_error(
             conn,
             handler,
@@ -948,6 +909,7 @@ class MessageFactHydrationWorker:
             preflight_observations,
             exc,
             effective_now,
+            terminal=isinstance(exc, ACCESS_LOST_ERRORS) or handler.is_terminal_error(exc),
             observation_order=observation_order,
             scope=scope,
         )
@@ -1329,60 +1291,6 @@ class MessageFactHydrationWorker:
             stopped=True,
         )
 
-    def _handle_access_lost(  # noqa: PLR0913, PLR0917
-        self,
-        conn: sqlite3.Connection,
-        handler: HydrationHandler,
-        batch: Sequence[HydrationJob],
-        started: Sequence[HydrationJob],
-        preflight_observations: Sequence[HydrationDropObservation],
-        exc: BaseException,
-        effective_now: int,
-        *,
-        observation_order: int | None = None,
-        owner: int | None = None,
-        membership_counts: list[MembershipSignalCounts] | None = None,
-        scope: ScopeToken | None = None,
-    ) -> _BatchOutcome:
-        descriptor = describe_telegram_rpc_error(exc)
-        self._log_drops(batch, preflight_observations)
-        with write_transaction(conn):
-            self._require_media_scope(conn, scope)
-            dialog_ids = tuple(
-                dict.fromkeys(job.dialog_id for job in self._current_jobs(conn, started, observation_order))
-            )
-            summaries = tuple(
-                summary
-                for dialog_id in dialog_ids
-                for summary in HydrationQueueRepository(conn).summarize_for_dialog(dialog_id)
-            )
-            for dialog_id in dialog_ids:
-                counts = set_access_lost(
-                    conn,
-                    dialog_id,
-                    effective_now,
-                    reason=descriptor.error_type,
-                    profile_owner_account_id=owner,
-                    observation_order=observation_order,
-                    membership_revision_at=effective_now,
-                    processing_at=int(self._clock()),
-                ).membership_counts
-                if membership_counts is not None:
-                    membership_counts.append(counts)
-            self._require_media_scope(conn, scope)
-        self._log_summaries(summaries, descriptor)
-        drop_counts: dict[str, int] = defaultdict(int)
-        for summary in summaries:
-            drop_counts[summary.kind] += summary.job_count
-        for observation in preflight_observations:
-            if observation.kind is not None:
-                drop_counts[observation.kind] += 1
-        dropped_by_kind = tuple(drop_counts.items())
-        return _BatchOutcome(
-            dropped=len(preflight_observations) + sum(summary.job_count for summary in summaries),
-            dropped_by_kind=dropped_by_kind,
-        )
-
     def _handle_request_error(  # noqa: PLR0913, PLR0917
         self,
         conn: sqlite3.Connection,
@@ -1393,11 +1301,12 @@ class MessageFactHydrationWorker:
         exc: BaseException,
         effective_now: int,
         *,
+        terminal: bool,
         observation_order: int | None = None,
         scope: ScopeToken | None = None,
     ) -> _BatchOutcome:
         descriptor = describe_telegram_rpc_error(exc)
-        if handler.is_terminal_error(exc):
+        if terminal:
             committed_revision: str | None = None
             with write_transaction(conn):
                 self._require_media_scope(conn, scope)
@@ -1624,25 +1533,6 @@ class MessageFactHydrationWorker:
     ) -> None:
         for drop in self._aggregate_drops(jobs, observations, descriptor):
             self._emit_drop(drop)
-
-    def _log_summaries(
-        self, summaries: Sequence[HydrationQueueSummary], descriptor: TelegramRpcErrorDescriptor
-    ) -> None:
-        for summary in summaries:
-            self._emit_drop(
-                HydrationDrop(
-                    reason="access_lost",
-                    kind=summary.kind,
-                    dialog_id=summary.dialog_id,
-                    job_count=summary.job_count,
-                    message_ids=summary.message_ids,
-                    attempts_min=summary.attempts_min,
-                    attempts_max=summary.attempts_max,
-                    error_type=descriptor.error_type,
-                    rpc_code=descriptor.code,
-                    rpc_symbol=descriptor.symbol,
-                )
-            )
 
     @staticmethod
     def _emit_drop(drop: HydrationDrop) -> None:

@@ -22,7 +22,7 @@ from tests.test_telegram_demand_coordinator import _adapters, _Clock
 
 @pytest.mark.asyncio
 async def test_coordinator_retries_persisted_timeout_after_backoff(tmp_path: Path) -> None:
-    conn, prior = _prepare(tmp_path / "coordinator.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "coordinator.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
 
     class FlakyClient(_PairClient):
@@ -102,7 +102,7 @@ async def test_coordinator_retries_persisted_timeout_after_backoff(tmp_path: Pat
 async def test_full_user_failure_receipt_classifies_only_transient_reads(
     tmp_path: Path, error: Exception, expected: SliceOutcomeKind
 ) -> None:
-    conn, prior = _prepare(tmp_path / "profile.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "profile.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
 
     class FailingClient(_PairClient):
@@ -136,7 +136,7 @@ async def test_full_user_failure_receipt_classifies_only_transient_reads(
 async def test_local_reservation_oserror_does_not_become_network_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    conn, prior = _prepare(tmp_path / "local-error.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "local-error.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
     service = cast(DaemonEntityInfoService, _pair_service(conn, _PairClient(), enabled=True))
     coordinator = service.refresh_coordinator
@@ -158,7 +158,7 @@ async def test_local_reservation_oserror_does_not_become_network_retry(
 async def test_rejected_failure_cas_is_stale_not_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mcp_telegram.entity_profile.repository import EntityProfileRepository
 
-    conn, prior = _prepare(tmp_path / "rejected.sqlite", migrated=True)
+    conn, prior = _prepare(tmp_path / "rejected.sqlite")
     await prior.shutdown()  # type: ignore[attr-defined]
 
     class FailingClient(_PairClient):

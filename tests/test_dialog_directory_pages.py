@@ -14,7 +14,15 @@ from mcp_telegram.pagination import (
 )
 from mcp_telegram.reading import service as reading_service
 from mcp_telegram.reading.sqlite_projection import _DIALOG_DIRECTORY_PAGE_SQL
-from tests.test_daemon_api import _make_db_with_dialogs, make_server
+from mcp_telegram.sync_db import _apply_migrations
+from tests.test_daemon_api import make_server
+
+
+def _directory_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    _apply_migrations(conn)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def test_directory_navigation_signed_and_negative_anchor() -> None:
@@ -32,11 +40,11 @@ def test_directory_navigation_signed_and_negative_anchor() -> None:
 async def test_sparse_directory_pages_bound_examined_candidates_and_preserve_upper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn = _make_db_with_dialogs()
+    conn = _directory_db()
     try:
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,name,type,hidden,last_message_at) VALUES (?,?,?,0,?)",
+            "INSERT INTO dialogs(dialog_id,name,type,last_message_at) VALUES (?,?,?,?)",
             [(i, f"peer {i}", "bot" if i < 1000 else "user", 100 if i == 1000 else None) for i in range(1, 1001)],
         )
         conn.commit()
@@ -69,11 +77,11 @@ async def test_sparse_directory_pages_bound_examined_candidates_and_preserve_upp
 
 
 async def test_page_membership_time_scope_and_live_upper_bound() -> None:
-    conn = _make_db_with_dialogs()
+    conn = _directory_db()
     try:
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.executemany(
-            "INSERT INTO dialogs(dialog_id,name,type,hidden,last_message_at) VALUES(?,?,?,0,?)",
+            "INSERT INTO dialogs(dialog_id,name,type,last_message_at) VALUES(?,?,?,?)",
             [
                 (-9, "negative", "user", 100),
                 (4, "too old", "user", 99),
@@ -100,7 +108,7 @@ async def test_page_membership_time_scope_and_live_upper_bound() -> None:
         assert [row["id"] for row in first["data"]["dialogs"]] == [-9]
         nav = first["data"]["navigation"]["next_navigation"]
         assert decode_dialog_directory_navigation(nav).upper_dialog_id == 50
-        conn.execute("INSERT INTO dialogs(dialog_id,name,type,hidden,last_message_at) VALUES(60,'new','user',0,150)")
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,last_message_at) VALUES(60,'new','user',150)")
         conn.commit()
         second = await reader.list_dialogs({**req, "navigation": nav, "limit": 10})
         assert [row["id"] for row in second["data"]["dialogs"]] == [50]
@@ -114,7 +122,7 @@ async def test_page_membership_time_scope_and_live_upper_bound() -> None:
 
 
 async def test_raw_reader_rejects_invalid_audit_selectors() -> None:
-    conn = _make_db_with_dialogs()
+    conn = _directory_db()
     try:
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.commit()
@@ -144,7 +152,7 @@ async def test_page_composes_folder_own_and_scheduled_filters(make_synced_db: Ca
     conn.execute("UPDATE scheduled_sync_state SET account_id=42 WHERE key='account'")
     conn.execute("UPDATE telegram_folder_projection_state SET account_id=42 WHERE singleton=1")
     conn.executemany(
-        "INSERT INTO dialogs(dialog_id,name,type,hidden) VALUES(?,?,'user',0)",
+        "INSERT INTO dialogs(dialog_id,name,type) VALUES(?,?,'user')",
         [(10, "not folder"), (20, "selected"), (30, "unknown membership")],
     )
     conn.execute(
@@ -181,18 +189,18 @@ async def test_page_composes_folder_own_and_scheduled_filters(make_synced_db: Ca
     assert [row["id"] for row in rows] == [20]
     assert rows[0]["folder_ids"] == [2] and rows[0]["scheduled_count"] == 1
     assert result["data"]["folder_membership_unknown_count"] == 1
-    assert result["data"]["navigation"]["has_more"] is True
+    assert result["data"]["navigation"]["has_more"] is False
 
 
 async def test_page_uses_caller_transaction_and_equal_effective_bounds_are_empty() -> None:
-    conn = _make_db_with_dialogs()
+    conn = _directory_db()
     try:
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.commit()
         server = make_server(conn)
         server.self_id = 42
         reader = server._get_reading_service()
-        conn.execute("INSERT INTO dialogs(dialog_id,name,type,hidden,last_message_at) VALUES(8,'pending','user',0,100)")
+        conn.execute("INSERT INTO dialogs(dialog_id,name,type,last_message_at) VALUES(8,'pending','user',100)")
         result = await reader.list_dialogs(
             {
                 "navigation": "start",
@@ -210,7 +218,7 @@ async def test_page_uses_caller_transaction_and_equal_effective_bounds_are_empty
 
 
 def test_continuation_sql_seeks_both_primary_keys() -> None:
-    conn = _make_db_with_dialogs()
+    conn = _directory_db()
     try:
         rows = cast(
             list[tuple[object, object, object, object]],
@@ -227,7 +235,7 @@ def test_continuation_sql_seeks_both_primary_keys() -> None:
 
 
 async def test_empty_directory_finishes_without_cursor() -> None:
-    conn = _make_db_with_dialogs()
+    conn = _directory_db()
     try:
         conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
         conn.commit()
@@ -239,3 +247,54 @@ async def test_empty_directory_finishes_without_cursor() -> None:
         assert result["data"]["navigation"]["next_navigation"] is None
     finally:
         conn.close()
+
+
+async def test_folder_paging_includes_members_before_dialog_metadata(
+    make_synced_db: Callable[[], sqlite3.Connection],
+) -> None:
+    from mcp_telegram.folders.read_repository import folder_summaries
+
+    conn = make_synced_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("UPDATE telegram_folder_projection_state SET account_id=42 WHERE singleton=1")
+    conn.execute(
+        "INSERT INTO telegram_folder_rules(account_id,namespace,folder_id,title,rule_kind,source_position,rule_json,catalog_member) VALUES(42,'filter',2,'Work','filter',0,'{}',1)"
+    )
+    conn.executemany(
+        "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state) VALUES('filter',2,?,'present')",
+        [(10,), (20,)],
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 42
+    reader = server._get_reading_service()
+    legacy = await reader.list_dialogs({"verified_account_id": 42, "folder_id": 2})
+    assert [row["id"] for row in legacy["data"]["dialogs"]] == [10, 20]
+    first = await reader.list_dialogs({"navigation": "start", "verified_account_id": 42, "folder_id": 2, "limit": 1})
+    assert [row["id"] for row in first["data"]["dialogs"]] == [10]
+    assert first["data"]["dialogs"][0]["archived"] is None
+    assert first["data"]["dialogs"][0]["unread_count"] is None
+    token = first["data"]["navigation"]["next_navigation"]
+    second = await reader.list_dialogs({"navigation": token, "verified_account_id": 42, "folder_id": 2, "limit": 1})
+    assert [row["id"] for row in second["data"]["dialogs"]] == [20]
+    assert folder_summaries(conn, account_id=42)[0]["dialog_count"] == 2
+
+
+async def test_missing_dialog_access_facts_stay_unknown_and_filters_require_evidence() -> None:
+    conn = _directory_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (10,'access_lost')")
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 42
+    reader = server._get_reading_service()
+    for navigation in (None, "start"):
+        req = {"verified_account_id": 42, "navigation": navigation}
+        result = await reader.list_dialogs(req)
+        row = result["data"]["dialogs"][0]
+        assert row["id"] == 10 and row["archived"] is None
+        assert row["unread_mentions_count"] is None and row["unread_reactions_count"] is None
+        for selector in ("exclude_archived", "ignore_pinned"):
+            filtered = await reader.list_dialogs({**req, selector: True})
+            assert filtered["data"]["dialogs"] == []
+    conn.close()

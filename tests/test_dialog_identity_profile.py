@@ -47,9 +47,8 @@ def test_fresh_core_profile_is_visible_without_changing_presence(tmp_path: Path)
         "profile",
         True,
     )
-    assert conn.execute("SELECT identity_revision,revision,hidden FROM dialogs WHERE dialog_id=42").fetchone() == (
+    assert conn.execute("SELECT identity_revision,revision FROM dialogs WHERE dialog_id=42").fetchone() == (
         1,
-        0,
         0,
     )
     repo.save_core({"id": 42, "type": "user", "name": "Cached", "username": "cached"}, now=21)

@@ -158,7 +158,7 @@ def test_activity_search_entity_upsert_skips_unknown_and_bad_peer(
 
 def _seed_dialog(conn: sqlite3.Connection, dialog_id: int, dialog_type: str) -> None:
     conn.execute(
-        "INSERT INTO dialogs(dialog_id, type, hidden, last_message_at) VALUES (?, ?, 0, 100)",
+        "INSERT INTO dialogs(dialog_id, type, last_message_at) VALUES (?, ?, 100)",
         (dialog_id, dialog_type),
     )
     conn.commit()

@@ -727,8 +727,8 @@ async def test_get_entity_info_access_lost_is_returned_without_duplicate_warning
     conn = _make_db()
     with write_transaction(conn):
         conn.execute(
-            "INSERT INTO dialogs (dialog_id, name, type, archived, hidden) VALUES (?, ?, ?, ?, ?)",
-            (entity_id, channel_name, "channel", 1, 1),
+            "INSERT INTO dialogs (dialog_id, name, type, archived) VALUES (?, ?, ?, ?)",
+            (entity_id, channel_name, "channel", 1),
         )
         conn.execute(
             "INSERT INTO entities (id, type, name, username, updated_at) VALUES (?, 'channel', ?, NULL, 1)",

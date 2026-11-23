@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+import sqlite3
+from typing import cast
 
 from .delivered_update import current_delivered_update
 from .own_only_contracts import is_channel_peer_id
 from .sync_transactions import write_savepoint
 
-if TYPE_CHECKING:
-    from .sync_db import SyncDatabaseConnection
 
-
-def has_nonchannel_deletion(conn: SyncDatabaseConnection, dialog_id: int, message_id: int) -> bool:
+def has_nonchannel_deletion(conn: sqlite3.Connection, dialog_id: int, message_id: int) -> bool:
     """Channel message IDs are independent of the account's nonchannel namespace."""
     if is_channel_peer_id(dialog_id):
         return False
@@ -23,7 +21,7 @@ def has_nonchannel_deletion(conn: SyncDatabaseConnection, dialog_id: int, messag
 
 
 def hydration_observation_current(
-    conn: SyncDatabaseConnection, dialog_id: int, message_id: int, observation_order: int | None
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, observation_order: int | None
 ) -> bool:
     if has_nonchannel_deletion(conn, dialog_id, message_id):
         return False
@@ -37,13 +35,13 @@ def hydration_observation_current(
     return row is None or (not row[1] and (observation_order is None or observation_order >= row[0]))
 
 
-def delivered_observation_order(conn: SyncDatabaseConnection) -> int:
+def delivered_observation_order(conn: sqlite3.Connection) -> int:
     """Reuse admission order only for the currently delivered raw update."""
     current = current_delivered_update()
     return allocate_observation_order(conn) if current is None else current.observation_order
 
 
-def allocate_observation_order(conn: SyncDatabaseConnection) -> int:
+def allocate_observation_order(conn: sqlite3.Connection) -> int:
     """Reserve a shared sequence in a short synchronous write unit."""
     with write_savepoint(conn):
         row = cast(

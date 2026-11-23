@@ -425,13 +425,13 @@ async def test_first_seen_private_message_projects_visible_dialog_and_entity(
 
     expected_sent_at = int(msg.date.timestamp())
     dialog_row = sync_db.execute(
-        "SELECT name, type, last_message_at, snapshot_at, hidden, needs_refresh FROM dialogs WHERE dialog_id=?",
+        "SELECT name, type, last_message_at, snapshot_at, needs_refresh FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
     ).fetchone()
     assert dialog_row is not None
     assert dialog_row[:3] == ("Алиса Иванова", "user", expected_sent_at)
     assert dialog_row[3] is not None and dialog_row[3] > 0
-    assert dialog_row[4:] == (0, 1)
+    assert dialog_row[4:] == (1,)
     assert sync_db.execute(
         "SELECT type, name, username, name_normalized FROM entities WHERE id=?", (dialog_id,)
     ).fetchone() == ("user", "Алиса Иванова", "alice", "alisa ivanova")
@@ -560,8 +560,8 @@ async def test_first_seen_outgoing_private_lookup_failure_keeps_message_discover
     await manager.on_new_message(event)
 
     assert sync_db.execute(
-        "SELECT name, type, hidden, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)
-    ).fetchone() == (None, None, 0, 1)
+        "SELECT name, type, needs_refresh FROM dialogs WHERE dialog_id=?", (dialog_id,)
+    ).fetchone() == (None, None, 1)
     assert sync_db.execute("SELECT identity_revision FROM dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (0,)
     assert sync_db.execute("SELECT message_id, out FROM messages WHERE dialog_id=?", (dialog_id,)).fetchone() == (19, 1)
 
@@ -601,8 +601,8 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
 ) -> None:
     dialog_id = 7019
     sync_db.execute(
-        "INSERT INTO dialogs(dialog_id, name, type, archived, pinned, members, hidden, unread_count) "
-        "VALUES (?, 'Saved', 'user', 1, 1, 9, 1, 4)",
+        "INSERT INTO dialogs(dialog_id, name, type, archived, pinned, members, unread_count) "
+        "VALUES (?, 'Saved', 'user', 1, 1, 9, 4)",
         (dialog_id,),
     )
     sync_db.commit()
@@ -620,12 +620,11 @@ async def test_first_seen_private_event_preserves_existing_dialog_facts(
     manager = make_manager(mock_client, sync_db, shutdown_event)
     assert await manager._auto_enroll_dm(dialog_id, sender=sender, message_date=msg.date, observed_at=100)
 
-    # Realtime presence intentionally exposes an absent-from-snapshot row; other
-    # durable dialog facts must survive the thin first-event projection.
+    # Durable dialog facts survive the thin first-event projection.
     assert sync_db.execute(
-        "SELECT archived, pinned, members, hidden, unread_count FROM dialogs WHERE dialog_id=?",
+        "SELECT archived, pinned, members, unread_count FROM dialogs WHERE dialog_id=?",
         (dialog_id,),
-    ).fetchone() == (1, 1, 9, 0, 4)
+    ).fetchone() == (1, 1, 9, 4)
     assert sync_db.execute(
         "SELECT name,username,type,identity_complete,identity_source,identity_revision FROM dialogs WHERE dialog_id=?",
         (dialog_id,),

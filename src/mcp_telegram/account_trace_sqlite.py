@@ -73,7 +73,6 @@ class TraceMessageQueryRequest:
 class TraceDialogMetadata(TypedDict):
     dialog_type: str
     status: str
-    hidden: bool
 
 
 def _rows(cursor: sqlite3.Cursor) -> list[object]:
@@ -332,31 +331,26 @@ def access_lost_dialog_ids(conn: sqlite3.Connection) -> set[int]:
     }
 
 
-def hidden_dialog_ids(conn: sqlite3.Connection) -> set[int]:
-    return {_int(_sequence(row)[0]) for row in _rows(conn.execute("SELECT dialog_id FROM dialogs WHERE hidden = 1"))}
-
-
 def dialog_metadata(conn: sqlite3.Connection, dialog_id: int) -> TraceDialogMetadata:
     result = dialog_presence_metadata(conn, dialog_id)
     identity = read_dialog_identities(conn, [dialog_id])[dialog_id]
     return {
         "dialog_type": identity.dialog_type.value,
         "status": result["status"],
-        "hidden": result["hidden"],
     }
 
 
 def dialog_presence_metadata(conn: sqlite3.Connection, dialog_id: int) -> TraceDialogMetadata:
     row = _one(
         conn.execute(
-            "SELECT COALESCE(sd.status, 'not_synced'), COALESCE(d.hidden, 0) "
+            "SELECT COALESCE(sd.status, 'not_synced') "
             "FROM (SELECT ? AS dialog_id) x LEFT JOIN dialogs d ON d.dialog_id=x.dialog_id "
             "LEFT JOIN synced_dialogs sd ON sd.dialog_id=x.dialog_id",
             (dialog_id,),
         )
     )
-    values = _sequence(row) if row is not None else ("not_synced", 0)
-    return {"dialog_type": "unknown", "status": str(values[0]), "hidden": bool(values[1])}
+    values = _sequence(row) if row is not None else ("not_synced",)
+    return {"dialog_type": "unknown", "status": str(values[0])}
 
 
 def apply_trace_dialog_identities(
@@ -404,7 +398,7 @@ def visible_synced_dialog_ids(conn: sqlite3.Connection) -> list[int]:
         _int(_sequence(row)[0])
         for row in _rows(
             conn.execute(
-                "SELECT sd.dialog_id FROM synced_dialogs sd LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id WHERE sd.status != 'access_lost' AND COALESCE(d.hidden, 0) = 0 ORDER BY sd.dialog_id ASC"
+                "SELECT sd.dialog_id FROM synced_dialogs sd LEFT JOIN dialogs d ON d.dialog_id = sd.dialog_id WHERE sd.status != 'access_lost' ORDER BY sd.dialog_id ASC"
             )
         )
     ]

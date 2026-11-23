@@ -37,6 +37,7 @@ from ._base import (
 )
 from .dialog_resolution import project_dialog_resolution_error
 from .structured import (
+    DIALOG_AVAILABILITY_OUTPUT_SCHEMA,
     FOLDER_SNAPSHOT_OUTPUT_SCHEMA,
     StructuredWarning,
     structured_warning,
@@ -99,8 +100,8 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "created": {"type": ["integer", "string", "null"]},
                     "unread_in": {"type": ["integer", "null"]},
                     "unread_out": {"type": ["integer", "null"]},
-                    "unread_mentions_count": {"type": "integer"},
-                    "unread_reactions_count": {"type": "integer"},
+                    "unread_mentions_count": {"type": ["integer", "null"]},
+                    "unread_reactions_count": {"type": ["integer", "null"]},
                     "scheduled_count": {
                         "type": "integer",
                         "description": "Count of future scheduled messages in this dialog.",
@@ -119,6 +120,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                         "items": {"type": "string"},
                         "description": "Stable own-only classifier basis when this row is in own scope.",
                     },
+                    "availability": DIALOG_AVAILABILITY_OUTPUT_SCHEMA,
                     "folder_ids": {"type": "array", "items": {"type": "integer"}},
                     "folders": {
                         "type": "array",
@@ -132,7 +134,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                             "additionalProperties": False,
                         },
                     },
-                    "archived": {"type": "boolean"},
+                    "archived": {"type": ["boolean", "null"]},
                 },
                 "required": [
                     "id",
@@ -179,8 +181,8 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "id": {"type": "integer"},
                     "title": TELEGRAM_CONTENT_OUTPUT_SCHEMA,
                     "dialog_count": {"type": "integer"},
-                    "unread_dialog_count": {"type": "integer"},
-                    "unread_count": {"type": "integer"},
+                    "unread_dialog_count": {"type": ["integer", "null"]},
+                    "unread_count": {"type": ["integer", "null"]},
                     "last_message_at": {"type": ["integer", "string", "null"]},
                     "unknown_membership_count": {"type": "integer"},
                 },
@@ -347,16 +349,17 @@ class _DialogSurface:
     created: int | str | None
     unread_in: int | None
     unread_out: int | None
-    unread_mentions_count: int
-    unread_reactions_count: int
+    unread_mentions_count: int | None
+    unread_reactions_count: int | None
     scheduled_count: int
     next_scheduled_at: int | None
     unresolved_scheduled_count: int
     scheduled_coverage: dict[str, object] | None
     inclusion_basis: list[str] | None
+    availability: dict[str, object] | None
     folder_ids: list[int]
     folders: list[tuple[int, str]]
-    archived: bool
+    archived: bool | None
     is_self: bool
 
 
@@ -365,8 +368,8 @@ class _FolderSummarySurface:
     folder_id: int
     title: str
     dialog_count: int
-    unread_dialog_count: int
-    unread_count: int
+    unread_dialog_count: int | None
+    unread_count: int | None
     last_message_at: int | None
     unknown_membership_count: int
 
@@ -441,6 +444,13 @@ def _strict_bool(data: Mapping[str, object], name: str, *, context: str) -> bool
     if not isinstance(value, bool):
         raise SyncReadModelContractError(f"{context}.{name} must be a boolean")
     return value
+
+
+def _strict_optional_bool(data: Mapping[str, object], name: str, *, context: str) -> bool | None:
+    value = _required(data, name, context=context)
+    if value is None or isinstance(value, bool):
+        return value
+    raise SyncReadModelContractError(f"{context}.{name} must be a boolean or null")
 
 
 def _strict_string_list_or_none(data: Mapping[str, object], name: str, *, context: str) -> list[str] | None:
@@ -544,8 +554,8 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
         created=_strict_optional_timestamp(value, "created", context=context),
         unread_in=_strict_optional_int(value, "unread_in", context=context),
         unread_out=_strict_optional_int(value, "unread_out", context=context),
-        unread_mentions_count=_strict_int(value, "unread_mentions_count", context=context),
-        unread_reactions_count=_strict_int(value, "unread_reactions_count", context=context),
+        unread_mentions_count=_strict_optional_int(value, "unread_mentions_count", context=context),
+        unread_reactions_count=_strict_optional_int(value, "unread_reactions_count", context=context),
         scheduled_count=_strict_int(value, "scheduled_count", context=context),
         next_scheduled_at=_strict_optional_int(value, "next_scheduled_at", context=context),
         unresolved_scheduled_count=_strict_int(value, "unresolved_scheduled_count", context=context),
@@ -553,9 +563,10 @@ def _strict_dialog(value: object, index: int) -> _DialogSurface:
             dict(value["scheduled_coverage"]) if isinstance(value.get("scheduled_coverage"), Mapping) else None
         ),
         inclusion_basis=_strict_string_list_or_none(value, "inclusion_basis", context=context),
+        availability=dict(value["availability"]) if isinstance(value.get("availability"), Mapping) else None,
         folder_ids=_strict_int_list(value, "folder_ids", context=context),
         folders=_strict_folders(value, context=context),
-        archived=_strict_bool(value, "archived", context=context),
+        archived=_strict_optional_bool(value, "archived", context=context),
         is_self=_strict_bool(value, "is_self", context=context),
     )
 
@@ -650,8 +661,8 @@ def _strict_folder_summaries(
                 folder_id=_strict_int(value, "id", context=context),
                 title=title,
                 dialog_count=_strict_int(value, "dialog_count", context=context),
-                unread_dialog_count=_strict_int(value, "unread_dialog_count", context=context),
-                unread_count=_strict_int(value, "unread_count", context=context),
+                unread_dialog_count=_strict_optional_int(value, "unread_dialog_count", context=context),
+                unread_count=_strict_optional_int(value, "unread_count", context=context),
                 last_message_at=_strict_optional_int(value, "last_message_at", context=context),
                 unknown_membership_count=(
                     _strict_int(value, "unknown_membership_count", context=context)
@@ -1037,6 +1048,7 @@ async def list_dialogs(args: ListDialogs) -> ToolResult:
                 "unresolved_scheduled_count": dialog.unresolved_scheduled_count,
                 "scheduled_coverage": dialog.scheduled_coverage,
                 "inclusion_basis": dialog.inclusion_basis,
+                "availability": dialog.availability,
                 "folder_ids": dialog.folder_ids,
                 "folders": [
                     {"id": folder_id, "title": telegram_content(title, "message_text")}

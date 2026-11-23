@@ -152,7 +152,6 @@ _NEXT_PENDING_SQL = (
     "SELECT sd.dialog_id, sd.sync_progress FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.status IN ('syncing', 'not_synced') "
-    "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1) "
     "AND COALESCE(sd.full_sync_retry_at,0) <= ? "
     "ORDER BY CASE WHEN sd.dialog_id > COALESCE((SELECT CAST(value AS INTEGER) FROM daemon_state "
     "WHERE key='full_sync_peer_cursor'),0) THEN 0 ELSE 1 END, sd.dialog_id LIMIT 1"
@@ -161,7 +160,6 @@ _NEXT_TOTAL_MESSAGES_REPAIR_SQL = (
     "SELECT sd.dialog_id FROM synced_dialogs sd "
     "JOIN full_history_enrollment fhe ON fhe.dialog_id = sd.dialog_id AND fhe.enabled = 1 "
     "WHERE sd.total_messages IS NULL AND sd.status NOT IN ('not_synced', 'access_lost') "
-    "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1) "
     "AND COALESCE(sd.full_sync_retry_at,0) <= ? "
     "ORDER BY CASE WHEN sd.dialog_id > COALESCE((SELECT CAST(value AS INTEGER) FROM daemon_state "
     "WHERE key='full_sync_total_peer_cursor'),0) THEN 0 ELSE 1 END, sd.dialog_id LIMIT 1"
@@ -375,7 +373,7 @@ class FullSyncWorker:
                 list[tuple[object, ...]],
                 conn.execute(
                     "SELECT dialog_id,type,name,read_inbox_max_id,read_outbox_max_id FROM dialogs "
-                    "WHERE type IN ('user','bot') AND hidden=0 ORDER BY dialog_id"
+                    "WHERE type IN ('user','bot') ORDER BY dialog_id"
                 ).fetchall(),
             )
             now = int(time.time())
@@ -419,7 +417,7 @@ class FullSyncWorker:
                     "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
                     "WHERE sd.dialog_id=? AND sd.status IN ('syncing','not_synced') "
                     "AND COALESCE(sd.full_sync_retry_at,0)<=? "
-                    "AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.dialog_id=sd.dialog_id AND d.hidden=1)",
+                    "",
                     (expected_dialog, time.time()),
                 ).fetchone(),
             )
@@ -622,6 +620,7 @@ class FullSyncWorker:
                 dialog_id,
                 observed_at,
                 reason=reason,
+                access_scope="history",
                 profile_owner_account_id=owner,
                 observation_order=order,
                 membership_revision_at=observed_at,
@@ -685,7 +684,7 @@ class FullSyncWorker:
                 "SELECT d.dialog_id FROM dialogs d "
                 "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+                "WHERE fhe.dialog_id IS NULL AND d.type IN ('group','supergroup','forum') "
                 "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
                 "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced')) "
                 "AND NOT EXISTS (SELECT 1 FROM daemon_state ds WHERE ds.key='automatic_group_history_retry:' || d.dialog_id AND CAST(ds.value AS INTEGER) > ?) "
@@ -703,7 +702,7 @@ class FullSyncWorker:
             conn.execute(
                 "SELECT 1 FROM dialogs d LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
-                "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL AND d.hidden=0 "
+                "WHERE d.dialog_id=? AND fhe.dialog_id IS NULL "
                 "AND d.type IN ('group','supergroup','forum') AND d.members BETWEEN 1 AND ? AND d.created >= ? "
                 "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost', 'synced'))",
                 (dialog_id, policy.max_members, cutoff),
@@ -827,7 +826,7 @@ class FullSyncWorker:
                 "WHERE sd.dialog_id=? AND sd.total_messages IS NULL "
                 "AND sd.status NOT IN ('not_synced','access_lost') "
                 "AND COALESCE(sd.full_sync_retry_at,0)<=? "
-                "AND NOT EXISTS (SELECT 1 FROM dialogs directory WHERE directory.dialog_id=sd.dialog_id AND directory.hidden=1)",
+                "",
                 (dialog_id, time.time()),
             ).fetchone(),
         )
@@ -1202,7 +1201,6 @@ class FullSyncDemandAdapter:
                 "SELECT sd.dialog_id,sd.sync_progress,sd.full_sync_retry_at,sd.status FROM synced_dialogs sd "
                 "JOIN full_history_enrollment fhe ON fhe.dialog_id=sd.dialog_id AND fhe.enabled=1 "
                 "WHERE sd.status IN ('syncing','not_synced') "
-                "AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.dialog_id=sd.dialog_id AND d.hidden=1) "
                 "ORDER BY CASE WHEN sd.dialog_id>COALESCE((SELECT CAST(value AS INTEGER) FROM daemon_state WHERE key='full_sync_peer_cursor'),0) THEN 0 ELSE 1 END,sd.dialog_id"
             ).fetchall(),
         )
@@ -1234,7 +1232,7 @@ class FullSyncDemandAdapter:
                 "LEFT JOIN full_history_enrollment fhe ON fhe.dialog_id=d.dialog_id "
                 "LEFT JOIN synced_dialogs sd ON sd.dialog_id=d.dialog_id "
                 "LEFT JOIN daemon_state ds ON ds.key='automatic_group_history_retry:' || d.dialog_id "
-                "WHERE fhe.dialog_id IS NULL AND d.hidden=0 AND d.type IN ('group','supergroup','forum') "
+                "WHERE fhe.dialog_id IS NULL AND d.type IN ('group','supergroup','forum') "
                 "AND d.members BETWEEN 1 AND ? AND d.created >= ? "
                 "AND (sd.status IS NULL OR sd.status NOT IN ('access_lost','synced')) ORDER BY d.dialog_id",
                 (policy.max_members, cutoff),

@@ -74,7 +74,7 @@ async def test_deadline_drains_real_writer_and_fences_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
     path = tmp_path / "deadline.sqlite"
-    conn, prior = _prepare(path, migrated=True)
+    conn, prior = _prepare(path)
     await prior.shutdown()  # type: ignore[attr-defined]
     _prepare_self(conn)
     writer = await SQLiteWriter.open(path)

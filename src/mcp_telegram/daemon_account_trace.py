@@ -31,7 +31,6 @@ from .account_trace_sqlite import (
     evidence_page,
     existing_message_bundle,
     fragment_next_retry_at,
-    hidden_dialog_ids,
     retry_fragment_dialog_ids,
     visible_synced_dialog_ids,
 )
@@ -1494,10 +1493,7 @@ async def _resolve_trace_account_signature_scope(
         return None
 
     meta = dialog_metadata(deps.conn, exact_dialog_id)
-    if (
-        _trace_strategy_for_dialog(meta["dialog_type"], status=meta["status"], hidden=bool(meta["hidden"]))
-        != "signature_only"
-    ):
+    if _trace_strategy_for_dialog(meta["dialog_type"], status=meta["status"]) != "signature_only":
         return None
 
     resolution = (
@@ -1615,9 +1611,8 @@ def _trace_enrich_candidate_precheck(request: _TraceEnrichPrecheckContext) -> st
             )
             return "pending"
 
-        if request.strategy in {"hidden", "access_lost", "unsupported", "signature_only"}:
+        if request.strategy in {"access_lost", "unsupported", "signature_only"}:
             status = {
-                "hidden": "unsupported",
                 "access_lost": "access_lost",
                 "unsupported": "unsupported",
                 "signature_only": "unsupported",
@@ -2269,7 +2264,6 @@ def _build_trace_gaps(
         status_by_dialog=status_by_dialog,
         considered_dialogs=considered_dialogs,
     )
-    gaps.extend(_collect_trace_gaps_for_hidden_dialogs(request=request, considered_dialogs=considered_dialogs))
     gaps.extend(_collect_trace_gaps_for_fragment_rows(request=request, fragment_rows=fragment_rows))
     gaps.extend(_collect_trace_gaps_for_evidence(request.evidence))
     if not request.evidence and not gaps:
@@ -2311,25 +2305,6 @@ def _collect_trace_gaps_for_dialog_statuses(
         if candidate is not None:
             gaps.append(_trace_gap(candidate))
     return gaps
-
-
-def _collect_trace_gaps_for_hidden_dialogs(
-    request: _TraceGapBuildRequest,
-    *,
-    considered_dialogs: set[int],
-) -> list[dict[str, object]]:
-    hidden_dialogs = hidden_dialog_ids(request.conn)
-    return [
-        _trace_gap(
-            _TraceGapCandidate(
-                kind="hidden_dialog",
-                severity="warning",
-                detail="Dialog is hidden in the local mirror.",
-                dialog_id=dialog_id,
-            )
-        )
-        for dialog_id in sorted(considered_dialogs & hidden_dialogs)
-    ]
 
 
 def _collect_trace_gaps_for_fragment_rows(
@@ -2393,9 +2368,7 @@ def _build_observed_zero_trace_gap() -> dict:
     )
 
 
-def _trace_strategy_for_dialog(dialog_type: str, *, status: str | None, hidden: bool) -> str:
-    if hidden:
-        return "hidden"
+def _trace_strategy_for_dialog(dialog_type: str, *, status: str | None) -> str:
     if status == "access_lost":
         return "access_lost"
     dt = DialogType.parse(dialog_type)
@@ -2484,14 +2457,12 @@ def _add_trace_candidate_dialog(
     strategy = _trace_strategy_for_dialog(
         meta["dialog_type"],
         status=meta["status"],
-        hidden=bool(meta["hidden"]),
     )
     state.candidates.append(
         {
             "dialog_id": dialog_id,
             "dialog_type": meta["dialog_type"],
             "status": meta["status"],
-            "hidden": bool(meta["hidden"]),
             "strategy": strategy,
             "origin": origin,
             "topic_id": request.exact_topic_id if request.exact_dialog_id == dialog_id else None,
@@ -2516,7 +2487,7 @@ def _trace_candidate_metadata(
     meta = cast(TraceDialogMetadata, dialog_presence_metadata(request.conn, dialog_id))
     if identity is not None:
         meta["dialog_type"] = identity.dialog_type.value
-    if not include_inaccessible and (meta["status"] == "access_lost" or meta["hidden"]):
+    if not include_inaccessible and meta["status"] == "access_lost":
         return None
     return meta
 

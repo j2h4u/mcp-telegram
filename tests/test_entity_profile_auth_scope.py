@@ -44,7 +44,7 @@ def test_capture_scope_requires_positive_account_and_primary_key() -> None:
 
 @pytest.mark.asyncio
 async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "scope.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     scope = _scope(account_id=99)
     service._deps = replace(service._deps, full_user_auth_scope=lambda: scope)
@@ -91,7 +91,7 @@ async def test_scope_is_private_evidence_and_invalidated_pair_is_reacquired(tmp_
 @pytest.mark.asyncio
 async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_receipts(tmp_path: Path) -> None:
     path = tmp_path / "disabled-scope.sqlite"
-    conn, raw_service = _prepare(path, migrated=True)
+    conn, raw_service = _prepare(path)
     service = cast(DaemonEntityInfoService, raw_service)
     service._deps = replace(service._deps, enable_full_user_pair=False)
     coordinator = service.refresh_coordinator
@@ -165,7 +165,7 @@ async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_recei
 
 @pytest.mark.asyncio
 async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "ownership-admission.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "ownership-admission.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -200,7 +200,7 @@ async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand
 
 @pytest.mark.asyncio
 async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "ownership-failed.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "ownership-failed.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -249,7 +249,7 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
 
 @pytest.mark.asyncio
 async def test_public_local_read_does_not_requeue_failed_refresh(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "ownership-reread.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "ownership-reread.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     coordinator = service.refresh_coordinator
     assert coordinator is not None
@@ -286,7 +286,7 @@ async def test_public_local_read_does_not_requeue_failed_refresh(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope-change.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "scope-change.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     first, second = _scope(), _scope(auth_key_id=100)
     current = [first]
@@ -321,7 +321,7 @@ async def test_scope_change_during_rpc_rejects_receipt_and_progress(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_same_account_scope_rotation_keeps_local_facts_without_mutation(tmp_path: Path) -> None:
-    conn, raw_service = _prepare(tmp_path / "scope-generation.sqlite", migrated=True)
+    conn, raw_service = _prepare(tmp_path / "scope-generation.sqlite")
     service = cast(DaemonEntityInfoService, raw_service)
     current_scope = [_scope(account_id=99)]
     service._deps = replace(service._deps, full_user_auth_scope=lambda: current_scope[0])
