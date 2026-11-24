@@ -118,6 +118,10 @@ def _nested_payload(nested_phases: dict[str, dict[str, float]]) -> dict[str, dic
     }
 
 
+def _writer_payload(phases: dict[str, float]) -> dict[str, float]:
+    return {f"{phase}_ms": value for phase, value in phases.copy().items()}
+
+
 @dataclass(slots=True)
 class DaemonRequestTiming:
     """Bounded evidence accumulated by one daemon request task."""
@@ -248,7 +252,7 @@ class DaemonRequestTiming:
             "required_phase_count": len(required_phases),
             "not_applicable_phases": not_applicable,
             "nested_phases": _nested_payload(self.nested_phases),
-            "writer_phases": {f"{phase}_ms": value for phase, value in self.writer_phases.copy().items()},
+            "writer_phases": _writer_payload(self.writer_phases),
             "unattributed_ms": unattributed_ms,
         }
 

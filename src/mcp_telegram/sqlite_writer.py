@@ -97,9 +97,11 @@ class SQLiteWriter:
     async def run[T](self, callback: Callable[[sqlite3.Connection], T]) -> T:
         timing = current_timing()
         admission_started = time.monotonic()
-        await self._slots.acquire()
-        if timing is not None:
-            timing.add_writer_phase("admission", (time.monotonic() - admission_started) * 1000)
+        try:
+            await self._slots.acquire()
+        finally:
+            if timing is not None:
+                timing.add_writer_phase("admission", (time.monotonic() - admission_started) * 1000)
         with self._state_lock:
             if self._closed or self._fatal_error is not None:
                 self._slots.release()

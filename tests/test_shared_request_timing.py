@@ -102,3 +102,75 @@ async def test_writer_distinguishes_queued_work(tmp_path: Path) -> None:
     finally:
         release.set()
         await writer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slow_dispatch_persists_through_real_observation_sink(tmp_path: Path) -> None:
+    import json
+    import sqlite3
+    from contextlib import closing
+
+    from mcp_telegram.config import RuntimeObservationConfig
+    from mcp_telegram.sync_db import ensure_sync_schema
+
+    path = tmp_path / "sync.db"
+    ensure_sync_schema(path)
+    writer = await SQLiteWriter.open(path)
+    sink = RuntimeObservationSink(path, writer=writer, retention_ttl_seconds=3600, policy=RuntimeObservationConfig())
+    try:
+        server = make_server()
+        server._policy = replace(server._policy, slow_request_seconds=0.0)
+        server.bind_runtime_observation_sink(sink)
+        await server._dispatch_request_with_timing({"method": "list_dialogs"}, "list_dialogs", "1234abcd", "e" * 32)
+        await sink.aclose()
+        with closing(sqlite3.connect(path)) as conn:
+            row = cast(
+                tuple[str, int | None, str] | None,
+                conn.execute(
+                    "SELECT operation_id, dialog_id, payload_json FROM runtime_observations WHERE kind='daemon.request_timing'"
+                ).fetchone(),
+            )
+        assert row is not None and row[0:2] == ("e" * 32, None)
+        payload = cast(dict[str, object], json.loads(row[2]))
+        assert payload["method"] == "list_dialogs" and cast(float, payload["local_projection_ms"]) >= 0
+        assert payload["request_id"] == "1234abcd"
+    finally:
+        await sink.aclose()
+        await writer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_writer_cancelled_during_admission_is_measured_without_enqueuing(tmp_path: Path) -> None:
+    import threading
+
+    writer = await SQLiteWriter.open(_database(tmp_path), capacity=1)
+    entered, release = threading.Event(), threading.Event()
+    called = False
+
+    def hold(_conn: object) -> None:
+        entered.set()
+        assert release.wait(5)
+
+    def forbidden(_conn: object) -> None:
+        nonlocal called
+        called = True
+
+    try:
+        first = asyncio.create_task(writer.run(hold))
+        assert await asyncio.to_thread(entered.wait, 5)
+        with timing_context("f" * 32) as timing:
+            assert timing is not None
+            waiter = asyncio.create_task(writer.run(forbidden))
+            await asyncio.sleep(0.02)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert timing.writer_phases["admission"] >= 10
+            assert set(timing.writer_phases) == {"admission"}
+            assert not called
+        release.set()
+        await first
+        assert await writer.run(lambda _conn: 42) == 42
+    finally:
+        release.set()
+        await writer.aclose()
