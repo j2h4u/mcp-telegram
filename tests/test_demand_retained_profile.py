@@ -198,3 +198,54 @@ async def test_sender_expiry_wins_without_parent_factory_or_budget_change() -> N
     assert budget.attempts == 0 and budget.limit == 1
     assert coordinator.inspect_work(adapters[kind].selected)["reason"] == "admission_deferred"
     coordinator._harvest_retained()
+
+
+async def test_daemon_retained_cleanup_waits_for_transport_but_explicit_stop_does_not() -> None:
+    shutdown = asyncio.Event()
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    adapters = _adapters({kind: DemandStatus(0)})
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    coordinator = TelegramDemandCoordinator(adapters, shutdown)
+    coordinator.defer_retained_shutdown_until_transport_settles()
+
+    async def pending() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    adapters[kind].on_run = pending
+    pump = asyncio.create_task(coordinator.run())
+    await asyncio.wait_for(started.wait(), 2)
+    shutdown.set()
+    async with asyncio.timeout(2):
+        while coordinator.state is not CoordinatorState.STOPPING:
+            await asyncio.sleep(0)
+    assert not cancelled.is_set() and not pump.done()
+    coordinator.shutdown()
+    await asyncio.wait_for(pump, 2)
+    assert cancelled.is_set() and coordinator.state is CoordinatorState.STOPPED
+
+
+async def test_cancelled_pump_does_not_wait_for_daemon_transport() -> None:
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    adapters = _adapters({kind: DemandStatus(0)})
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    coordinator = TelegramDemandCoordinator(adapters)
+    coordinator.defer_retained_shutdown_until_transport_settles()
+
+    async def pending() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    adapters[kind].on_run = pending
+    pump = asyncio.create_task(coordinator.run())
+    await asyncio.wait_for(started.wait(), 2)
+    pump.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pump, 2)
+    assert cancelled.is_set() and coordinator.state is CoordinatorState.STOPPED

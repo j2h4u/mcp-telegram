@@ -3054,3 +3054,72 @@ async def test_native_account_difference_shutdown_recovers_without_selected_work
         if not loop.done():
             loop.cancel()
             await asyncio.gather(loop, return_exceptions=True)
+
+
+async def test_daemon_shutdown_settles_retained_profile_before_cancelling_caller(  # noqa: PLR0914, PLR0915 - physical wire and durable owner
+    image_wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram import daemon
+    from mcp_telegram.daemon_entity_info import DaemonEntityInfoService
+    from mcp_telegram.entity_profile.ports import ProfileCollectionPort
+    from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
+    from mcp_telegram.telegram_demand import DurableDemandAdapter
+    from mcp_telegram.telegram_demand_coordinator import CoordinatorState, TelegramDemandCoordinator
+    from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
+    from tests.test_daemon import _ConnectionStub, _typed_ctx
+    from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient, _prepare
+    from tests.test_telegram_demand_coordinator import _adapters
+
+    gate, sender, connection, sink = image_wire
+    ctx = _typed_ctx(client=gate, conn=_ConnectionStub(), socket_path=tmp_path / "daemon.sock")
+    gate.set_shutdown_requested(ctx.shutdown_event.is_set)
+    kind = DemandKind.ENTITY_PROFILE_REFRESH
+    conn, raw_service = _prepare(tmp_path / "profile.db")
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("UPDATE entity_profile_refresh_state SET next_section='pinned_stories'")
+    conn.commit()
+    await cast(DaemonEntityInfoService, raw_service).shutdown()
+    client = _PairClient(account_id=42)
+    service = cast(DaemonEntityInfoService, _pair_service(conn, client, enabled=True))
+
+    class Collection:
+        async def fetch_profile_collection_page(self, _reference: object, _section: str, _cursor: object) -> object:
+            return await _AdmissionAwareSender(gate, current_rpc_scope()).send(
+                functions.stories.GetPinnedStoriesRequest(peer=types.InputPeerUser(11, 1), offset_id=0, limit=1)
+            )
+
+    client.collection_port = cast(ProfileCollectionPort, Collection())
+    refresh = service.refresh_coordinator
+    assert refresh is not None
+    adapters = cast(dict[DemandKind, DurableDemandAdapter], cast(object, _adapters()))
+    adapters[kind] = EntityProfileDemandAdapter(refresh)
+    coordinator = TelegramDemandCoordinator(adapters, ctx.shutdown_event)
+    coordinator.defer_retained_shutdown_until_transport_settles()
+    ctx.coordinator = coordinator
+    pump = asyncio.create_task(coordinator.run())
+    ctx.background_tasks.add(pump)
+    state = await asyncio.wait_for(sender._send_queue.next_state(), 5)
+    await sender._prepare_state(state)
+    assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+    assert len(sink.frames) == 1
+    ctx.shutdown_request.request("sigterm")
+    async with asyncio.timeout(5):
+        while coordinator.state is not CoordinatorState.STOPPING:
+            await asyncio.sleep(0)
+    assert coordinator._retained_task is not None and not coordinator._retained_task.done()
+
+    async def keep_fixture_connections(_ctx: object) -> None:
+        pass
+
+    monkeypatch.setattr(daemon, "_close_runtime_connections", keep_fixture_connections)
+    await daemon._shutdown_sync_main_context(ctx)
+    encoded = gate._safety_store.load_record()
+    assert encoded is not None
+    record = cast(dict[str, object], json.loads(encoded))
+    receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+    assert receipt["phase"] == "unknown" and receipt["read_retry"] == {"reason": "clean_shutdown"}
+    saved_scope = cast(dict[str, int], record["scope"])
+    reopened = TelegramRpcSafetyLedger(gate._safety_store, dc_id=saved_scope["dc_id"], key_id=saved_scope["key_id"])
+    assert reopened.protection_reason is None and not reopened._unresolved()
+    await service.shutdown()
+    conn.close()
