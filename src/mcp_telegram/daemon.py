@@ -2165,6 +2165,7 @@ def _build_demand_runtime(
             request_shutdown=partial(ctx.shutdown_request.request, "rpc_admission_closed"),
         )
         coordinator.bind_canonical_progress(ctx.client.note_canonical_progress)
+        coordinator.defer_retained_shutdown_until_transport_settles()
     except BaseException:
         message_fact_refresh_deps.conn.close()
         raise
@@ -2400,9 +2401,14 @@ async def _shutdown_sync_main_context(ctx: _SyncMainContext) -> None:
     async def close_runtime_connections() -> None:
         await _close_runtime_connections(ctx)
 
+    async def settle_retained_work() -> None:
+        if ctx.coordinator is not None:
+            ctx.coordinator.retained_transport_settled()
+
     stages: tuple[tuple[str, Callable[[], Awaitable[object]]], ...] = (
         ("telegram_disconnect", lambda: _disconnect_telegram(ctx.client)),
         ("rpc_scheduler", lambda: ctx.client.close_rpc_scheduler()),
+        ("retained_work", settle_retained_work),
         ("daemon_api", lambda: _stop_daemon_api(ctx)),
         ("background_tasks", lambda: _cancel_background_tasks(ctx)),
         ("image_sources", lambda: _stop_image_sources(ctx)),

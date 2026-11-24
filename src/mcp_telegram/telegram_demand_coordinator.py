@@ -169,6 +169,8 @@ class TelegramDemandCoordinator:
         self._active_revision: WorkRevision | None = None
         self._retained_revision: WorkRevision | None = None
         self._retained_task: asyncio.Task[None] | None = None
+        self._retained_transport_settled: asyncio.Event | None = None
+        self._explicit_shutdown = False
         self._next_release_at: float | None = None
         self._status_failed_until: dict[DemandKind, float] = {}
         self._invocations: dict[WorkRevision, _Invocation] = {}
@@ -249,10 +251,20 @@ class TelegramDemandCoordinator:
             return "excluded", None
         return "none", None
 
+    def defer_retained_shutdown_until_transport_settles(self) -> None:
+        """Let daemon-owned transport settle before cancelling retained work."""
+        self._retained_transport_settled = asyncio.Event()
+
+    def retained_transport_settled(self) -> None:
+        if self._retained_transport_settled is not None:
+            self._retained_transport_settled.set()
+
     def shutdown(self) -> None:
         """Request a prompt stop for a coordinator that owns its event."""
+        self._explicit_shutdown = True
         self._shutdown_event.set()
         self._wake.set()
+        self.retained_transport_settled()
 
     def eligibility_changed(self, method_key: str | None = None) -> None:
         """Wake the pump after gate eligibility changes."""
@@ -495,6 +507,7 @@ class TelegramDemandCoordinator:
         if self._state is not CoordinatorState.NEW:
             raise RuntimeError("Telegram demand coordinator can run only once")
         self._state = CoordinatorState.RUNNING
+        normal_shutdown = False
         try:
             while not self._shutdown_event.is_set():
                 self._wake.clear()
@@ -515,12 +528,20 @@ class TelegramDemandCoordinator:
                 finally:
                     self._active_kind = None
                     await asyncio.sleep(0)
+            normal_shutdown = True
         except asyncio.CancelledError:
             raise
         except TelegramRpcThrottled:
             raise
         finally:
-            self._state = CoordinatorState.STOPPING
+            await self._stop_after_transport(normal_shutdown)
+
+    async def _stop_after_transport(self, normal_shutdown: bool) -> None:
+        self._state = CoordinatorState.STOPPING
+        try:
+            if normal_shutdown and not self._explicit_shutdown and self._retained_transport_settled is not None:
+                await self._retained_transport_settled.wait()
+        finally:
             await self._stop_retained()
             self._active_kind = None
             self._state = CoordinatorState.STOPPED

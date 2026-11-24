@@ -140,6 +140,10 @@ class _CoordinatorStub:
     def __init__(self) -> None:
         self.offered: list[DemandKind] = []
         self.shutdown_calls = 0
+        self.settled_calls = 0
+
+    def retained_transport_settled(self) -> None:
+        self.settled_calls += 1
 
     def offer(self, kind: DemandKind) -> bool:
         self.offered.append(kind)
@@ -1662,6 +1666,7 @@ async def test_shutdown_requests_coordinator_stop_before_connections_close() -> 
     await _shutdown_sync_main_context(ctx)
 
     assert coordinator.shutdown_calls == 1
+    assert coordinator.settled_calls == 1
     assert client.disconnect_calls == 1
     assert client.close_scheduler_calls == 1
     assert client.observer_detached
