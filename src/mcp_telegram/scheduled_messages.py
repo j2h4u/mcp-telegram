@@ -55,6 +55,8 @@ from .telegram_rpc_scheduler import (
 logger = logging.getLogger(__name__)
 
 
+_MONOFORUM_UNSUPPORTED_CODE = 400
+_MONOFORUM_UNSUPPORTED_SYMBOL = "CHANNEL_MONOFORUM_UNSUPPORTED"
 _SCHEDULED_SYNC_KEY = "account"
 _DELETE_SCHEDULED_FTS_SQL = "DELETE FROM scheduled_messages_fts WHERE dialog_id=? AND message_id=?"
 _INSERT_SCHEDULED_FTS_SQL = "INSERT INTO scheduled_messages_fts(dialog_id, message_id, stemmed_text) VALUES (?, ?, ?)"
@@ -91,6 +93,21 @@ def _failure_identity(exc: RPCError) -> tuple[str, str, int | None, str | None, 
     else:
         category = "unknown_rpc"
     return category, identity.error_type, identity.code, symbol, 30 if category == "server_error" else 86400
+
+
+def _scheduled_failure(exc: RPCError) -> tuple[str, str, str, int | None, str | None, int]:
+    category, error_type, code, symbol, delay = _failure_identity(exc)
+    observed_stage = getattr(exc, "_scheduled_failure_stage", None)
+    stage = observed_stage if observed_stage in {"scheduled_history", "peer_resolution"} else "unknown"
+    identity = describe_telegram_rpc_error(exc)
+    unsupported = (
+        stage == "scheduled_history"
+        and identity.code == _MONOFORUM_UNSUPPORTED_CODE
+        and identity.symbol == _MONOFORUM_UNSUPPORTED_SYMBOL
+    )
+    if unsupported:
+        category, symbol = "unsupported", _MONOFORUM_UNSUPPORTED_SYMBOL
+    return stage, category, error_type, code, symbol, delay
 
 
 def _attempt_current(conn: sqlite3.Connection, attempt: _SnapshotAttempt) -> bool:
@@ -947,10 +964,11 @@ class ScheduledMessageReconciler:
             return None, False, None
 
     async def _handle_rpc_failure(self, dialog_id: int, attempt: _SnapshotAttempt | None, exc: RPCError) -> str | None:
-        category, error_type, code, symbol, delay = _failure_identity(exc)
+        stage, category, error_type, code, symbol, delay = _scheduled_failure(exc)
         logger.warning(
-            "scheduled_reconcile_rpc_error dialog_id=%d category=%s error_type=%s code=%s symbol=%s",
+            "scheduled_reconcile_rpc_error dialog_id=%d stage=%s category=%s error_type=%s code=%s symbol=%s",
             dialog_id,
+            stage,
             category,
             error_type,
             code,
@@ -963,8 +981,8 @@ class ScheduledMessageReconciler:
             accepted = await self._block_snapshot(attempt, completed, "access_denied", error_type)
             return "blocked" if accepted else "stale"
         reason = f"scheduled_failure:{category}:{error_type}:{code or 0}:{symbol or '-'}"
-        if category == "admin_required":
-            accepted = await self._block_snapshot(attempt, completed, "admin_required", reason)
+        if category in {"admin_required", "unsupported"}:
+            accepted = await self._block_snapshot(attempt, completed, category, reason)
             return "blocked" if accepted else "stale"
         accepted = await self._record_snapshot_failure(attempt, completed, reason, delay)
         return "retry" if accepted else "stale"

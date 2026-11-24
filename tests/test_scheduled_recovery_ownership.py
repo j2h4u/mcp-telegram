@@ -531,3 +531,60 @@ async def test_fresh_event_and_changed_permissions_rearm_only_failure_floor(
         )
         upsert_scheduled_message(conn, 42, _message(11, "fresh event"), now=103)
     assert adapter.status(103).release_at == 103  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("case", ["scheduled", "wrapped", "resolution", "wrapped_resolution", "unknown", "wrong_code"])
+async def test_monoforum_failure_blocks_only_exact_scheduled_method(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, case: str
+) -> None:
+    from telethon.errors import RPCError
+    from telethon.tl.functions import InvokeWithoutUpdatesRequest
+    from telethon.tl.functions.messages import GetScheduledHistoryRequest
+    from telethon.tl.functions.users import GetUsersRequest
+    from telethon.tl.types import InputPeerSelf
+
+    monkeypatch.setattr("mcp_telegram.scheduled_messages.time.time", lambda: 100.0)
+    request = GetScheduledHistoryRequest(peer=InputPeerSelf(), hash=0)
+    if case in {"resolution", "wrapped_resolution"}:
+        request = GetUsersRequest(id=[])
+        if case == "wrapped_resolution":
+            request = InvokeWithoutUpdatesRequest(query=request)
+    elif case == "unknown":
+        request = None
+    error = RPCError(
+        request=request, message="CHANNEL_MONOFORUM_UNSUPPORTED", code=401 if case == "wrong_code" else 400
+    )
+
+    class Client(_ScheduledSnapshotClient):
+        async def get_input_entity(self, dialog_id: int) -> object:
+            if case in {"resolution", "wrapped_resolution"}:
+                raise error
+            return await super().get_input_entity(dialog_id)
+
+        async def __call__(self, request: object, **kwargs: object) -> object:
+            if case in {"scheduled", "wrapped", "wrong_code"}:
+                assert isinstance(request, GetScheduledHistoryRequest)
+                error.request = InvokeWithoutUpdatesRequest(query=request) if case == "wrapped" else request
+            return await super().__call__(request, **kwargs)
+
+    _, reconciler = _coordinator(conn, Client(call_error=error), [100.0])
+    adapter = ScheduledRepairDemandAdapter(reconciler, account_id=42)
+    status = adapter.status(100)
+    assert status is not None and status.selected is not None
+    await adapter.run_slice(RpcAttemptBudget(16, selected=status.selected))
+    block, reason = conn.execute(
+        "SELECT acquisition_block,coverage_reason FROM scheduled_reconciliation_state"
+    ).fetchone()
+    assert conn.execute("SELECT message_id,text FROM scheduled_messages").fetchone() == (11, "draft")
+    if case in {"scheduled", "wrapped"}:
+        assert block == "unsupported" and "CHANNEL_MONOFORUM_UNSUPPORTED" in reason
+        assert adapter.status(100000) is None
+        assert "stage=scheduled_history" in caplog.text
+    else:
+        assert block is None and "CHANNEL_MONOFORUM_UNSUPPORTED" not in reason
+        status = adapter.status(100)
+        assert status is not None and status.release_at == 86500
+        assert (
+            f"stage={'peer_resolution' if case in {'resolution', 'wrapped_resolution'} else 'unknown' if case == 'unknown' else 'scheduled_history'}"
+            in caplog.text
+        )
