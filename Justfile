@@ -115,11 +115,20 @@ deadcode:
 # suite can exhaust memory on GitHub runners even though the uninstrumented
 # suite and both halves pass independently.
 [private]
-coverage-data:
+coverage-shard shard *args:
     test_files=(tests/test_*.py); \
     split=$(((${#test_files[@]} + 1) / 2)); \
-    just test "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report=; \
-    just test "${test_files[@]:split}" --cov=src/mcp_telegram --cov-append --cov-report=
+    case "{{shard}}" in \
+      0) selected=("${test_files[@]:0:split}") ;; \
+      1) selected=("${test_files[@]:split}") ;; \
+      *) echo "Invalid coverage shard: {{shard}}" >&2; exit 1 ;; \
+    esac; \
+    just test "${selected[@]}" --cov=src/mcp_telegram --cov-report= {{args}}
+
+[private]
+coverage-data:
+    just coverage-shard 0
+    just coverage-shard 1 --cov-append
 
 # Enforce the repository-wide CRAP limit of 30 using per-function coverage.
 crap-threshold:

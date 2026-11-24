@@ -118,17 +118,7 @@ jobs:
         run: uv run python -c 'import os, sys; expected = tuple(map(int, os.environ["UV_PYTHON"].split("."))); actual = sys.version_info[:len(expected)]; print(sys.version); assert actual == expected, f"expected {expected}, got {actual}"'
 
       - name: Test one half with coverage
-        run: |
-          # shellcheck disable=SC2016 # expanded by the child shell
-          python3 scripts/ci_pytest_runner.py run -- bash -c '
-            test_files=(tests/test_*.py)
-            split=$(((${#test_files[@]} + 1) / 2))
-            if [ "$1" = 0 ]; then
-              just test "${test_files[@]:0:split}" --cov=src/mcp_telegram --cov-report= --durations=20
-            else
-              just test "${test_files[@]:split}" --cov=src/mcp_telegram --cov-report= --durations=20
-            fi
-          ' _ "${{ matrix.shard }}"
+        run: python3 scripts/ci_pytest_runner.py run -- just coverage-shard "${{ matrix.shard }}" --durations=20
 
       - name: Upload raw coverage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
