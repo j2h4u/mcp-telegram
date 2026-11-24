@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Protocol, cast
 
+from telethon import functions  # type: ignore[import-untyped]
 from telethon.errors import ChatAdminRequiredError, MethodInvalidError, RPCError  # type: ignore[import-untyped]
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.channels import (  # type: ignore[import-untyped]
@@ -1559,6 +1560,35 @@ def translate_reaction_detail_failure(exc: BaseException) -> GatewayFailure:
     return GatewayFailure(GatewayFailureKind.INVALID_TARGET, failure.error_type, failure.error_message, False)
 
 
+async def _resolve_scheduled_peer(client: ScheduledHistoryClient, dialog_id: int) -> TypeInputPeer:
+    try:
+        return cast(TypeInputPeer, await client.get_input_entity(dialog_id))
+    except RPCError as exc:
+        setattr(exc, "_scheduled_failure_stage", "peer_resolution")  # noqa: B010 - bounded operation provenance
+        raise
+
+
+async def _call_scheduled_history(client: ScheduledHistoryClient, request: GetScheduledHistoryRequest) -> object:
+    try:
+        return await client(request)
+    except RPCError as exc:
+        current = cast(object, exc.request)
+        wrappers = (
+            functions.InvokeWithLayerRequest,
+            functions.InitConnectionRequest,
+            functions.InvokeWithoutUpdatesRequest,
+            functions.InvokeAfterMsgRequest,
+            functions.InvokeAfterMsgsRequest,
+        )
+        for _ in range(4):
+            if type(current) not in wrappers:
+                break
+            current = getattr(current, "query", None)
+        if current is request:
+            setattr(exc, "_scheduled_failure_stage", "scheduled_history")  # noqa: B010 - bounded operation provenance
+        raise
+
+
 async def fetch_scheduled_history_snapshot(
     client: ScheduledHistoryClient,
     dialog_id: int,
@@ -1570,8 +1600,8 @@ async def fetch_scheduled_history_snapshot(
     The scheduled reconciliation caller owns the ``SCHEDULED_MESSAGES`` scope;
     this shared adapter deliberately inherits it.
     """
-    input_entity = cast(TypeInputPeer, await client.get_input_entity(dialog_id))
-    result = await client(GetScheduledHistoryRequest(peer=input_entity, hash=0))
+    input_entity = await _resolve_scheduled_peer(client, dialog_id)
+    result = await _call_scheduled_history(client, GetScheduledHistoryRequest(peer=input_entity, hash=0))
     accepted = (types.messages.Messages, types.messages.MessagesSlice, types.messages.ChannelMessages)
     if not isinstance(result, accepted):
         raise ValueError("scheduled history response is not authoritative")
