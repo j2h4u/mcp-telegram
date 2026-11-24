@@ -80,14 +80,18 @@ jobs:
       - name: Static quality gate
         run: just check
 
-  crap-threshold:
+  coverage-shard:
     needs: changes
     if: needs.changes.outputs.run_heavy == 'true'
     runs-on: ubuntu-latest
     env:
       UV_PYTHON: "3.15.2"
       UV_PYTHON_DOWNLOADS: "never"
-    # Include the full suite with instrumentation and both suite halves.
+    # Two file shards use the same Python, not a Python version matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,8 +117,45 @@ jobs:
       - name: Verify selected interpreter
         run: uv run python -c 'import os, sys; expected = tuple(map(int, os.environ["UV_PYTHON"].split("."))); actual = sys.version_info[:len(expected)]; print(sys.version); assert actual == expected, f"expected {expected}, got {actual}"'
 
-      - name: Tests with coverage and CRAP
-        run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold
+      - name: Test one half with coverage
+        run: python3 scripts/ci_pytest_runner.py run -- just coverage-shard "${{ matrix.shard }}" --durations=20
+
+      - name: Upload raw coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: .coverage
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  crap-threshold:
+    needs: [changes, coverage-shard]
+    if: needs.changes.outputs.run_heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15.2"
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: coverage-*
+          path: coverage-parts
+      - name: Combine coverage and enforce CRAP threshold
+        run: |
+          test -f coverage-parts/coverage-0/.coverage
+          test -f coverage-parts/coverage-1/.coverage
+          uv run python -c 'from coverage import CoverageData; from pathlib import Path; paths = [Path("coverage-parts") / f"coverage-{i}" / ".coverage" for i in (0, 1)]; data = [CoverageData(basename=str(p)) for p in paths]; [d.read() for d in data]; assert all(d.has_arcs() and d.measured_files() for d in data), "invalid or empty branch coverage artifact"'
+          uv run coverage combine coverage-parts/coverage-0/.coverage coverage-parts/coverage-1/.coverage
+          uv run coverage json -o coverage.json
+          uv run python -m devtools.crap_threshold --coverage coverage.json --src src/mcp_telegram
 
   docker-build:
     needs: changes
@@ -136,11 +177,22 @@ jobs:
   ci:
     if: always()
     runs-on: ubuntu-latest
-    needs: [changes, quality, crap-threshold, docker-build]
+    needs: [changes, quality, coverage-shard, crap-threshold, docker-build]
     steps:
       - name: Check required jobs
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUN_HEAVY: ${{ needs.changes.outputs.run_heavy }}
+          QUALITY: ${{ needs.quality.result }}
+          SHARDS: ${{ needs.coverage-shard.result }}
+          COVERAGE: ${{ needs.crap-threshold.result }}
+          DOCKER: ${{ needs.docker-build.result }}
         run: |
-          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
-             [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
-            exit 1
+          test "$CHANGES" = success
+          if [ "$RUN_HEAVY" = true ]; then
+            test "$QUALITY" = success && test "$SHARDS" = success && \
+              test "$COVERAGE" = success && test "$DOCKER" = success
+          else
+            test "$RUN_HEAVY" = false && test "$QUALITY" = skipped && \
+              test "$SHARDS" = skipped && test "$COVERAGE" = skipped && test "$DOCKER" = skipped
           fi

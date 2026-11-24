@@ -3327,7 +3327,8 @@ class ReadingService:
         return await self._search_messages(req)
 
     async def list_dialogs(self, req: dict[str, object]) -> dict:
-        return await self._list_dialogs(req)
+        with timing_phase("local_projection"):
+            return await self._list_dialogs(req)
 
     async def get_unread_summary(self, req: dict[str, object]) -> dict:
         return await self._get_unread_summary(req)

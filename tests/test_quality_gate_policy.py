@@ -44,11 +44,6 @@ def test_aggregate_coverage_is_informational_only() -> None:
     assert all("fail-under" not in text for text in (pyproject_text, justfile, workflow))
     assert "coverage-check:" not in justfile
     assert re.search(r"(?m)^coverage:\s*$", justfile) is None
-    assert "just coverage" not in workflow
-    workflow_job_ids = [
-        match.group(1) for match in re.finditer(r"(?m)^  ([a-z][a-z0-9_-]*):\s*$", workflow.partition("jobs:\n")[2])
-    ]
-    assert all("coverage" not in job_id for job_id in workflow_job_ids)
     assert "just coverage-check" not in workflow
 
 
@@ -58,10 +53,15 @@ def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert re.search(r"(?m)^  crap-threshold:\s*$", workflow) is not None
-    assert "run: python3 scripts/ci_pytest_runner.py run -- just crap-threshold" in workflow
-    assert workflow.count("needs: changes") == 3
-    assert workflow.count("if: needs.changes.outputs.run_heavy == 'true'") == 3
-    assert "needs: [changes, quality, crap-threshold, docker-build]" in workflow
+    assert "shard: [0, 1]" in workflow
+    assert workflow.count("-- just coverage-shard") == 1
+    assert "needs: [changes, coverage-shard]" in workflow
+    assert "needs: [changes, quality, coverage-shard, crap-threshold, docker-build]" in workflow
+    assert workflow.count("uv run coverage combine ") == 1
+    assert workflow.count("uv run coverage json ") == 1
+    assert workflow.count("uv run python -m devtools.crap_threshold ") == 1
+    assert 'test "$SHARDS" = success' in workflow
+    assert 'test "$COVERAGE" = success' in workflow
     assert re.search(r"(?m)^  unit:\s*$", workflow) is None
     assert re.search(r"(?m)^radon-threshold:\s*$", justfile) is not None
     assert re.search(r"(?m)^crap-threshold:\s*$", justfile) is not None
@@ -69,7 +69,8 @@ def test_fixed_metric_thresholds_and_coverage_informed_crap_gate() -> None:
     assert "pytest-crap" not in justfile
     assert "--crap" not in justfile
     assert re.search(r"(?m)^coverage-data:\s*$", justfile) is not None
-    assert "--cov-append --cov-report=" in justfile
+    assert "just coverage-shard 0" in justfile
+    assert "just coverage-shard 1 --cov-append" in justfile
     assert justfile.count("just coverage-data;") == 1
     assert justfile.count('uv run coverage json -o "$coverage_file";') == 1
     assert "--cov-report=json:" not in justfile
@@ -108,7 +109,8 @@ def test_full_ci_is_premerge_or_explicit_not_repeated_on_main_or_nightly() -> No
     assert re.search(r"(?m)^  workflow_dispatch:", triggers)
     assert not re.search(r"(?m)^  (push|schedule):", triggers)
     assert "run: just package-smoke" not in workflow
-    assert workflow.count("-- just crap-threshold") == 1
+    assert workflow.count("-- just coverage-shard") == 1
+    assert workflow.count("uv run python -m devtools.crap_threshold ") == 1
 
     codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
     codeql_triggers = codeql.partition("\non:\n")[2].partition("\njobs:")[0]
@@ -166,6 +168,24 @@ def test_instrumented_batches_execute_each_file_once_through_shared_recipe(tmp_p
     assert executed_files == expected_files
     assert "--cov-append" not in invocations[0]
     assert "--cov-append" in invocations[1]
+
+    invocation_log.unlink()
+    for shard in ("0", "1"):
+        subprocess.run(
+            ["just", "coverage-shard", shard, "--durations=20"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    shards = [cast(list[str], json.loads(line)) for line in invocation_log.read_text().splitlines()]
+    assert len(shards) == 2
+    assert [[arg for arg in command if arg.startswith("tests/")] for command in shards] == [
+        expected_files[: (file_count + 1) // 2],
+        expected_files[(file_count + 1) // 2 :],
+    ]
+    assert all("--durations=20" in command and "--cov-append" not in command for command in shards)
 
 
 def test_changed_file_lookup_failure_cannot_skip_heavy_ci(tmp_path: Path) -> None:

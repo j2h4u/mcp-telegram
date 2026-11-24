@@ -118,6 +118,10 @@ def _nested_payload(nested_phases: dict[str, dict[str, float]]) -> dict[str, dic
     }
 
 
+def _writer_payload(phases: dict[str, float]) -> dict[str, float]:
+    return {f"{phase}_ms": value for phase, value in phases.copy().items()}
+
+
 @dataclass(slots=True)
 class DaemonRequestTiming:
     """Bounded evidence accumulated by one daemon request task."""
@@ -131,6 +135,7 @@ class DaemonRequestTiming:
     nested_phases: dict[str, dict[str, float]] = field(default_factory=dict)
     _active_phases: list[str] = field(default_factory=list, repr=False)
     fallback_attempted: bool = False
+    writer_phases: dict[str, float] = field(default_factory=dict)
     rpc_attempts: int = 0
     attempts_capped: bool = False
 
@@ -193,6 +198,10 @@ class DaemonRequestTiming:
         finally:
             self.add_nested_phase(parent, phase, _duration_ms(started_at))
 
+    def add_writer_phase(self, phase: str, duration_ms: float) -> None:
+        if phase in {"admission", "queue", "work"} and math.isfinite(duration_ms) and duration_ms >= 0:
+            self.writer_phases[phase] = self.writer_phases.get(phase, 0.0) + duration_ms
+
     def record_rpc_attempt(self) -> None:
         if self.rpc_attempts >= _MAX_RPC_ATTEMPTS:
             self.attempts_capped = True
@@ -243,6 +252,7 @@ class DaemonRequestTiming:
             "required_phase_count": len(required_phases),
             "not_applicable_phases": not_applicable,
             "nested_phases": _nested_payload(self.nested_phases),
+            "writer_phases": _writer_payload(self.writer_phases),
             "unattributed_ms": unattributed_ms,
         }
 

@@ -15,6 +15,7 @@ from typing import cast
 
 from .delivered_update import isolate_delivered_update
 from .peer_access import reconcile_peers
+from .request_timing import DaemonRequestTiming, current_timing
 from .sync_db import open_runtime_sync_db
 
 _STOP = None
@@ -27,6 +28,19 @@ def _reconcile_peer_access(conn: sqlite3.Connection) -> None:
         reconcile_peers(conn)
     except Exception as error:  # noqa: BLE001 - preserve the already-settled database operation.
         logger.warning("peer_access_reconcile_failed error_type=%s", type(error).__name__)
+
+
+def _timed_callback(
+    callback: Callable[[sqlite3.Connection], object], timing: DaemonRequestTiming
+) -> Callable[[sqlite3.Connection], object]:
+    def run(conn: sqlite3.Connection) -> object:
+        started = time.monotonic()
+        try:
+            return callback(conn)
+        finally:
+            timing.add_writer_phase("work", (time.monotonic() - started) * 1000)
+
+    return run
 
 
 class SQLiteWriterContractError(RuntimeError):
@@ -81,7 +95,13 @@ class SQLiteWriter:
         return writer
 
     async def run[T](self, callback: Callable[[sqlite3.Connection], T]) -> T:
-        await self._slots.acquire()
+        timing = current_timing()
+        admission_started = time.monotonic()
+        try:
+            await self._slots.acquire()
+        finally:
+            if timing is not None:
+                timing.add_writer_phase("admission", (time.monotonic() - admission_started) * 1000)
         with self._state_lock:
             if self._closed or self._fatal_error is not None:
                 self._slots.release()
@@ -156,6 +176,10 @@ class SQLiteWriter:
                     return
                 callback, result, context, admitted_at = item
                 queue_wait = max(0.0, time.monotonic() - admitted_at)
+                timing = context.run(current_timing)
+                if timing is not None:
+                    timing.add_writer_phase("queue", queue_wait * 1000)
+                    callback = _timed_callback(callback, timing)
                 if queue_wait >= _SLOW_QUEUE_SECONDS:
                     logger.warning("sqlite_writer_queue_slow queue_wait_seconds=%.3f", queue_wait)
                 try:

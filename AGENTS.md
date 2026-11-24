@@ -270,9 +270,10 @@ During development, run affected slices. For new complex logic subject to CRAP,
 run the targeted slice with coverage in that same pass and inspect the changed
 functions' coverage and CRAP using the existing `devtools.crap_threshold` metric
 before CI; keep targeted coverage data in temporary files. Do not first run the
-same slice without coverage. The final full suite belongs in PR CI;
-do not duplicate it locally when CI will test the same candidate. CI uses the
-same `just check` and `just crap-threshold` recipes. A failed test or metric is
+same slice without coverage. CI uses `just check` and runs the same two test
+partitions as `just crap-threshold` in parallel before combining coverage. Run the full suite
+locally when using it to qualify a deployment before CI finishes; otherwise,
+reuse the full CI result. A failed test or metric is
 fixed before a new candidate is checked; never rerun an unchanged failure blindly.
 
 Before opening a release candidate, inventory ordinary ready work and tasks
@@ -306,11 +307,17 @@ exercises the changed behavior. Test long timing boundaries with bounded control
 clocks; require a production soak only when the behavior needs observation over
 time. Report delivered behavior separately from remaining verification or work.
 
-Protected PR CI is the release gate. After merge, reuse that result when the
-merged tree matches the checked PR tree; do not dispatch or wait for another
-full main-branch run. If the tree differs, obtain a fresh successful check.
-`just verify` is a standalone full local release path, not an additional gate
-after successful CI. Use `just runtime-verify` for runtime rebuild and smoke.
+Deploy the exact tested tree from any clean branch on our host. A green full
+local check (`just check` and `just crap-threshold`) qualifies it for deployment
+while PR CI runs independently. Alternatively, reuse green PR CI for that exact
+tree. For code-only deployment, `just verify` includes the full local checks,
+rebuild and smoke; use `just runtime-verify` if the tree is already qualified.
+For schema changes, use the documented `just runtime-migrate` path after
+qualification.
+
+Protected PR CI is required for merging into `main`. Reuse the checked PR result
+when the merged tree matches; obtain fresh checks if it differs. Do not dispatch
+another full run or redeploy when the checked, installed and merged trees match.
 
 ## Observability
 
