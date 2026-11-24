@@ -10,7 +10,7 @@ dependencies = [
   "telethon==1.45.0",
   "pydantic>=2.14.3",
   "pydantic-settings>=2.16.2",
-  "typer>=0.28.0",
+  "typer>=0.29.2",
   "xdg-base-dirs>=6.1.0",
   "rapidfuzz>=3.14.6",
   "anyascii>=0.3.3",
@@ -34,7 +34,7 @@ build-backend = "setuptools.build_meta"
 dev = [
     "mypy>=2.4.1",
     "pytest>=9.2.0",
-    "pytest-asyncio>=1.4.1",
+    "pytest-asyncio>=1.5.0",
     "hypothesis>=6.170.15",
     "ruff>=0.17.4",
     "vulture>=2.14",
