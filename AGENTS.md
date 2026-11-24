@@ -270,8 +270,8 @@ During development, run affected slices. For new complex logic subject to CRAP,
 run the targeted slice with coverage in that same pass and inspect the changed
 functions' coverage and CRAP using the existing `devtools.crap_threshold` metric
 before CI; keep targeted coverage data in temporary files. Do not first run the
-same slice without coverage. CI uses the same `just check` and
-`just crap-threshold` recipes as local verification. Run the full suite
+same slice without coverage. CI uses `just check` and runs the same two test
+partitions as `just crap-threshold` in parallel before combining coverage. Run the full suite
 locally when using it to qualify a deployment before CI finishes; otherwise,
 reuse the full CI result. A failed test or metric is
 fixed before a new candidate is checked; never rerun an unchanged failure blindly.
