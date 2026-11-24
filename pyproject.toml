@@ -10,7 +10,7 @@ dependencies = [
   "telethon==1.45.0",
   "pydantic>=2.14.3",
   "pydantic-settings>=2.16.2",
-  "typer>=0.28.0",
+  "typer>=0.29.0",
   "xdg-base-dirs>=6.1.0",
   "rapidfuzz>=3.14.6",
   "anyascii>=0.3.3",
