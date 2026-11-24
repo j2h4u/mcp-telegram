@@ -1139,16 +1139,43 @@ class DaemonAPIServer:
                     raise
                 finally:
                     _current_request_id.reset(request_token)
-                    if method in {"list_messages", "get_inbox"} and timing is not None:
-                        timing.set_served_source(
-                            "local" if method == "get_inbox" and response.get("ok") else _served_source(response)
-                        )
-                        self._record_request_timing(timing, response, cancelled=cancelled)
-                    if method == "export_chat" and timing is not None:
-                        self._record_export_observation(req, timing, response, cancelled=cancelled)
+                    if timing is not None:
+                        self._finish_request_timing(req, method, timing, response, cancelled=cancelled)
 
         self._log_request_completion(method, request_id, response, time.perf_counter() - started_at)
         return response
+
+    def _finish_request_timing(
+        self,
+        req: Mapping[str, object],
+        method: str,
+        timing: DaemonRequestTiming,
+        response: Mapping[str, object],
+        *,
+        cancelled: bool,
+    ) -> None:
+        if method == "export_chat":
+            self._record_export_observation(req, timing, response, cancelled=cancelled)
+        elif method in {"list_messages", "get_inbox"}:
+            timing.set_served_source(
+                "local" if method == "get_inbox" and response.get("ok") else _served_source(response)
+            )
+            self._record_request_timing(timing, response, cancelled=cancelled)
+        elif cancelled or not response.get("ok") or timing.duration_ms() >= self._policy.slow_request_seconds * 1000:
+            self._record_request_timing(timing, response, cancelled=cancelled, method=method)
+
+    def _generic_timing_payload(
+        self, timing: DaemonRequestTiming, method: str, duration_ms: float
+    ) -> dict[str, object]:
+        payload = timing.payload()
+        payload["method"] = method if method in self._dispatch_handlers() else "unknown"
+        if payload["unattributed_ms"] is None:
+            measured = [*timing.writer_phases.values(), *timing.phases.values()]
+            if not measured:
+                payload["unattributed_ms"] = duration_ms
+            else:
+                payload["unattributed_upper_bound_ms"] = duration_ms
+        return payload
 
     def _record_export_observation(
         self,
@@ -1238,13 +1265,14 @@ class DaemonAPIServer:
         response: Mapping[str, object],
         *,
         cancelled: bool = False,
+        method: str | None = None,
     ) -> None:
-        """Enqueue one content-free reading timing observation."""
+        """Enqueue one content-free daemon timing observation."""
         if self._runtime_observation_sink is None:
             return
         try:
-            payload = timing.payload()
             duration_ms = timing.duration_ms()
+            payload = timing.payload() if method is None else self._generic_timing_payload(timing, method, duration_ms)
             operation_id = timing.operation_id
             self._runtime_observation_sink.record(
                 kind=TIMING_KIND,

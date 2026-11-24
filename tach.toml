@@ -699,7 +699,7 @@ depends_on = []
 [[modules]]
 path = "mcp_telegram.sqlite_writer"
 layer = "persistence"
-depends_on = ["mcp_telegram.peer_access", "mcp_telegram.sync_db", "mcp_telegram.delivered_update"]
+depends_on = ["mcp_telegram.peer_access", "mcp_telegram.sync_db", "mcp_telegram.delivered_update", "mcp_telegram.request_timing"]
 
 # Transaction owner for account-fenced identities supplied by history pages.
 [[modules]]
