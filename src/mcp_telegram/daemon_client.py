@@ -447,6 +447,7 @@ class DaemonConnection:
         last_message_since_utc: int | None = None,
         last_message_until_utc: int | None = None,
         navigation: str | None = None,
+        order: str | None = None,
     ) -> dict:
         """List dialogs with optional archive/pin/name filtering."""
         payload: dict = {
@@ -470,6 +471,7 @@ class DaemonConnection:
                     ("last_message_since_utc", last_message_since_utc),
                     ("last_message_until_utc", last_message_until_utc),
                     ("navigation", navigation),
+                    ("order", order),
                 )
                 if value is not None
             }

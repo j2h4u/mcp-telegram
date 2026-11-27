@@ -1986,6 +1986,7 @@ class DaemonAPIServer:
     def _directory_audit_requested(req: dict[str, object]) -> bool:
         return (
             req.get("navigation") is not None
+            or req.get("order") is not None
             or req.get("dialog_type") is not None
             or (req.get("exclude_self") is not None and req.get("exclude_self") is not False)
             or req.get("last_message_since_utc") is not None

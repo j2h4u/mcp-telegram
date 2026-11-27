@@ -9,6 +9,7 @@ import pytest
 from mcp_telegram.dialog_identity_contracts import DialogIdentity
 from mcp_telegram.pagination import (
     DialogDirectoryNavigationToken,
+    _encode_payload,
     decode_dialog_directory_navigation,
     encode_dialog_directory_navigation,
 )
@@ -35,6 +36,23 @@ def test_directory_navigation_signed_and_negative_anchor() -> None:
         decode_dialog_directory_navigation(encoded + "x")
     with pytest.raises(ValueError):
         encode_dialog_directory_navigation(DialogDirectoryNavigationToken(7, "a" * 64, True, 1))
+    payload = {
+        "kind": "dialog_directory",
+        "version": 2,
+        "order": "last_message_at_desc",
+        "account_id": 7,
+        "fingerprint": "a" * 64,
+        "last_dialog_id": 1,
+        "upper_dialog_id": 1,
+        "last_message_at": 2**63,
+    }
+    with pytest.raises(ValueError):
+        decode_dialog_directory_navigation(_encode_payload(payload))
+    for timestamp in (True, 2**63, -(2**63) - 1):
+        with pytest.raises(ValueError):
+            encode_dialog_directory_navigation(
+                DialogDirectoryNavigationToken(7, "a" * 64, 1, 1, "last_message_at_desc", timestamp)
+            )
 
 
 async def test_sparse_directory_pages_bound_examined_candidates_and_preserve_upper(
@@ -297,4 +315,112 @@ async def test_missing_dialog_access_facts_stay_unknown_and_filters_require_evid
         for selector in ("exclude_archived", "ignore_pinned"):
             filtered = await reader.list_dialogs({**req, selector: True})
             assert filtered["data"]["dialogs"] == []
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [("last_message_at_desc", [30, 10, 20, 40]), ("last_message_at_asc", [10, 20, 30, 40])],
+)
+async def test_folder_time_order_across_pages(order: str, expected: list[int]) -> None:
+    conn = _directory_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("UPDATE telegram_folder_projection_state SET account_id=42 WHERE singleton=1")
+    conn.execute(
+        "INSERT INTO telegram_folder_rules(account_id,namespace,folder_id,title,rule_kind,source_position,rule_json,catalog_member) VALUES(42,'filter',2,'Work','filter',0,'{}',1)"
+    )
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,name,type,last_message_at,pinned) VALUES(?,?,'user',?,0)",
+        [(10, "a", 100), (20, "b", 100), (30, "c", 200), (40, "d", None)],
+    )
+    conn.executemany(
+        "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state) VALUES('filter',2,?,'present')",
+        [(10,), (20,), (30,), (40,)],
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 42
+    reader = server._get_reading_service()
+    req = {
+        "verified_account_id": 42,
+        "folder_id": 2,
+        "message_state": "sent",
+        "ignore_pinned": True,
+        "dialog_type": "user",
+        "limit": 1,
+        "order": order,
+    }
+    ids = []
+    while True:
+        page = await reader.list_dialogs(req)
+        assert page["ok"]
+        ids.extend(row["id"] for row in page["data"]["dialogs"])
+        nav = page["data"]["navigation"]
+        assert nav["order"] == order
+        if not nav["has_more"]:
+            break
+        if len(ids) == 1:
+            assert (await reader.list_dialogs({**req, "navigation": nav["next_navigation"], "dialog_type": "bot"}))[
+                "error"
+            ] == "invalid_navigation"
+        req["navigation"] = nav["next_navigation"]
+    assert ids == expected
+    conn.close()
+
+
+async def test_folder_default_time_order_filtered_sparse_pages() -> None:
+    conn = _directory_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.execute("UPDATE telegram_folder_projection_state SET account_id=42 WHERE singleton=1")
+    conn.execute(
+        "INSERT INTO telegram_folder_rules(account_id,namespace,folder_id,title,rule_kind,source_position,rule_json,catalog_member) VALUES(42,'filter',2,'Work','filter',0,'{}',1)"
+    )
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,name,type,last_message_at,pinned) VALUES(?,?,?, ?,0)",
+        [(i, f"peer {i}", "user" if i == 1 else "bot", i) for i in range(1, 503)],
+    )
+    conn.executemany(
+        "INSERT INTO telegram_folder_local_members(namespace,folder_id,dialog_id,state) VALUES('filter',2,?,'present')",
+        [(i,) for i in range(1, 503)],
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 42
+    reader = server._get_reading_service()
+    req = {
+        "verified_account_id": 42,
+        "folder_id": 2,
+        "message_state": "sent",
+        "ignore_pinned": True,
+        "dialog_type": "user",
+        "last_message_since_utc": 1,
+        "last_message_until_utc": 600,
+        "limit": 30,
+    }
+    first = await reader.list_dialogs(req)
+    assert first["data"]["dialogs"] == []
+    nav = first["data"]["navigation"]
+    assert nav["order"] == "last_message_at_desc" and nav["has_more"]
+    second = await reader.list_dialogs({**req, "order": "last_message_at_desc", "navigation": nav["next_navigation"]})
+    assert [row["id"] for row in second["data"]["dialogs"]] == [1]
+    assert not second["data"]["navigation"]["has_more"]
+    conn.close()
+
+
+async def test_archived_folder_orders_by_time() -> None:
+    conn = _directory_db()
+    conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+    conn.executemany(
+        "INSERT INTO dialogs(dialog_id,name,type,last_message_at,archived) VALUES(?,?,'user',?,?)",
+        [(1, "old", 100, 1), (2, "new", 200, 1), (3, "outside", 300, 0)],
+    )
+    conn.commit()
+    server = make_server(conn)
+    server.self_id = 42
+    reader = server._get_reading_service()
+    req = {"verified_account_id": 42, "folder_id": 1, "navigation": "start", "limit": 1}
+    first = await reader.list_dialogs(req)
+    assert [row["id"] for row in first["data"]["dialogs"]] == [2]
+    second = await reader.list_dialogs({**req, "navigation": first["data"]["navigation"]["next_navigation"]})
+    assert [row["id"] for row in second["data"]["dialogs"]] == [1]
     conn.close()
