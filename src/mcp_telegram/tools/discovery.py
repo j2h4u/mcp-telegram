@@ -206,7 +206,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                     "type": "boolean",
                     "description": "Unexamined local candidates remain; a short or empty page may still have a continuation.",
                 },
-                "order": {"const": "dialog_id_asc"},
+                "order": {"enum": ["dialog_id_asc", "last_message_at_asc", "last_message_at_desc"]},
                 "consistency": {
                     "const": "live",
                     "description": "Each page sees current local state; restart for a fresh traversal.",
@@ -239,6 +239,7 @@ LIST_DIALOGS_OUTPUT_SCHEMA = {
                 "last_message_since_utc": {"type": ["string", "null"]},
                 "last_message_until_utc": {"type": ["string", "null"]},
                 "navigation": {"type": ["string", "null"]},
+                "order": {"type": ["string", "null"], "enum": ["last_message_at_asc", "last_message_at_desc", None]},
             },
             "required": [
                 "exclude_archived",
@@ -578,11 +579,15 @@ def _strict_directory_navigation(value: object) -> dict[str, object] | None:
         raise SyncReadModelContractError("navigation must be an object")
     has_more = value.get("has_more")
     cursor = value.get("next_navigation")
-    if not isinstance(has_more, bool) or value.get("order") != "dialog_id_asc" or value.get("consistency") != "live":
+    if (
+        not isinstance(has_more, bool)
+        or value.get("order") not in ("dialog_id_asc", "last_message_at_asc", "last_message_at_desc")
+        or value.get("consistency") != "live"
+    ):
         raise SyncReadModelContractError("invalid directory navigation")
     if not _valid_directory_cursor(has_more, cursor):
         raise SyncReadModelContractError("invalid directory navigation")
-    return {"has_more": has_more, "order": "dialog_id_asc", "consistency": "live", "next_navigation": cursor}
+    return {"has_more": has_more, "order": value["order"], "consistency": "live", "next_navigation": cursor}
 
 
 def _valid_directory_cursor(has_more: bool, cursor: object) -> bool:
@@ -765,7 +770,8 @@ class ListDialogs(ToolArgs):
     A new type, self-exclusion or message-time filter, or navigation="start", selects
     bounded live pages (default limit 100). has_more means unexamined local candidates
     remain: a short or empty page may still have next_navigation. Repeat the same
-    selectors when continuing, and start again for a fresh traversal.
+    selectors when continuing, and start again for a fresh traversal. Restart navigation
+    after a service update. Time order ignores pins; use ignore_pinned to exclude them.
 
     History state and its completion boundary are reported separately from message delivery.
     Call `get_sync_status` for retention policy, history boundary and separate delivery diagnostics.
@@ -787,6 +793,10 @@ class ListDialogs(ToolArgs):
     last_message_until_utc: str | None = Field(
         default=None,
         description="Exclusive UTC bound on the latest observed message creation time; unknown times are excluded.",
+    )
+    order: Literal["last_message_at_asc", "last_message_at_desc"] | None = Field(
+        default=None,
+        description="Sort by latest observed message time; unknown times last, ties by dialog ID ascending. Folder pages default to descending time.",
     )
     navigation: str | None = Field(
         default=None,
@@ -816,6 +826,7 @@ class ListDialogs(ToolArgs):
                 self.last_message_since_utc is not None,
                 self.last_message_until_utc is not None,
                 self.navigation is not None,
+                self.order is not None,
             )
         )
         if self.view == "folders" and uses_dialog_filters:
@@ -846,6 +857,8 @@ def _list_dialogs_filters(args: ListDialogs) -> dict[str, object]:
             last_message_until_utc=args.last_message_until_utc,
             navigation=args.navigation,
         )
+        if args.order is not None:
+            filters["order"] = args.order
     return filters
 
 
@@ -857,6 +870,7 @@ def _directory_audit_requested(args: ListDialogs) -> bool:
             args.last_message_since_utc is not None,
             args.last_message_until_utc is not None,
             args.navigation is not None,
+            args.order is not None,
         )
     )
 
@@ -888,6 +902,7 @@ async def _fetch_directory_audit(conn: DaemonConnection, args: ListDialogs) -> d
         last_message_since_utc=_directory_boundary_seconds(args.last_message_since_utc, "last_message_since_utc"),
         last_message_until_utc=_directory_boundary_seconds(args.last_message_until_utc, "last_message_until_utc"),
         navigation=args.navigation,
+        order=args.order,
     )
 
 

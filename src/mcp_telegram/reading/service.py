@@ -90,6 +90,7 @@ from .sqlite_projection import (
     _compute_snapshot_age_h,
     _read_state_for_dialog,
     count_dialog_rows,
+    directory_time_page_sql,
     message_sent_at,
     read_context_anchor,
     read_daemon_state_int,
@@ -3507,6 +3508,7 @@ class ReadingService:
     def _directory_request_error(req: dict) -> dict | None:
         return (
             ReadingService._directory_selector_error(req)
+            or ReadingService._directory_order_error(req)
             or ReadingService._directory_bounds_error(req)
             or ReadingService._directory_navigation_error(req)
         )
@@ -3523,6 +3525,12 @@ class ReadingService:
                 return {"ok": False, "error": "invalid_input", "message": f"{key} must be a boolean."}
         if req.get("filter") is not None and not isinstance(req["filter"], str):
             return {"ok": False, "error": "invalid_input", "message": "filter must be a string."}
+        return None
+
+    @staticmethod
+    def _directory_order_error(req: dict) -> dict | None:
+        if req.get("order") is not None and req["order"] not in ("last_message_at_asc", "last_message_at_desc"):
+            return {"ok": False, "error": "invalid_input", "message": "Unknown directory order."}
         return None
 
     @staticmethod
@@ -3571,7 +3579,7 @@ class ReadingService:
             conn, req, request, account, dialog_filter, candidates, scheduled_coverage
         )
         has_more = examined is not None and (
-            len(rows) > len(candidates) or examined != _object_to_int(candidates[-1]["dialog_id"])
+            len(rows) > len(candidates) or examined[0] != _object_to_int(candidates[-1]["dialog_id"])
         )
         return self._finish_dialogs_page(
             conn,
@@ -3601,6 +3609,7 @@ class ReadingService:
             req.get("exclude_self", False),
             req.get("last_message_since_utc"),
             req.get("last_message_until_utc"),
+            ReadingService._directory_order(req),
         ]
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
@@ -3619,32 +3628,44 @@ class ReadingService:
         upper, after = ReadingService._directory_page_bounds(conn, req, params, folder_query, (account, fingerprint))
         if upper is None:
             return [], None
-        page_sql = (
-            _FOLDER_DIALOG_ROWS_SQL
-            + " AND m.dialog_id <= :upper_id"
-            + (" AND m.dialog_id > :after_id" if after is not None else "")
-            + " ORDER BY m.dialog_id ASC LIMIT 501"
-            if folder_query
-            else (_DIALOG_DIRECTORY_FIRST_PAGE_SQL if after is None else _DIALOG_DIRECTORY_PAGE_SQL)
-        )
+        order = ReadingService._directory_order(req)
+        after_id = after.last_dialog_id if after else None
+        if order != "dialog_id_asc":
+            page_sql = directory_time_page_sql(folder=folder_query, order=order, continuation=after is not None)
+            return _fetchall_rows(
+                conn.execute(
+                    page_sql,
+                    {
+                        **params,
+                        "after_id": after_id,
+                        "after_time": after.last_message_at if after else None,
+                        "upper_id": upper,
+                    },
+                )
+            ), upper
+        page_sql = _DIALOG_DIRECTORY_FIRST_PAGE_SQL if after is None else _DIALOG_DIRECTORY_PAGE_SQL
         return _fetchall_rows(
             conn.execute(
                 page_sql,
-                {**params, "after_id": after, "upper_id": upper},
+                {**params, "after_id": after_id, "upper_id": upper},
             )
         ), upper
 
     @staticmethod
     def _directory_page_bounds(
         conn: sqlite3.Connection, req: dict, params: dict, folder_query: bool, navigation_scope: tuple[int, str]
-    ) -> tuple[int | None, int | None]:
+    ) -> tuple[int | None, DialogDirectoryNavigationToken | None]:
         account, fingerprint = navigation_scope
         navigation = req.get("navigation")
         if navigation not in (None, "start"):
             cursor = decode_dialog_directory_navigation(navigation)
-            if cursor.account_id != account or cursor.fingerprint != fingerprint:
+            if (
+                cursor.account_id != account
+                or cursor.fingerprint != fingerprint
+                or cursor.order != ReadingService._directory_order(req)
+            ):
                 raise ValueError("Navigation token belongs to a different account or selection")
-            return cursor.upper_dialog_id, cursor.last_dialog_id
+            return cursor.upper_dialog_id, cursor
         upper_sql = (
             "SELECT MAX(dialog_id) FROM (" + _FOLDER_DIALOG_ROWS_SQL + ")"
             if folder_query
@@ -3652,6 +3673,10 @@ class ReadingService:
         )
         result = cast(tuple[int | None], conn.execute(upper_sql, params).fetchone())
         return result[0], None
+
+    @staticmethod
+    def _directory_order(req: dict) -> str:
+        return req.get("order") or ("last_message_at_desc" if req.get("folder_id") is not None else "dialog_id_asc")
 
     def _directory_account_coverage(self, conn: sqlite3.Connection, account: int, directory: dict) -> dict[str, object]:
         result = self._scheduled_account_coverage(conn, account_id=account)
@@ -3674,7 +3699,7 @@ class ReadingService:
         dialog_filter: _ListDialogsFilter,
         candidates: list[Mapping[str, object]],
         scheduled_coverage: dict[str, object],
-    ) -> tuple[list, int | None]:
+    ) -> tuple[list, tuple[int, int | None] | None]:
         ids = [_object_to_int(row["dialog_id"]) for row in candidates]
         identities = read_dialog_identities(conn, ids)
         summaries = (
@@ -3700,7 +3725,7 @@ class ReadingService:
         archived: Mapping[int, bool | None],
         account: int,
         selected_by_id: dict,
-    ) -> tuple[list, int | None]:
+    ) -> tuple[list, tuple[int, int | None] | None]:
         limit = req.get("limit") or 100
         if type(limit) is not int or not 1 <= limit <= _DIRECTORY_PAGE_LIMIT:
             raise ValueError("Invalid page limit")
@@ -3708,7 +3733,7 @@ class ReadingService:
         examined = None
         for row in candidates:
             dialog_id = _object_to_int(row["dialog_id"])
-            examined = dialog_id
+            examined = (dialog_id, _object_to_int_or_none(row["last_message_at"]))
             item = selected_by_id.get(dialog_id)
             if item is None or not ReadingService._directory_page_matches(
                 req, row, identities[dialog_id], folders, archived, account
@@ -3778,7 +3803,7 @@ class ReadingService:
         account: int,
         fingerprint: str,
         upper: int | None,
-        examined: int | None,
+        examined: tuple[int, int | None] | None,
         has_more: bool,
         selected: list,
         scheduled_coverage: dict[str, object],
@@ -3813,7 +3838,7 @@ class ReadingService:
         account: int,
         fingerprint: str,
         upper: int | None,
-        examined: int | None,
+        examined: tuple[int, int | None] | None,
         has_more: bool,
         ids: list[int],
         data: dict,
@@ -3821,10 +3846,12 @@ class ReadingService:
         self._decorate_dialog_facts(conn, req, account, account, data)
         data["navigation"] = {
             "has_more": has_more,
-            "order": "dialog_id_asc",
+            "order": self._directory_order(req),
             "consistency": "live",
             "next_navigation": encode_dialog_directory_navigation(
-                DialogDirectoryNavigationToken(account, fingerprint, examined, upper)
+                DialogDirectoryNavigationToken(
+                    account, fingerprint, examined[0], upper, self._directory_order(req), examined[1]
+                )
             )
             if has_more and examined is not None and upper is not None
             else None,
@@ -3905,7 +3932,7 @@ class ReadingService:
         return (
             any(
                 req.get(key) is not None
-                for key in ("navigation", "dialog_type", "last_message_since_utc", "last_message_until_utc")
+                for key in ("navigation", "dialog_type", "last_message_since_utc", "last_message_until_utc", "order")
             )
             or req.get("exclude_self", False) is not False
         )

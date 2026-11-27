@@ -402,6 +402,7 @@ async def test_audit_cursor_and_utc_bounds_pass_unchanged_to_daemon() -> None:
         last_message_since_utc=1767225600,
         last_message_until_utc=None,
         navigation="opaque.token",
+        order=None,
     )
     payload = cast(dict[str, object], result.structured_content)
     assert cast(dict[str, object], payload["navigation"])["next_navigation"] == "opaque.token"

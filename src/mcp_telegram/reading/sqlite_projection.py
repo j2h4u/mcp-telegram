@@ -268,7 +268,7 @@ ORDER BY pinned DESC, last_message_at DESC, dialog_id ASC
 
 
 # Both branches remain keyset-bounded and SQLite merges their primary-key order.
-_DIALOG_DIRECTORY_PAGE_SQL = """
+_DIALOG_DIRECTORY_BASE_SQL = """
 SELECT d.dialog_id AS dialog_id, d.archived, d.pinned, d.members, d.created, d.last_message_at, d.snapshot_at,
        d.unread_mentions_count, d.unread_reactions_count, d.unread_count,
        CASE tc.applicable WHEN 1 THEN 'supported' WHEN 0 THEN 'unsupported' ELSE 'unknown' END AS topic_capability,
@@ -293,11 +293,29 @@ WHERE sd.status='access_lost' AND d.dialog_id IS NULL
   AND :archived_filter IS NULL AND :pinned_filter IS NULL
   AND NOT EXISTS (SELECT 1 FROM dialog_listing_observations lo JOIN dialog_directory_publication p ON p.singleton=1 AND p.account_id=lo.account_id WHERE lo.dialog_id=sd.dialog_id AND lo.state='not_returned')
   AND sd.dialog_id > :after_id AND sd.dialog_id <= :upper_id
-ORDER BY dialog_id ASC LIMIT 501
 """
-_DIALOG_DIRECTORY_FIRST_PAGE_SQL = _DIALOG_DIRECTORY_PAGE_SQL.replace("sd.dialog_id > :after_id AND ", "").replace(
+_DIALOG_DIRECTORY_PAGE_SQL = _DIALOG_DIRECTORY_BASE_SQL + "ORDER BY dialog_id ASC LIMIT 501"
+_DIALOG_DIRECTORY_FIRST_BASE_SQL = _DIALOG_DIRECTORY_BASE_SQL.replace("sd.dialog_id > :after_id AND ", "").replace(
     "d.dialog_id > :after_id AND ", ""
 )
+_DIALOG_DIRECTORY_FIRST_PAGE_SQL = _DIALOG_DIRECTORY_FIRST_BASE_SQL + "ORDER BY dialog_id ASC LIMIT 501"
+
+
+def directory_time_page_sql(*, folder: bool, order: str, continuation: bool) -> str:
+    base = (_FOLDER_DIALOG_ROWS_SQL + " AND m.dialog_id <= :upper_id") if folder else _DIALOG_DIRECTORY_FIRST_BASE_SQL
+    comparison = ">" if order.endswith("asc") else "<"
+    seek = (
+        f" WHERE (last_message_at IS NULL AND :after_time IS NOT NULL) OR (last_message_at IS :after_time AND dialog_id > :after_id) OR (last_message_at {comparison} :after_time)"
+        if continuation
+        else ""
+    )
+    direction = "ASC" if comparison == ">" else "DESC"
+    return (
+        f"SELECT * FROM ({base})"
+        + seek
+        + f" ORDER BY last_message_at IS NULL, last_message_at {direction}, dialog_id ASC LIMIT 501"
+    )
+
 
 _DIALOG_DIRECTORY_UPPER_SQL = """
 SELECT MAX(bound) FROM (
