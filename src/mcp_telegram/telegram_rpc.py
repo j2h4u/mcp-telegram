@@ -363,7 +363,7 @@ class _AdmissionAwareSender:
     async def _settle_timeout(
         self, sender: _MainSender, raw_future: asyncio.Future[object], wire_owner: _WireAttempt, error: TimeoutError
     ) -> object:
-        if self._gate._durable_read_timeout_owner(wire_owner):
+        if self._gate._can_retire_read_timeout(wire_owner):
             sender.retire_read_timeout(raw_future, wire_owner)
             return await self._drain_timed_read(raw_future)
         self._gate._revoke_wire_owner(wire_owner)
@@ -6212,20 +6212,25 @@ class TelegramRpcGate(TelegramClient):
             and owner.claimed
             and rpc_effect(owner.method) is RpcEffect.NONMUTATING_READ
             and self._ordinary_read_owner(owner)
-            and self._verified_read_budget(owner)
+            and (
+                self._verified_read_budget(owner)
+                or (isinstance(error, RpcReadTimeoutError) and self._verified_native_difference_owner(owner))
+            )
         )
 
-    def _durable_read_timeout_owner(self, owner: _WireAttempt) -> bool:
+    def _can_retire_read_timeout(self, owner: _WireAttempt) -> bool:
         kind = owner.scope.demand_kind
         return bool(
             owner.claimed
             and not owner.terminal
             and not owner.revoked
             and kind is not None
-            and demand_contract(kind).execution_mode is ExecutionMode.DURABLE
             and rpc_effect(owner.method) is RpcEffect.NONMUTATING_READ
             and self._ordinary_read_owner(owner)
-            and self._verified_read_budget(owner)
+            and (
+                (demand_contract(kind).execution_mode is ExecutionMode.DURABLE and self._verified_read_budget(owner))
+                or self._verified_native_difference_owner(owner)
+            )
             and self._transport_state is _TransportBoundaryState.READY
         )
 
@@ -6255,8 +6260,12 @@ class TelegramRpcGate(TelegramClient):
             return False
         if self._verified_read_budget(owner):
             return True
+        return self._verified_native_difference_owner(owner)
+
+    def _verified_native_difference_owner(self, owner: _WireAttempt) -> bool:
         return bool(
-            owner.difference_claimed
+            not owner.revoked
+            and owner.difference_claimed
             and owner.scope.attempt_budget is not None
             and owner.scope.attempt_budget.selected is None
             and owner.scope.demand_kind is DemandKind.TELETHON_UPDATE_DIFFERENCE
@@ -6365,7 +6374,7 @@ class TelegramRpcGate(TelegramClient):
         owner = self._require_wire_owner(owner)
         timer = owner.response_timer
         if owner.claimed and timer is not None and not timer.expired():
-            timer.reschedule(None if self._durable_read_timeout_owner(owner) else owner.scope.deadline)
+            timer.reschedule(None if self._can_retire_read_timeout(owner) else owner.scope.deadline)
 
     def _note_photo_fault_owner(self, owner: _WireAttempt) -> None:
         if self._wire_fault is None and owner.photo_capability is not None and owner.photo_capability.aux_bootstrap:
@@ -8118,14 +8127,8 @@ class TelegramRpcGate(TelegramClient):
             result = await self._call_classified_difference(request, ordered=ordered)
             await self._recover_scheduled_difference_gap(request, result)
             return result
-        except (TelegramRpcThrottled, TelegramRpcMethodRecoveryPending) as exc:
-            if (
-                task is self._update_loop_owner
-                and not connection_owned
-                and isinstance(self._message_box, GateMessageBox)
-            ):
-                self._message_box.preserve_deferred(request, exc)
-                raise TelegramUpdateEligibilityDeferredError("Telegram difference waits for gate eligibility") from exc
+        except (TelegramRpcThrottled, TelegramRpcMethodRecoveryPending, RpcReadTimeoutError) as exc:
+            self._defer_update_difference(request, exc, connection_owned=connection_owned)
             raise
         except RpcAdmissionExpiredError as exc:
             if not connection_owned and exc.source is TelegramRpcSource.TELETHON_UPDATE_DIFFERENCE:
@@ -8133,6 +8136,24 @@ class TelegramRpcGate(TelegramClient):
             raise
         except PeerAccessRejectedError as exc:
             self._handle_update_access_rejection(request, exc, task=task, connection_owned=connection_owned)
+
+    def _defer_update_difference(
+        self,
+        request: object,
+        exc: TelegramRpcThrottled | TelegramRpcMethodRecoveryPending | RpcReadTimeoutError,
+        *,
+        connection_owned: bool,
+    ) -> None:
+        if asyncio.current_task() is not self._update_loop_owner or connection_owned:
+            return
+        if isinstance(exc, RpcReadTimeoutError) and self.account_safety_status() is not None:
+            return
+        hint = self.rpc_eligibility(_canonical_wire_method(request)) if isinstance(exc, RpcReadTimeoutError) else exc
+        if hint is None:
+            raise OSError("Telegram difference timed out") from exc
+        if isinstance(self._message_box, GateMessageBox):
+            self._message_box.preserve_deferred(request, hint)
+            raise TelegramUpdateEligibilityDeferredError("Telegram difference waits for gate eligibility") from exc
 
     def _handle_update_access_rejection(
         self,

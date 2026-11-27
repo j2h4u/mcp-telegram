@@ -3123,3 +3123,149 @@ async def test_daemon_shutdown_settles_retained_profile_before_cancelling_caller
     assert reopened.protection_reason is None and not reopened._unresolved()
     await service.shutdown()
     conn.close()
+
+
+async def test_native_difference_deadline_then_sigterm_recovers_ledger(  # noqa: PLR0914, PLR0915 - physical lifecycle and persistence
+    image_wire: _WireHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    from mcp_telegram import daemon
+    from mcp_telegram.telegram_rpc_scheduler import TelegramRpcAdmissionDeferred
+    from tests.test_daemon import _ConnectionStub, _typed_ctx
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    snapshot = box.session_state()
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), timeout=5)
+        assert isinstance(state.request, functions.updates.GetChannelDifferenceRequest)
+        owner = cast(telegram_rpc._WireAttempt, sender.require_owned(state).owner)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        assert len(sink.frames) == 1 and owner.response_timer is not None
+        deadline = owner.response_timer.when()
+        assert deadline is not None
+        assert 55 < deadline - asyncio.get_running_loop().time() <= 60
+        owner.response_timer.reschedule(asyncio.get_running_loop().time() - 1)
+        async with asyncio.timeout(5):
+            while state in sender._owned_states:
+                await asyncio.sleep(0)
+        assert not owner.revoked and owner.terminal
+        assert state.msg_id not in sender._pending_state
+        assert box.session_state() == snapshot and 11 in box.getting_diff_for
+        hint = gate.rpc_eligibility(owner.method)
+        assert isinstance(hint, TelegramRpcAdmissionDeferred)
+        assert hint.eligible_at is not None and hint.eligible_at > time.monotonic() + 290
+        assert len(sink.frames) == 1
+        await sender._handle_rpc_result(
+            TLMessage(123, 0, RpcResult(state.msg_id, None, types.RpcError(420, "FLOOD_WAIT_600")))
+        )
+        await gate._drain_cooldown_saves()
+        assert gate._ensure_safety_ledger().floor_deadline > time.monotonic() + 590
+        ctx = _typed_ctx(
+            client=gate, conn=_ConnectionStub(), background_tasks={loop}, socket_path=tmp_path / "daemon.sock"
+        )
+        gate.set_shutdown_requested(ctx.shutdown_event.is_set)
+
+        async def keep_fixture_connections(_ctx: object) -> None:
+            pass
+
+        monkeypatch.setattr(daemon, "_close_runtime_connections", keep_fixture_connections)
+        ctx.shutdown_request.request("sigterm")
+        await daemon._shutdown_sync_main_context(ctx)
+        assert box.session_state() == snapshot
+        encoded = gate._safety_store.load_record()
+        assert encoded is not None
+        record = cast(dict[str, object], json.loads(encoded))
+        receipt = next(iter(cast(dict[str, dict[str, object]], record["intents"]).values()))
+        assert (
+            receipt["phase"] == "unknown"
+            and cast(dict[str, object], receipt["read_retry"])["reason"] == "sender_timeout"
+        )
+        saved_scope = cast(dict[str, int], record["scope"])
+        reopened = TelegramRpcSafetyLedger(gate._safety_store, dc_id=saved_scope["dc_id"], key_id=saved_scope["key_id"])
+        assert reopened.protection_reason is None and not reopened._unresolved()
+        assert reopened.floor_deadline > time.monotonic() + 590
+    finally:
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+
+async def test_native_difference_known_response_disarms_deadline_during_receipt(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, _sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    ledger = gate._ensure_safety_ledger()
+    original = cast(Callable[..., Awaitable[object]], ledger.complete)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_complete(*args: object, **kwargs: object) -> object:
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "complete", blocked_complete)
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), 5)
+        owner = cast(telegram_rpc._WireAttempt, sender.require_owned(state).owner)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        timer = owner.response_timer
+        assert timer is not None and timer.when() is not None
+        state.future.set_result(types.updates.ChannelDifferenceEmpty(final=True, pts=22))
+        await asyncio.wait_for(entered.wait(), 5)
+        assert timer.when() is None and not owner.revoked
+        assert not loop.done()
+    finally:
+        release.set()
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+        await gate.close_rpc_scheduler()
+
+
+async def test_native_timeout_elapsed_floor_keeps_update_loop_and_gap(
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from telethon._updates import ChannelState, SessionState
+
+    gate, sender, connection, sink = image_wire
+    box = gate._message_box
+    box.load(SessionState(42, 2, False, 10, 3, 1_700_000_000, 1, None), [ChannelState(11, 21)])
+    gate._mb_entity_cache.extend([], [SimpleNamespace(id=11, access_hash=1, min=False)])
+    box.try_begin_get_diff(11, "fixture channel gap")
+    loop = asyncio.create_task(gate._update_loop())
+    gate._updates_handle = loop
+    try:
+        state = await asyncio.wait_for(sender._send_queue.next_state(), 5)
+        owner = cast(telegram_rpc._WireAttempt, sender.require_owned(state).owner)
+        await sender._prepare_state(state)
+        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        monkeypatch.setattr(gate, "rpc_eligibility", lambda _method=None: None)
+        assert owner.response_timer is not None
+        owner.response_timer.reschedule(asyncio.get_running_loop().time() - 1)
+        async with asyncio.timeout(5):
+            while not owner.terminal:
+                await asyncio.sleep(0)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not loop.done() and 11 in box.getting_diff_for and len(sink.frames) == 1
+        assert gate._ensure_safety_ledger()._record["methods"]
+    finally:
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+        await gate.close_rpc_scheduler()
