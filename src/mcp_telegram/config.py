@@ -72,12 +72,10 @@ class EntityProfileConfig:
     rpc_timeout_seconds: float = 8.0
     # Deprecated compatibility input; it does not limit durable acquisition.
     refresh_timeout_seconds: float = 25.0
-    max_queued_refreshes: int = 128
 
     def __post_init__(self) -> None:
         self._validate_durations()
         self._validate_caps()
-        self._validate_queue_capacity()
 
     def _validate_durations(self) -> None:
         durations = (
@@ -110,14 +108,6 @@ class EntityProfileConfig:
         for value, cap, name in cap_errors:
             if value > cap:
                 raise ValueError(f"entity profile {name} budget cannot exceed {cap:g} seconds")
-
-    def _validate_queue_capacity(self) -> None:
-        if (
-            isinstance(self.max_queued_refreshes, bool)
-            or not isinstance(self.max_queued_refreshes, int)
-            or self.max_queued_refreshes < 1
-        ):
-            raise ValueError("entity profile queue capacity must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -957,7 +947,6 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
             "foreground_refresh_wait_seconds",
             "rpc_timeout_seconds",
             "refresh_timeout_seconds",
-            "max_queued_refreshes",
         },
         "entity_profile",
         path,
@@ -983,9 +972,6 @@ def _parse_entity_profile(data: dict[str, object], path: Path) -> EntityProfileC
             ),
             refresh_timeout_seconds=_positive_float(
                 section, "refresh_timeout_seconds", "entity_profile", path, defaults.refresh_timeout_seconds
-            ),
-            max_queued_refreshes=_positive_int(
-                section, "max_queued_refreshes", "entity_profile", path, defaults.max_queued_refreshes
             ),
         )
     except ValueError as exc:

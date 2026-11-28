@@ -6,12 +6,13 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
 from typing import TextIO, cast
 
-_CAPACITY_MARKERS = ("no space left on device", "disk quota exceeded", "errno 28")
+_CAPACITY_EXCEPTION = re.compile(r"^(?:E\s+)?(?:OSError|PermissionError):\s*\[Errno\s+(?:28|122)\]", re.IGNORECASE)
 _PYTEST_TERMINAL = re.compile(r"^(?:FAILED|ERROR)\s+.+?\s+-\s+(.+)$", re.MULTILINE)
 _SQLITE_EXCEPTION = re.compile(r"^(?:E\s+)?sqlite3\.\w*(?:Error|Exception)\s*:", re.IGNORECASE)
 _SQLITE_CODE = re.compile(r"(?:(?<!\w)sqlite_errorname\s*=\s*|^(?:E\s+)?)(SQLITE_[A-Z0-9_]+)\b(?!\s*=)", re.IGNORECASE)
@@ -30,7 +31,10 @@ def _runner_temp() -> Path:
 
 def _run_diagnostic_command(args: list[str]) -> None:
     print(f"$ {' '.join(args)}", flush=True)
-    subprocess.run(args, check=False)
+    try:
+        subprocess.run(args, check=False)
+    except OSError as error:
+        print(f"diagnostic failed: {error}", flush=True)
 
 
 def report_filesystem_state() -> None:
@@ -79,19 +83,20 @@ def _sqlite_failure(log_text: str) -> str | None:
 
 def classify_failure(log_text: str, runner_temp: Path) -> str:
     """Classify CI failures using log markers and live filesystem capacity."""
-    lowered = log_text.lower()
     usage = shutil.disk_usage(runner_temp)
     stat = os.statvfs(runner_temp)
-    if (
-        any(marker in lowered for marker in _CAPACITY_MARKERS)
-        or usage.free < _MIN_FREE_BYTES
-        or stat.f_favail < _MIN_FREE_INODES
+    summaries = _PYTEST_TERMINAL.findall(log_text)
+    exceptions = [line.strip() for line in log_text.splitlines() if _EXCEPTION.match(line.strip())]
+    capacity_evidence = any(_CAPACITY_EXCEPTION.match(line) for line in [*summaries, *exceptions])
+    unrelated_failure = any(not _CAPACITY_EXCEPTION.match(line) for line in [*summaries, *exceptions])
+    if not unrelated_failure and (
+        capacity_evidence or usage.free < _MIN_FREE_BYTES or stat.f_favail < _MIN_FREE_INODES
     ):
         return "runner_capacity_exhausted"
     sqlite_failure = _sqlite_failure(log_text)
     if sqlite_failure is not None:
         return sqlite_failure
-    if any(marker in lowered for marker in _NATIVE_EXTENSION_LOAD_MARKERS):
+    if any(marker in log_text.lower() for marker in _NATIVE_EXTENSION_LOAD_MARKERS):
         return "native_extension_load_failure"
     return "unknown_failure"
 
@@ -114,14 +119,26 @@ def _run_once(command: list[str], work_dir: Path, attempt: int) -> tuple[int, st
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
         assert process.stdout is not None
         stdout = cast(TextIO, process.stdout)
-        for line in stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            log_file.write(line)
-        return_code = process.wait()
+        try:
+            for line in stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log_file.write(line)
+            return_code = process.wait()
+            stdout.close()
+        except BaseException as error:
+            for cleanup in (lambda: os.killpg(process.pid, signal.SIGKILL), process.wait, stdout.close):
+                try:
+                    cleanup()
+                except ProcessLookupError:
+                    continue
+                except BaseException as cleanup_error:  # noqa: BLE001 - preserve the original failure.
+                    error.add_note(f"CI child cleanup failed: {cleanup_error!r}")
+            raise
     return return_code, log_path.read_text(encoding="utf-8", errors="replace")
 
 
@@ -139,8 +156,12 @@ def run_with_diagnostics(command: list[str]) -> int:
         if return_code == 0:
             return 0
         print(f"pytest_attempt={attempt} exit_code={return_code}", flush=True)
-        report_filesystem_state()
-        outcome = classify_failure(log_text, runner_temp)
+        try:
+            report_filesystem_state()
+            outcome = classify_failure(log_text, runner_temp)
+        except OSError as error:
+            print(f"diagnostic failed: {error}", flush=True)
+            return return_code
         print(f"ci_failure_outcome={outcome}", flush=True)
         if attempt == _MAX_ATTEMPTS or outcome not in _RETRYABLE_OUTCOMES:
             return return_code

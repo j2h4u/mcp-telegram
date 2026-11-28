@@ -1024,15 +1024,6 @@ class DaemonEntityInfoService:
                 result = await self._run_selected_profile_owner(cursor, now=now)
         except _ProfileAccessLostError:
             result = DurableRefreshSliceResult(entity_id)
-        except asyncio.CancelledError:
-            if receipt.accepted_state is not None and self._refresh is not None:
-                status = receipt.accepted_state[1]
-                if status in {"complete", "rejected"}:
-                    terminal = (
-                        DurableRefreshTerminal.SUCCESS if status == "complete" else DurableRefreshTerminal.FAILURE
-                    )
-                    self._refresh.signal_terminal(DurableRefreshSliceResult(entity_id, terminal))
-            raise
         finally:
             _PROFILE_REFRESH_WRITES.reset(token)
         current_state = self._profiles.refresh_work_state(entity_id, scope.account_id)
@@ -1244,7 +1235,7 @@ class DaemonEntityInfoService:
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             now = int(self._deps.now_provider())
-            terminal = await self._handle_profile_section_failure(
+            await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=DialogType.GROUP,
@@ -1254,8 +1245,6 @@ class DaemonEntityInfoService:
                     retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            if terminal is not None:
-                self._signal_foreground_refresh_failure(cursor.entity_id)
             raise
         except (
             TimeoutError,
@@ -1283,8 +1272,6 @@ class DaemonEntityInfoService:
                     retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            if terminal is not None:
-                self._signal_foreground_refresh_failure(cursor.entity_id)
             if self._note_retryable_profile_failure(exc, terminal):
                 return DurableRefreshSliceResult(cursor.entity_id, terminal, retryable_failure=True)
             raise
@@ -1471,7 +1458,7 @@ class DaemonEntityInfoService:
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             now = int(self._deps.now_provider())
-            terminal = await self._handle_profile_section_failure(
+            await self._handle_profile_section_failure(
                 _ProfileSectionFailure(
                     cursor=cursor,
                     entity_type=entity_type,
@@ -1481,8 +1468,6 @@ class DaemonEntityInfoService:
                     retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            if terminal is not None:
-                self._signal_foreground_refresh_failure(cursor.entity_id)
             raise
         except (
             TimeoutError,
@@ -1507,8 +1492,6 @@ class DaemonEntityInfoService:
                 ),
                 guard_scope=_scope_bound_profile_failure(cursor.next_section, exc),
             )
-            if terminal is not None:
-                self._signal_foreground_refresh_failure(cursor.entity_id)
             self._note_retryable_profile_failure(exc, terminal)
             return terminal
         if self._profile_scope_changed_during_acquisition(context.captured_scope):
@@ -1941,8 +1924,6 @@ class DaemonEntityInfoService:
                 received_context=context,
             )
         )
-        if terminal is not None:
-            self._signal_foreground_refresh_failure(cursor.entity_id)
         if flood_wait:
             raise error
         self._note_retryable_profile_failure(error, terminal)
@@ -2780,7 +2761,7 @@ class DaemonEntityInfoService:
         except TelegramRpcThrottled as exc:
             _raise_if_latched(exc)
             now = int(self._deps.now_provider())
-            failed = await self._write_profiles(
+            await self._write_profiles(
                 lambda profiles: profiles.mark_core_failure(
                     cursor,
                     now=now,
@@ -2788,8 +2769,6 @@ class DaemonEntityInfoService:
                     retry_at=self._existing_refresh_retry_at(cursor, now),
                 )
             )
-            if failed:
-                self._signal_foreground_refresh_failure(cursor.entity_id)
             raise
         if entity is None or error is not None:
             return await self._persist_core_refresh_failure(cursor, error)
@@ -2837,7 +2816,6 @@ class DaemonEntityInfoService:
             )
         )
         if failed:
-            self._signal_foreground_refresh_failure(cursor.entity_id)
             cause = error.get("_rpc_exception") if error is not None else None
             if isinstance(cause, BaseException):
                 self._note_retryable_profile_failure(cause, DurableRefreshTerminal.FAILURE)
@@ -2852,10 +2830,6 @@ class DaemonEntityInfoService:
     def _existing_refresh_retry_at(cursor: EntityRefreshCursor, now: int) -> int:
         """Keep an existing business retry floor without creating a new network delay."""
         return max(now, cursor.retry_at or now)
-
-    def _signal_foreground_refresh_failure(self, entity_id: int) -> None:
-        if self._refresh is not None:
-            self._refresh.signal_terminal(DurableRefreshSliceResult(entity_id, DurableRefreshTerminal.FAILURE))
 
     def _success_if_refresh_finished(
         self,

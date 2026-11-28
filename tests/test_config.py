@@ -149,7 +149,6 @@ foreground_resolve_seconds = 2
 foreground_refresh_wait_seconds = 12
 rpc_timeout_seconds = 6
 refresh_timeout_seconds = 20
-max_queued_refreshes = 7
 """,
     )
     assert load_config(path).entity_profile == EntityProfileConfig(
@@ -158,7 +157,6 @@ max_queued_refreshes = 7
         foreground_refresh_wait_seconds=12.0,
         rpc_timeout_seconds=6.0,
         refresh_timeout_seconds=20.0,
-        max_queued_refreshes=7,
     )
 
     invalid = _write_config(

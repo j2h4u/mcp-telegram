@@ -10,10 +10,29 @@ import pytest
 import mcp_telegram.sync_transactions as sync_transactions
 from mcp_telegram.sync_transactions import (
     enable_runtime_writes,
+    read_snapshot,
     require_write_transaction,
     write_savepoint,
     write_transaction,
 )
+
+
+def test_read_snapshot_keeps_one_view_and_preserves_outer_transaction(tmp_path: Path) -> None:
+    path = tmp_path / "snapshot.db"
+    _create_db(path)
+    with closing(sqlite3.connect(path)) as reader, closing(sqlite3.connect(path)) as writer:
+        reader.execute("BEGIN")
+        with read_snapshot(reader):
+            assert reader.execute("SELECT COUNT(*) FROM items").fetchone() == (3,)
+            writer.execute("INSERT INTO items VALUES (4)")
+            writer.commit()
+            with pytest.raises(ValueError), read_snapshot(reader):
+                assert reader.execute("SELECT COUNT(*) FROM items").fetchone() == (3,)
+                raise ValueError("fixture")
+        assert reader.in_transaction
+        assert reader.execute("SELECT COUNT(*) FROM items").fetchone() == (3,)
+        reader.rollback()
+        assert reader.execute("SELECT COUNT(*) FROM items").fetchone() == (4,)
 
 
 def _query_only(conn: sqlite3.Connection) -> bool:

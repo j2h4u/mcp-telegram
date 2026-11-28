@@ -2,7 +2,7 @@
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +19,7 @@ from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.event_handlers import EventHandlerManager, _EditedMessageEvent, _NewMessageEvent
 from mcp_telegram.image_authorization import ActiveSources, ScopeCell
 from mcp_telegram.message_contracts import ExtractedMessage
+from mcp_telegram.message_images import worker as worker_module
 from mcp_telegram.message_images.contracts import ImageScope
 from mcp_telegram.message_images.fence import DurableBudget, SourceFence
 from mcp_telegram.message_images.repository import current_source
@@ -478,7 +479,10 @@ def test_startup_file_reconciliation_preserves_referenced_and_unrelated_files(tm
 
 
 @pytest.mark.asyncio
-async def test_local_read_rechecks_source_after_file_io(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("change", ["photo", "unsupported", "deleted"])
+async def test_local_read_rechecks_source_after_file_io(  # noqa: PLR0915 - complete file race
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
     import asyncio
     import threading
 
@@ -520,10 +524,21 @@ async def test_local_read_rechecks_source_after_file_io(tmp_path: Path, monkeypa
         def replace_photo(db: sqlite3.Connection) -> None:
             with write_transaction(db):
                 db.execute("UPDATE message_image_sources SET photo_id=100 WHERE dialog_id=7 AND message_id=8")
+                if change == "unsupported":
+                    db.execute(
+                        "UPDATE messages SET media_kind=NULL,media_payload=NULL WHERE dialog_id=7 AND message_id=8"
+                    )
+                elif change == "deleted":
+                    db.execute("UPDATE messages SET is_deleted=1 WHERE dialog_id=7 AND message_id=8")
 
         await writer.run(replace_photo)
         proceed.set()
-        assert (await task).image_bytes is None
+        result = await task
+        assert result.image_bytes is None
+        if change == "unsupported":
+            assert result.status["content"] == {"state": "unavailable", "reason": "unsupported_media"}
+        elif change == "deleted":
+            assert result.status["content"] == {"state": "missing", "reason": "message_deleted"}
     finally:
         proceed.set()
         await task
@@ -679,8 +694,9 @@ async def test_source_claim_is_revoked_before_canonical_update_commit(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_read_retries_when_artifact_is_retired_before_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("retire_old", [False, True])
+async def test_read_retries_when_artifact_is_retired_before_open(  # noqa: PLR0915 - complete file race
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retire_old: bool
 ) -> None:
     import asyncio
     import threading
@@ -707,6 +723,10 @@ async def test_read_retries_when_artifact_is_retired_before_open(
             "INSERT INTO message_image_artifacts VALUES(42,7,8,99,1,?,?,?,?,?)",
             (old.filename, old.sha256, old.byte_size, 10, 20),
         )
+        conn.execute(
+            "INSERT INTO message_image_jobs(account_id,dialog_id,message_id,state,attempt_generation,"
+            "source_generation,photo_id,remaining,setup_remaining) VALUES(42,7,8,'running',1,1,99,2,1)"
+        )
     started, proceed = threading.Event(), threading.Event()
     original = service._read_file
 
@@ -724,16 +744,110 @@ async def test_read_retries_when_artifact_is_retired_before_open(
         def replace_artifact(db: sqlite3.Connection) -> None:
             with write_transaction(db):
                 db.execute(
-                    "UPDATE message_image_artifacts SET filename=?,sha256=?,byte_size=?",
+                    "UPDATE message_image_artifacts SET filename=?,sha256=?,byte_size=?,width=30,height=40",
                     (new.filename, new.sha256, new.byte_size),
                 )
-            (directory / "42" / old.filename).unlink()
+                db.execute("UPDATE message_image_jobs SET state='complete'")
+            if retire_old:
+                (directory / "42" / old.filename).unlink()
 
         await writer.run(replace_artifact)
         proceed.set()
-        assert (await task).image_bytes == new_bytes
+        result = await task
+        assert result.image_bytes == new_bytes
+        assert cast(dict[str, object], result.status["content"])["width"] == 30
+        assert result.status["acquisition"] == {"state": "complete"}
     finally:
         proceed.set()
         await task
+        await writer.aclose()
+        conn.close()
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("scope_changes", [False, True])
+async def test_photo_observation_records_dm_edit_even_for_unsupported_replacement(
+    tmp_path: Path, replacement: bool, scope_changes: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "photo-edit.db"
+    ensure_sync_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    now = datetime.now(UTC)
+    photo = types.Photo(99, 555, b"private", now, [], 2)
+    old = types.Message(
+        8,
+        types.PeerUser(7),
+        date=now,
+        message="old caption",
+        from_id=types.PeerUser(7),
+        media=types.MessageMediaPhoto(photo=photo),
+    )
+    new = types.Message(
+        8,
+        types.PeerUser(7),
+        date=now,
+        message="new caption",
+        from_id=types.PeerUser(7),
+        edit_date=now,
+        media=None if replacement else types.MessageMediaPhoto(photo=photo),
+    )
+    with write_transaction(conn):
+        conn.execute("UPDATE dialog_directory_state SET account_id=42 WHERE singleton=1")
+        conn.execute("INSERT INTO entities(id,type,name,updated_at) VALUES(7,'user','person',1)")
+        conn.execute("INSERT INTO dialogs(dialog_id,type) VALUES(7,'user')")
+        insert_messages_with_fts(conn, [replace(extract_message_row(7, old), observation_order=1)])
+        conn.execute("INSERT INTO daemon_state(key,value) VALUES('canonical_observation_sequence','1')")
+    writer = await SQLiteWriter.open(db_path)
+    scope, cell = await _bind_image_scope(writer, TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 100))
+
+    class Gateway:
+        async def resolve_photo(self, target: PhotoTarget, **_kwargs: object) -> PhotoObservation:
+            return PhotoObservation(new, None if replacement else PhotoLocator(99, "x", 2, 8, 10, 20, object()))
+
+        async def open_photo_download(self, *_args: object, **_kwargs: object) -> PhotoDownloadSession:
+            raise RuntimeError("stop after canonical observation")
+
+    service = MessageImageService(conn, writer, tmp_path / "images", scope, lambda: None)
+    worker = MessageImageWorker(conn, writer, tmp_path / "images", scope, Gateway())
+    try:
+        await service.prepare(7, 8)
+        if scope_changes:
+            persist = cast(Callable[..., object], worker_module.persist_edited_message)
+
+            def persist_then_change(*args: object, **kwargs: object) -> object:
+                result = persist(*args, **kwargs)
+                cell.publish(TelegramAuthScope(AUTH_SCOPE_VERSION, 42, 2, 101))
+                return result
+
+            monkeypatch.setattr(worker_module, "persist_edited_message", persist_then_change)
+        await run_ready_slice(worker, limit=32, now=100)
+        if scope_changes:
+            assert conn.execute("SELECT text FROM messages WHERE dialog_id=7 AND message_id=8").fetchone() == (
+                "old caption",
+            )
+            assert conn.execute("SELECT COUNT(*) FROM message_versions").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM conversation_history_events").fetchone() == (0,)
+            return
+        assert conn.execute("SELECT text FROM messages WHERE dialog_id=7 AND message_id=8").fetchone() == (
+            "new caption",
+        )
+        assert conn.execute("SELECT old_text FROM message_versions WHERE dialog_id=7 AND message_id=8").fetchall() == [
+            ("old caption",)
+        ]
+        assert conn.execute(
+            "SELECT kind FROM conversation_history_events WHERE dialog_id=7 AND message_id=8"
+        ).fetchall() == [("edit",)]
+        await _observe_same_photo(writer, new, 3)
+        assert conn.execute("SELECT old_text FROM message_versions WHERE dialog_id=7 AND message_id=8").fetchall() == [
+            ("old caption",)
+        ]
+        if replacement:
+            assert (await service.read(7, 8)).status["content"] == {
+                "state": "unavailable",
+                "reason": "unsupported_media",
+            }
+    finally:
+        await worker.close()
+        await writer.run(scope.sources.unbind)
         await writer.aclose()
         conn.close()

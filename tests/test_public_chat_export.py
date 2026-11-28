@@ -94,6 +94,393 @@ def _restore_export(public: Path, removed: Path) -> ExportDocument:
     return restored
 
 
+@pytest.mark.parametrize("stop_at", ["before_private", "after_private", "after_public"])
+def test_pair_publication_resumes_after_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_at: str
+) -> None:
+    import os
+
+    source = tmp_path / "source.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [{"dialog_id": "-1", "event_id": "1", "actor_name": "secret"}],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 1, "reactors": 0},
+            }
+        )
+    )
+    before = source.read_bytes()
+    public, private = tmp_path / "public.json", tmp_path / "private.json"
+    link = os.link
+
+    def interrupt(src: object, dst: object, *args: object, **kwargs: object) -> None:
+        if stop_at == "before_private" and Path(cast(str, dst)) == private:
+            raise SystemExit
+        link(src, dst, *args, **kwargs)  # type: ignore[arg-type]
+        if (stop_at == "after_private" and Path(cast(str, dst)) == private) or (
+            stop_at == "after_public" and Path(cast(str, dst)) == public
+        ):
+            raise SystemExit
+
+    with monkeypatch.context() as patch:
+        patch.setattr("devtools.public_chat_export.os.link", interrupt)
+        with pytest.raises(SystemExit):
+            sanitize_export(source, public, private)
+    checkpoint = tmp_path / ".public.json.public-resume.sqlite3"
+    assert checkpoint.stat().st_mode & 0o777 == 0o600
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in tmp_path.glob("*.tmp"))
+    sanitize_export(source, public, private)
+    assert source.read_bytes() == before
+    assert "secret" in private.read_text() and "secret" not in public.read_text()
+    assert not list(tmp_path.glob("*.public-resume.sqlite3"))
+
+
+def test_pair_resume_rejects_foreign_destination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    source = tmp_path / "source.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    public, private = tmp_path / "public.json", tmp_path / "private.json"
+    link = os.link
+
+    def interrupt(src: object, dst: object, *args: object, **kwargs: object) -> None:
+        link(src, dst, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(cast(str, dst)) == private:
+            raise SystemExit
+
+    with monkeypatch.context() as patch:
+        patch.setattr("devtools.public_chat_export.os.link", interrupt)
+        with pytest.raises(SystemExit):
+            sanitize_export(source, public, private)
+    public.write_text("foreign")
+    with pytest.raises(FileExistsError):
+        sanitize_export(source, public, private)
+    assert public.read_text() == "foreign"
+
+
+@pytest.mark.parametrize("stop_at", ["private", "public"])
+def test_pair_resumes_after_process_exit(tmp_path: Path, stop_at: str) -> None:
+    import subprocess
+    import sys
+
+    source, public, private = tmp_path / "source.json", tmp_path / "public.json", tmp_path / "private.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    code = """
+import os, sys
+from pathlib import Path
+from devtools.public_chat_export import sanitize_export
+link = os.link
+def crash(src, dst):
+    link(src, dst)
+    if str(dst) == sys.argv[4]:
+        os._exit(17)
+os.link = crash
+sanitize_export(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+"""
+    target = private if stop_at == "private" else public
+    child = subprocess.run(
+        [sys.executable, "-c", code, str(source), str(public), str(private), str(target)], check=False
+    )
+    assert child.returncode == 17
+    sanitize_export(source, public, private)
+    assert public.exists() and private.exists()
+
+
+def test_private_directory_is_synced_before_public_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    import devtools.public_chat_export as exporter
+
+    source = tmp_path / "source.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    private_dir, public_dir = tmp_path / "private", tmp_path / "public"
+    private_dir.mkdir()
+    public_dir.mkdir()
+    private, public = private_dir / "removed.json", public_dir / "public.json"
+    events: list[tuple[str, Path]] = []
+    link = os.link
+    sync = exporter._sync_directory
+
+    def record_link(source: str | Path, destination: str | Path) -> None:
+        events.append(("link", Path(destination)))
+        link(source, destination)
+
+    def record_sync(path: Path) -> None:
+        events.append(("sync", path))
+        sync(path)
+
+    monkeypatch.setattr(exporter.os, "link", record_link)
+    monkeypatch.setattr(exporter, "_sync_directory", record_sync)
+    sanitize_export(source, public, private)
+    private_link = events.index(("link", private))
+    public_link = events.index(("link", public))
+    assert ("sync", private_dir) in events[private_link + 1 : public_link]
+
+
+def test_interrupted_staging_removes_only_recorded_owned_files(tmp_path: Path) -> None:
+    import sqlite3
+    import subprocess
+    import sys
+    from contextlib import closing
+
+    source, public, private = tmp_path / "source.json", tmp_path / "public.json", tmp_path / "private.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    code = """
+import os, sys
+from pathlib import Path
+import devtools.public_chat_export as exporter
+write = exporter._write_public_export
+def crash(*args):
+    result = write(*args)
+    for stream in args[1:3]:
+        stream.flush()
+    os._exit(17)
+exporter._write_public_export = crash
+exporter.sanitize_export(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+"""
+    child = subprocess.run([sys.executable, "-c", code, str(source), str(public), str(private)], check=False)
+    assert child.returncode == 17
+    checkpoint = tmp_path / ".public.json.public-resume.sqlite3"
+    with closing(sqlite3.connect(checkpoint)) as db:
+        row = cast(tuple[str], db.execute("SELECT value FROM state WHERE key='staging'").fetchone())
+        staged = cast(list[list[object]], json.loads(row[0]))
+    unrelated = tmp_path / ".private.json.foreign.tmp"
+    unrelated.write_text("keep")
+    sanitize_export(source, public, private)
+    assert all(not Path(cast(str, item[0])).exists() for item in staged)
+    assert unrelated.read_text() == "keep"
+
+
+def test_pair_checkpoint_recovers_interrupted_sqlite_transaction(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    source, public, private = tmp_path / "source.json", tmp_path / "public.json", tmp_path / "private.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    code = """
+import os, sys
+from pathlib import Path
+from mcp_telegram.chat_export_checkpoint import Checkpoint
+from devtools.public_chat_export import sanitize_export
+def crash(self, values):
+    self.db.execute('PRAGMA cache_size=1')
+    self.db.execute('BEGIN IMMEDIATE')
+    self.set_state('stages', values['stages'])
+    for index in range(1000):
+        self.set_state(f'spill-{index}', 'x' * 4096)
+    os._exit(17)
+Checkpoint.mark_many = crash
+sanitize_export(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+"""
+    child = subprocess.run([sys.executable, "-c", code, str(source), str(public), str(private)], check=False)
+    assert child.returncode == 17
+    journal = tmp_path / ".public.json.public-resume.sqlite3-journal"
+    assert journal.read_bytes()[:8] == bytes.fromhex("d9d505f920a163d7")
+    sanitize_export(source, public, private)
+    assert public.exists() and private.exists()
+
+
+def _empty_export_source(path: Path) -> bytes:
+    path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    return path.read_bytes()
+
+
+def test_interrupted_rollback_withdraws_public_before_private_and_recovers(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    source, public, private = tmp_path / "source.json", tmp_path / "public.json", tmp_path / "private.json"
+    before = _empty_export_source(source)
+    code = """
+import os, sys
+from pathlib import Path
+import devtools.public_chat_export as exporter
+publish = exporter._publish_pair_file
+sync = exporter._sync_directory
+rolling_back = False
+def fail_after_public(stage, destination):
+    global rolling_back
+    publish(stage, destination)
+    if destination == Path(sys.argv[2]):
+        rolling_back = True
+        raise OSError('trigger rollback')
+def interrupt_rollback(path):
+    if rolling_back and not Path(sys.argv[2]).exists():
+        os._exit(17)
+    sync(path)
+exporter._publish_pair_file = fail_after_public
+exporter._sync_directory = interrupt_rollback
+exporter.sanitize_export(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+"""
+    child = subprocess.run([sys.executable, "-c", code, str(source), str(public), str(private)], check=False)
+    assert child.returncode == 17
+    assert not public.exists() and private.exists()
+    assert len(list(tmp_path.glob("*.tmp"))) == 2
+    sanitize_export(source, public, private)
+    assert source.read_bytes() == before and public.exists() and private.exists()
+
+
+def test_prepublication_conflict_and_source_change_leave_no_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import devtools.public_chat_export as exporter
+
+    source, public, private = tmp_path / "source.json", tmp_path / "public.json", tmp_path / "private.json"
+    _empty_export_source(source)
+    public.write_text("foreign")
+    with pytest.raises(FileExistsError):
+        sanitize_export(source, public, private)
+    assert public.read_text() == "foreign"
+    assert not (tmp_path / ".public.json.public-resume.sqlite3").exists()
+    public.unlink()
+    write = exporter._write_public_export
+
+    def mutate(*args: object) -> dict[str, int]:
+        result = write(*args)  # type: ignore[arg-type]
+        source.write_text(source.read_text() + " ")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(exporter, "_write_public_export", mutate)
+        with pytest.raises(ValueError, match="Input changed"):
+            sanitize_export(source, public, private)
+    assert not list(tmp_path.glob("*.tmp"))
+    assert not (tmp_path / ".public.json.public-resume.sqlite3").exists()
+    sanitize_export(source, public, private)
+    assert public.exists() and private.exists()
+
+
+def test_changed_source_after_interruption_cleans_owned_staging_for_next_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import devtools.public_chat_export as exporter
+
+    source, public, private = tmp_path / "source.json", tmp_path / "public.json", tmp_path / "private.json"
+    _empty_export_source(source)
+
+    def interrupt(_stage: list[object], _destination: Path) -> None:
+        raise SystemExit
+
+    with monkeypatch.context() as patch:
+        patch.setattr(exporter, "_publish_pair_file", interrupt)
+        with pytest.raises(SystemExit):
+            sanitize_export(source, public, private)
+    source.write_text(source.read_text() + " ")
+    with pytest.raises(ValueError, match="Input changed"):
+        sanitize_export(source, public, private)
+    assert not list(tmp_path.glob("*.tmp"))
+    assert not (tmp_path / ".public.json.public-resume.sqlite3").exists()
+    sanitize_export(source, public, private)
+    assert public.exists() and private.exists()
+
+
+@pytest.mark.parametrize("suffix", ["", "-journal", "-wal", "-shm"])
+@pytest.mark.parametrize("role", ["source", "private"])
+def test_pair_rejects_sqlite_namespace_collisions(tmp_path: Path, suffix: str, role: str) -> None:
+    reserved = tmp_path / f".public.json.public-resume.sqlite3{suffix}"
+    source = reserved if role == "source" else tmp_path / "source.json"
+    private = reserved if role == "private" else tmp_path / "private.json"
+    _empty_export_source(source)
+    if role == "private":
+        private.write_text("foreign")
+    before = reserved.read_bytes()
+    with pytest.raises(ValueError, match="collides"):
+        sanitize_export(source, tmp_path / "public.json", private)
+    assert reserved.read_bytes() == before
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+@pytest.mark.parametrize("kind", ["file", "symlink"])
+def test_new_pair_refuses_foreign_sqlite_auxiliary(tmp_path: Path, suffix: str, kind: str) -> None:
+    source = tmp_path / "source.json"
+    source_before = _empty_export_source(source)
+    public, private = tmp_path / "public.json", tmp_path / "private.json"
+    marker = tmp_path / ".public.json.public-resume.sqlite3"
+    auxiliary = marker.with_name(marker.name + suffix)
+    if kind == "symlink":
+        auxiliary.symlink_to(source)
+    else:
+        auxiliary.write_bytes(b"foreign SQLite auxiliary sentinel")
+    with pytest.raises(FileExistsError, match="auxiliary path already exists"):
+        sanitize_export(source, public, private)
+    assert source.read_bytes() == source_before
+    assert (
+        auxiliary.is_symlink() if kind == "symlink" else auxiliary.read_bytes() == b"foreign SQLite auxiliary sentinel"
+    )
+    assert not marker.exists() and not public.exists() and not private.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 @pytest.mark.parametrize("format_version", [4, 5])
 def test_public_identity_order_is_independent_of_admin_log_and_private_snapshots(
     tmp_path: Path, format_version: int

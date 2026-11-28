@@ -21,7 +21,6 @@ from mcp_telegram.entity_profile.refresh import (
     DurableRefreshTerminal,
     EntityProfileDemandAdapter,
     EntityRefreshCoordinator,
-    RefreshEnqueueResult,
 )
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.sqlite_writer import SQLiteWriter
@@ -143,7 +142,6 @@ async def test_file_backed_pending_pair_shutdown_preserves_state_then_reopens_fo
     service._deps = replace(service._deps, full_user_auth_scope=None)  # type: ignore[attr-defined]
     coordinator = service.refresh_coordinator  # type: ignore[attr-defined]
     assert coordinator is not None
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
     before = {
         table: conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall()
         for table in ("entities", "entity_details", "entity_detail_sections", "entity_profile_refresh_state")

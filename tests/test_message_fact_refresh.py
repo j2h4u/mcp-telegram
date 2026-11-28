@@ -1219,7 +1219,6 @@ def test_older_message_too_old_witness_does_not_advance_or_reclassify() -> None:
         INSERT INTO entities VALUES (20, 'user');
         INSERT INTO messages VALUES (20, 1, 100, 1, NULL, 0), (20, 2, 300, 1, NULL, 0);
         INSERT INTO message_read_facts VALUES
-            (20, 1, NULL, 1000, 'unavailable', 'message_too_old', NULL),
             (20, 2, NULL, 1000, 'unavailable', 'message_too_old', NULL);
         """
     )
@@ -1233,8 +1232,62 @@ def test_older_message_too_old_witness_does_not_advance_or_reclassify() -> None:
     classified = _persist_message_too_old(conn, 20, 1, sent_at=100, checked_at=2000)
 
     assert classified == 0
-    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (300,)
+    assert conn.execute(
+        "SELECT expired_through_sent_at, observed_at, witness_dialog_id, witness_message_id FROM read_date_expiry_state"
+    ).fetchone() == (300, 1000, 20, 2)
     assert conn.execute("SELECT COUNT(*) FROM message_read_facts WHERE reason='message_too_old'").fetchone() == (2,)
+    conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "UPDATE full_history_enrollment SET enabled=0 WHERE dialog_id=20",
+        "UPDATE synced_dialogs SET status='access_lost' WHERE dialog_id=20",
+        "UPDATE synced_dialogs SET read_outbox_max_id=0 WHERE dialog_id=20",
+        "UPDATE entities SET type='channel' WHERE id=20",
+        "UPDATE messages SET is_deleted=1 WHERE dialog_id=20 AND message_id=1",
+        "UPDATE messages SET sent_at=101 WHERE dialog_id=20 AND message_id=1",
+        "INSERT INTO message_read_facts VALUES (20,1,150,2000,'complete','resolved',NULL)",
+    ],
+)
+async def test_witness_invalidated_during_rpc_cannot_advance_cutoff(change: str) -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 1);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 100, 1, NULL, 0);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    conn.commit()
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            conn.execute(change)
+            conn.commit()
+            return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.MESSAGE_TOO_OLD)
+
+    accepted: list[str] = []
+    await _refresh_stale_read_at_facts(
+        conn,
+        Gateway(),
+        20,
+        [ReadMessage(message_id=1, sent_at=100, dialog_id=20, out=1)],
+        writer=inline_writer(conn),
+        stale_before_utc=2000,
+        checked_at=2000,
+        read_at_ttl_seconds=600,
+        accepted_revisions=accepted,
+    )
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (None,)
+    assert accepted == []
+    if change.startswith("INSERT"):
+        assert conn.execute("SELECT read_at FROM message_read_facts").fetchone() == (150,)
+    else:
+        assert conn.execute("SELECT COUNT(*) FROM message_read_facts").fetchone() == (0,)
     conn.close()
 
 
@@ -1427,6 +1480,48 @@ def test_future_dated_message_too_old_witness_fails_without_cutoff_or_classifica
 
 
 @pytest.mark.asyncio
+async def test_corrected_invalid_witness_during_rpc_is_not_quarantined() -> None:
+    conn = _make_db()
+    conn.executescript(
+        """
+        INSERT INTO synced_dialogs VALUES (20, 'synced', 1);
+        INSERT INTO entities VALUES (20, 'user');
+        INSERT INTO messages VALUES (20, 1, 300, 1, NULL, 0);
+        INSERT INTO message_read_facts VALUES (20, 1, NULL, 100, 'unavailable', 'transient', 200);
+        """
+    )
+    seed_full_history_enrollment(conn, 20, enabled=True)
+    conn.commit()
+
+    class Gateway:
+        async def fetch_outbox_read_date(self, entity: object, message_id: int) -> ReadDateFetchResult:
+            conn.execute("UPDATE messages SET sent_at=150 WHERE dialog_id=20 AND message_id=1")
+            conn.commit()
+            return ReadDateFetchResult(status="unavailable", reason=ReadDateReason.MESSAGE_TOO_OLD)
+
+    accepted: list[str] = []
+    await _refresh_stale_read_at_facts(
+        conn,
+        Gateway(),
+        20,
+        [ReadMessage(message_id=1, sent_at=300, dialog_id=20, out=1)],
+        writer=inline_writer(conn),
+        stale_before_utc=200,
+        checked_at=200,
+        read_at_ttl_seconds=600,
+        accepted_revisions=accepted,
+    )
+    assert conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state").fetchone() == (None,)
+    assert conn.execute("SELECT checked_at, reason, next_attempt_at FROM message_read_facts").fetchone() == (
+        100,
+        "transient",
+        200,
+    )
+    assert accepted == []
+    conn.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_sent_at", [0, -1, 300])
 async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_at: int) -> None:
     conn = _make_db()
@@ -1471,6 +1566,9 @@ async def test_invalid_witness_is_quarantined_and_cycle_continues(invalid_sent_a
     assert conn.execute(
         "SELECT status, reason, next_attempt_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1"
     ).fetchone() == ("unavailable", "message_too_old", None)
+    assert conn.execute("SELECT checked_at FROM message_read_facts WHERE dialog_id=20 AND message_id=1").fetchone() == (
+        200,
+    )
     assert conn.execute(
         "SELECT status, reason FROM message_read_facts WHERE dialog_id=20 AND message_id=2"
     ).fetchone() == ("complete", "resolved")

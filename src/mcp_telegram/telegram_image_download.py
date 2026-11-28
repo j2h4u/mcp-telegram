@@ -64,7 +64,7 @@ class PhotoWork:
 @dataclass(frozen=True, slots=True)
 class PhotoObservation:
     message: object = field(repr=False)
-    locator: PhotoLocator
+    locator: PhotoLocator | None
 
 
 class PhotoUnsupportedError(ValueError):

@@ -3,7 +3,8 @@
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -14,9 +15,10 @@ from ..entity_profile.membership import MembershipSignalCounts
 from ..entity_profile.repository import bound_profile_account
 from ..flood import TelegramRpcThrottled
 from ..image_authorization import ScopeToken
-from ..messages.sqlite_bundle import insert_messages_with_fts
+from ..messages.sqlite_bundle import persist_edited_message
 from ..messages.telegram_adapter import extract_message_row
 from ..observation_order import allocate_observation_order
+from ..reactions.contracts import ReactionAggregateSource
 from ..sqlite_writer import SQLiteWriter
 from ..sync_transactions import write_transaction
 from ..telegram_demand import DemandStatus, RpcAttemptBudget, RpcAttemptBudgetExhaustedError, durable_demand_context
@@ -168,6 +170,12 @@ class MessageImageWorker:
             and current_source(conn, target.dialog_id, target.message_id) == source
             and self._scope.is_current(scope)
         )
+
+    @contextmanager
+    def _guard_observation_scope(self, conn: sqlite3.Connection, scope: ScopeToken) -> Iterator[None]:
+        yield
+        if bound_profile_account(conn) != scope.scope.account_id or not self._scope.is_current(scope):
+            raise RuntimeError("image observation scope changed")
 
     async def _run_transfer(self, selected: WorkRevision, scope: ScopeToken, target: PhotoTarget) -> SliceOutcome:
         attempt, source_generation, offset = (int(part) for part in selected.revision.split(":"))
@@ -331,24 +339,36 @@ class MessageImageWorker:
             target, scope=scope.scope, observation_order=order, budget=allowance, source_fence=source_fence
         )
         locator = observation.locator
-        if locator.size <= 0 or locator.size > PHOTO_MAX_BYTES:
-            raise PhotoUnsupportedError("unsupported_photo")
         extracted = replace(extract_message_row(target.dialog_id, observation.message), observation_order=order)
-        if extracted.message.message_id != target.message_id or extracted.private_photo_id != locator.photo_id:
+        if extracted.message.message_id != target.message_id:
             raise ValueError("photo identity mismatch")
 
         membership_counts: list[MembershipSignalCounts] = []
 
         def apply(conn: sqlite3.Connection) -> ImageSource | None:
-            with write_transaction(conn):
+            with write_transaction(conn), self._guard_observation_scope(conn, scope):
                 if not self._source_is_current(conn, scope, target, source):
                     return None
-                result = insert_messages_with_fts(conn, [extracted], profile_owner_account_id=scope.scope.account_id)
+                result = persist_edited_message(
+                    conn,
+                    extracted,
+                    old_text=None,
+                    edit_date=extracted.message.edit_date,
+                    reaction_source=ReactionAggregateSource.HISTORY,
+                    profile_owner_account_id=scope.scope.account_id,
+                )
                 membership_counts.append(result.membership_counts)
-                if result.accepted_count != 1:
-                    return None
                 updated = current_source(conn, target.dialog_id, target.message_id)
-                if not _matches_resolved_photo(source, updated, locator):
+                if (
+                    locator is None
+                    or not 0 < locator.size <= PHOTO_MAX_BYTES
+                    or not _matches_resolved_photo(source, updated, locator)
+                ):
+                    conn.execute(
+                        "UPDATE message_image_jobs SET state='failed',reason='unsupported_photo' "
+                        "WHERE account_id=? AND dialog_id=? AND message_id=? AND attempt_generation=? AND source_generation=?",
+                        (scope.scope.account_id, target.dialog_id, target.message_id, attempt, generation),
+                    )
                     return None
                 assert updated is not None
                 count = conn.execute(
@@ -371,6 +391,7 @@ class MessageImageWorker:
         if updated is None:
             self._revoke_opening()
             return None
+        assert locator is not None
         fence = SourceFence(self._writer, self._scope, scope, target.dialog_id, target.message_id, updated, attempt)
         session = await self._gateway.open_photo_download(
             locator,

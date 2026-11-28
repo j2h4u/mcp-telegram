@@ -226,6 +226,8 @@ async def execute_script_steps(client: McpTestClient, steps: list[dict[str, Any]
     results: list[dict[str, Any]] = []
     for index, step in enumerate(steps, start=1):
         action = step.get("action")
+        if "expect" in step and isinstance(action, str):
+            _validate_expectations(index, action, step["expect"])
         if action == "list_tools":
             result = await client.list_tools()
             _assert_step_expectations(index=index, action=action, result=result, expect=step.get("expect"))
@@ -300,6 +302,60 @@ async def execute_script_steps(client: McpTestClient, steps: list[dict[str, Any]
     return results
 
 
+_COMMON_EXPECTATIONS = {"one_of", "path_equals", "path_exists", "path_not_exists", "path_nonempty"}
+_ACTION_EXPECTATIONS = {
+    "list_tools": {"tool_names_include", "tool_expectations"},
+    "list_prompts": {"prompt_names_include"},
+    "call_tool": {"is_error", "content_text_contains", "content_text_not_contains"},
+    "get_prompt": {"prompt_text_contains", "prompt_text_not_contains"},
+}
+
+
+def _validate_expectations(index: int, action: str, expect: Any) -> None:
+    if not isinstance(expect, dict) or not expect:
+        raise ValueError(f"script step {index} expectation must be a non-empty object")
+    unknown = expect.keys() - (_COMMON_EXPECTATIONS | _ACTION_EXPECTATIONS.get(action, set()))
+    if unknown:
+        raise ValueError(f"script step {index} unsupported expectation keys: {sorted(unknown)}")
+    for key, value in expect.items():
+        if key == "one_of":
+            if not isinstance(value, list) or not value:
+                raise ValueError(f"script step {index} expect.one_of must be a non-empty list")
+            for candidate in value:
+                _validate_expectations(index, action, candidate)
+        else:
+            _validate_expectation_field(index, key, value)
+
+
+def _valid_expectation_path(path: Any) -> bool:
+    return isinstance(path, str) and all(path.split("."))
+
+
+def _validate_expectation_field(index: int, key: str, value: Any) -> None:
+    if key == "is_error":
+        if not isinstance(value, bool):
+            raise ValueError(f"script step {index} expect.is_error must be a boolean")
+    elif key == "path_equals":
+        if not isinstance(value, dict) or not value or not all(_valid_expectation_path(path) for path in value):
+            raise ValueError(f"script step {index} expect.path_equals must be a non-empty path map")
+    elif key == "tool_expectations":
+        _validate_tool_expectations(index, value)
+    elif not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise ValueError(f"script step {index} expect.{key} must be a non-empty list of strings")
+    elif key.startswith("path_") and not all(_valid_expectation_path(path) for path in value):
+        raise ValueError(f"script step {index} expect.{key} contains an invalid path")
+
+
+def _validate_tool_expectations(index: int, value: Any) -> None:
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"script step {index} expect.tool_expectations must be a non-empty object")
+    for name, paths in value.items():
+        if not isinstance(name, str) or not name or not isinstance(paths, dict) or not paths:
+            raise ValueError(f"script step {index} invalid tool expectations")
+        if not all(_valid_expectation_path(path) for path in paths):
+            raise ValueError(f"script step {index} invalid tool expectation path")
+
+
 def _assert_step_expectations(
     *,
     index: int,
@@ -309,8 +365,7 @@ def _assert_step_expectations(
 ) -> None:
     if expect is None:
         return
-    if not isinstance(expect, dict):
-        raise ValueError(f"script step {index} field 'expect' must be an object")
+    _validate_expectations(index, action, expect)
 
     one_of = expect.get("one_of")
     if one_of is not None:
@@ -320,10 +375,11 @@ def _assert_step_expectations(
         for candidate in one_of:
             try:
                 _assert_step_expectations(index=index, action=action, result=result, expect=candidate)
-                return
+                break
             except McpClientError as exc:
                 errors.append(str(exc))
-        raise McpClientError(f"script step {index} did not match any expect.one_of branch: {'; '.join(errors)}")
+        else:
+            raise McpClientError(f"script step {index} did not match any expect.one_of branch: {'; '.join(errors)}")
 
     path_equals = expect.get("path_equals")
     if path_equals is not None:

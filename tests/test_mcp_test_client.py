@@ -4,12 +4,17 @@ import json
 import re
 from pathlib import Path
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 from devtools.mcp_client.cli import print_json, redact_script_output
 from devtools.mcp_client.client import (
     DEFAULT_TIMEOUT_SECONDS,
+    McpClientError,
+    McpTestClient,
     _assert_step_expectations,
+    _validate_expectations,
+    execute_script_steps,
     load_script_steps,
 )
 
@@ -52,6 +57,103 @@ def test_mcp_test_client_script_asserts_structured_paths() -> None:
             "path_nonempty": ["structuredContent.dialogs"],
         },
     )
+
+
+@pytest.mark.parametrize(
+    "expect",
+    [
+        {"is_eror": False},
+        {"one_of": []},
+        {"one_of": [{}]},
+        {"one_of": [{"is_error": False}, {"unknown": True}]},
+        {"one_of": [{"is_error": False}, {"path_exists": []}]},
+        {"one_of": [{"is_error": False}, {"is_error": None}]},
+        {"one_of": [{"is_error": False}, {"one_of": []}]},
+        {"tool_names_include": ["x"]},
+        {"is_error": None},
+    ],
+)
+async def test_script_rejects_invalid_expectations_even_in_unselected_branch(expect: dict[str, object]) -> None:
+    client = cast(McpTestClient, AsyncMock())
+    cast(AsyncMock, client.call_tool).return_value = {"isError": False}
+    with pytest.raises(ValueError):
+        await execute_script_steps(client, [{"action": "call_tool", "name": "x", "expect": expect}])
+    cast(AsyncMock, client.call_tool).assert_not_awaited()
+
+
+@pytest.mark.parametrize("path", [".field", "field.", "structuredContent..count"])
+@pytest.mark.parametrize("field", ["path_equals", "path_exists", "path_not_exists", "path_nonempty"])
+async def test_script_rejects_empty_path_segments_before_call(field: str, path: str) -> None:
+    client = cast(McpTestClient, AsyncMock())
+    expected = {path: 1} if field == "path_equals" else [path]
+    with pytest.raises(ValueError):
+        await execute_script_steps(client, [{"action": "call_tool", "name": "x", "expect": {field: expected}}])
+    cast(AsyncMock, client.call_tool).assert_not_awaited()
+
+
+async def test_script_rejects_empty_tool_path_segment_before_call() -> None:
+    client = cast(McpTestClient, AsyncMock())
+    with pytest.raises(ValueError):
+        await execute_script_steps(
+            client,
+            [{"action": "list_tools", "expect": {"tool_expectations": {"x": {"inputSchema..type": "object"}}}}],
+        )
+    cast(AsyncMock, client.list_tools).assert_not_awaited()
+
+
+async def test_script_rejects_null_expectation_before_call() -> None:
+    client = cast(McpTestClient, AsyncMock())
+    with pytest.raises(ValueError):
+        await execute_script_steps(client, [{"action": "call_tool", "name": "x", "expect": None}])
+    cast(AsyncMock, client.call_tool).assert_not_awaited()
+
+
+async def test_script_enforces_siblings_after_matching_alternative() -> None:
+    client = cast(McpTestClient, AsyncMock())
+    cast(AsyncMock, client.call_tool).return_value = {"isError": False, "structuredContent": {"count": 0}}
+    with pytest.raises(McpClientError, match="expected path"):
+        await execute_script_steps(
+            client,
+            [
+                {
+                    "action": "call_tool",
+                    "name": "x",
+                    "expect": {
+                        "one_of": [{"is_error": False}, {"is_error": True}],
+                        "path_equals": {"structuredContent.count": 1},
+                    },
+                }
+            ],
+        )
+
+
+async def test_script_accepts_matching_alternative_and_siblings() -> None:
+    client = cast(McpTestClient, AsyncMock())
+    cast(AsyncMock, client.call_tool).return_value = {"isError": False, "structuredContent": {"count": 1}}
+    results = await execute_script_steps(
+        client,
+        [
+            {
+                "action": "call_tool",
+                "name": "x",
+                "expect": {
+                    "one_of": [{"is_error": True}, {"is_error": False}],
+                    "path_equals": {"structuredContent.count": 1},
+                },
+            }
+        ],
+    )
+    assert len(results) == 1
+
+
+def test_shipped_smoke_expectation_grammar() -> None:
+    for path in (_repo_root() / "devtools/mcp_client").glob("smoke-*.json"):
+        script = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        for index, step in enumerate(cast(list[dict[str, object]], script["steps"]), 1):
+            if "expect" in step:
+                action = step["action"]
+                assert isinstance(action, str)
+                _validate_expectations(index, action, step["expect"])
 
 
 def test_mcp_test_client_redacts_structured_content() -> None:

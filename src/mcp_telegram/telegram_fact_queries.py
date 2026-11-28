@@ -387,6 +387,25 @@ def _read_date_rpc_still_eligible(
     )
 
 
+def _eligible_read_date_witness(
+    conn: sqlite3.Connection, dialog_id: int, message_id: int, *, sent_at: int, checked_at: int
+) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM messages m "
+            "JOIN synced_dialogs sd ON sd.dialog_id=m.dialog_id "
+            "JOIN full_history_enrollment fhe ON fhe.dialog_id=m.dialog_id AND fhe.enabled=1 "
+            "JOIN entities e ON e.id=m.dialog_id "
+            "LEFT JOIN message_read_facts f ON f.dialog_id=m.dialog_id AND f.message_id=m.message_id "
+            "WHERE m.dialog_id=? AND m.message_id=? AND m.sent_at=? AND m.out=1 AND m.is_deleted=0 "
+            "AND sd.status='synced' AND lower(e.type)='user' AND m.message_id<=sd.read_outbox_max_id "
+            "AND (f.dialog_id IS NULL OR (f.next_attempt_at IS NOT NULL AND f.next_attempt_at<=?))",
+            (dialog_id, message_id, sent_at, checked_at),
+        ).fetchone()
+        is not None
+    )
+
+
 def _persist_message_too_old(  # noqa: PLR0913 - optional committed receipt output is explicit
     conn: sqlite3.Connection,
     dialog_id: int,
@@ -406,6 +425,8 @@ def _persist_message_too_old(  # noqa: PLR0913 - optional committed receipt outp
     if not 0 < sent_at <= checked_at:
         raise InvalidReadDateWitnessError("read-date witness must satisfy 0 < sent_at <= checked_at")
     with write_transaction(conn):
+        if not _eligible_read_date_witness(conn, dialog_id, message_id, sent_at=sent_at, checked_at=checked_at):
+            return 0
         previous = _read_date_business_state(conn, dialog_id, message_id)
         inserted, updated = _advance_read_date_cutoff(
             conn, dialog_id, message_id, sent_at=sent_at, checked_at=checked_at
@@ -436,21 +457,22 @@ def _advance_read_date_cutoff(
 ) -> tuple[int, int]:
     state = cast(
         tuple[object, ...],
-        conn.execute("SELECT expired_through_sent_at FROM read_date_expiry_state WHERE singleton=1").fetchone(),
+        conn.execute(
+            "SELECT expired_through_sent_at, observed_at FROM read_date_expiry_state WHERE singleton=1"
+        ).fetchone(),
     )
     current_cutoff = None if state[0] is None else int(cast(int | str, state[0]))
     cutoff = sent_at if current_cutoff is None else max(current_cutoff, sent_at)
-    if current_cutoff is None or sent_at >= current_cutoff:
-        conn.execute(
-            "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
-            "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
-            (cutoff, checked_at, dialog_id, message_id),
-        )
-    else:
-        conn.execute(
-            "UPDATE read_date_expiry_state SET observed_at=? WHERE singleton=1",
-            (checked_at,),
-        )
+    if current_cutoff is not None and (
+        sent_at < current_cutoff
+        or (sent_at == current_cutoff and state[1] is not None and checked_at <= int(cast(int, state[1])))
+    ):
+        return 0, 0
+    conn.execute(
+        "UPDATE read_date_expiry_state SET expired_through_sent_at=?, observed_at=?, "
+        "witness_dialog_id=?, witness_message_id=? WHERE singleton=1",
+        (cutoff, checked_at, dialog_id, message_id),
+    )
     inserted = conn.execute(_READ_DATE_EXPIRY_INSERT_SQL, (checked_at, cutoff, dialog_id, message_id)).rowcount
     updated = conn.execute(_READ_DATE_EXPIRY_UPDATE_SQL, (checked_at, cutoff, dialog_id, message_id)).rowcount
     return int(inserted or 0), int(updated or 0)
@@ -579,29 +601,22 @@ def _quarantine_invalid_read_date_witness(
     dialog_id: int,
     message_id: int,
     *,
+    sent_at: int,
     checked_at: int,
 ) -> None:
     """Store a malformed age witness through the ordinary monotonic fence."""
-    row = cast(
-        tuple[object, ...] | None,
-        conn.execute(
-            "SELECT checked_at FROM message_read_facts WHERE dialog_id=? AND message_id=?",
-            (dialog_id, message_id),
-        ).fetchone(),
-    )
-    persisted_checked_at = checked_at
-    if row is not None:
-        persisted_checked_at = max(persisted_checked_at, int(cast(int | str, row[0])) + 1)
-    persist_read_at(
-        conn,
-        dialog_id,
-        message_id,
-        read_at=None,
-        checked_at=persisted_checked_at,
-        status="unavailable",
-        reason=ReadDateReason.MESSAGE_TOO_OLD,
-        next_attempt_at=None,
-    )
+    with write_transaction(conn):
+        if _eligible_read_date_witness(conn, dialog_id, message_id, sent_at=sent_at, checked_at=checked_at):
+            _persist_read_at_v70(
+                conn,
+                dialog_id,
+                message_id,
+                read_at=None,
+                checked_at=checked_at,
+                status="unavailable",
+                reason=ReadDateReason.MESSAGE_TOO_OLD,
+                next_attempt_at=None,
+            )
 
 
 def _persist_fetched_read_date(  # noqa: PLR0913
@@ -638,7 +653,9 @@ def _persist_fetched_read_date(  # noqa: PLR0913
     except InvalidReadDateWitnessError:
         # Telegram explicitly returned MESSAGE_TOO_OLD. Quarantine only this
         # malformed local witness; it must not advance or classify globally.
-        _quarantine_invalid_read_date_witness(conn, dialog_id, message.message_id, checked_at=checked_at)
+        _quarantine_invalid_read_date_witness(
+            conn, dialog_id, message.message_id, sent_at=message.sent_at, checked_at=checked_at
+        )
         locally_classified = 0
         accepted_revision = None
         if cycle_metrics is not None:
@@ -703,7 +720,8 @@ def _persist_read_at_v70(  # noqa: PLR0913
         "WHERE NOT (message_read_facts.status = 'complete' AND message_read_facts.read_at IS NOT NULL) "
         "AND ((excluded.status = 'complete' AND excluded.read_at IS NOT NULL) "
         "OR (message_read_facts.reason != 'message_too_old' "
-        "AND excluded.checked_at > message_read_facts.checked_at))",
+        "AND (excluded.checked_at > message_read_facts.checked_at OR "
+        "(excluded.reason = 'message_too_old' AND excluded.checked_at = message_read_facts.checked_at))))",
         (dialog_id, message_id, read_at, checked_at, status, reason.value, next_attempt_at, dialog_id),
     )
 

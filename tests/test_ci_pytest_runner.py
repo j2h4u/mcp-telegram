@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +25,123 @@ def test_capacity_failure_takes_precedence(monkeypatch: pytest.MonkeyPatch, tmp_
     assert ci_pytest_runner.classify_failure("OSError: [Errno 28] No space left on device", tmp_path) == (
         "runner_capacity_exhausted"
     )
+
+
+@pytest.mark.parametrize("message", ["OSError: no space left on device", "OSError: disk quota exceeded"])
+def test_capacity_prose_is_not_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, message: str) -> None:
+    _healthy_capacity(monkeypatch)
+    assert ci_pytest_runner.classify_failure(message, tmp_path) == "unknown_failure"
+
+
+def test_diagnostic_failure_preserves_exit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setattr(ci_pytest_runner, "_run_once", lambda *_args: (7, "test failure"))
+    monkeypatch.setattr(ci_pytest_runner, "report_filesystem_state", lambda: (_ for _ in ()).throw(OSError("broken")))
+    assert ci_pytest_runner.run_with_diagnostics(["pytest"]) == 7
+
+
+def test_assertion_capacity_text_does_not_retry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _healthy_capacity(monkeypatch)
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    calls: list[int] = []
+
+    def fail(_command: list[str], _work_dir: Path, attempt: int) -> tuple[int, str]:
+        calls.append(attempt)
+        return (
+            7,
+            "E   AssertionError: No space left on device\nFAILED test_x.py::test_x - AssertionError: No space left on device",
+        )
+
+    monkeypatch.setattr(ci_pytest_runner, "_run_once", fail)
+    monkeypatch.setattr(ci_pytest_runner, "report_filesystem_state", lambda: None)
+    assert ci_pytest_runner.run_with_diagnostics(["pytest"]) == 7
+    assert calls == [1]
+
+
+def test_real_child_failure_keeps_exit_and_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _healthy_capacity(monkeypatch)
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("GITHUB_JOB", "local")
+    monkeypatch.setattr(ci_pytest_runner, "report_filesystem_state", lambda: None)
+    message = "FAILED test_x.py::test_x - AssertionError: No space left on device"
+    command = [sys.executable, "-c", f"import sys; print({message!r}); sys.exit(7)"]
+    assert ci_pytest_runner.run_with_diagnostics(command) == 7
+    assert (tmp_path / "pt/l/a1/pytest.log").read_text().strip() == message
+    assert not (tmp_path / "pt/l/a2").exists()
+
+
+def test_confirmed_capacity_error_retries_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _healthy_capacity(monkeypatch)
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    calls: list[int] = []
+
+    def fail(_command: list[str], work_dir: Path, attempt: int) -> tuple[int, str]:
+        calls.append(attempt)
+        (work_dir / f"a{attempt}").mkdir()
+        return 7, "E   OSError: [Errno 28] No space left on device"
+
+    monkeypatch.setattr(ci_pytest_runner, "_run_once", fail)
+    monkeypatch.setattr(ci_pytest_runner, "report_filesystem_state", lambda: None)
+    assert ci_pytest_runner.run_with_diagnostics(["pytest"]) == 7
+    assert calls == [1, 2]
+
+
+def test_child_is_reaped_when_output_read_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class BrokenOutput:
+        def __iter__(self) -> object:
+            raise KeyboardInterrupt
+
+        def close(self) -> None:
+            pass
+
+    class Child:
+        pid = 123
+        stdout = BrokenOutput()
+        waited = False
+
+        def wait(self) -> int:
+            self.waited = True
+            return -9
+
+    child = Child()
+    groups: list[int] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(ci_pytest_runner.os, "killpg", lambda pid, _signal: groups.append(pid))
+    with pytest.raises(KeyboardInterrupt):
+        ci_pytest_runner._run_once(["pytest"], tmp_path, 1)
+    assert groups == [123] and child.waited
+
+
+def test_output_failure_kills_real_process_group(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    marker = tmp_path / "child-pid"
+    code = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        f"Path({str(marker)!r}).write_text(str(p.pid)); "
+        "print('started', flush=True); time.sleep(60)"
+    )
+
+    class BrokenStdout:
+        def write(self, _value: str) -> int:
+            raise OSError("output failed")
+
+        def flush(self) -> None:
+            pass
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(sys, "stdout", BrokenStdout())
+        with pytest.raises(OSError, match="output failed"):
+            ci_pytest_runner._run_once([sys.executable, "-c", code], tmp_path, 1)
+    pid = int(marker.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        status = Path(f"/proc/{pid}/stat")
+        if not status.exists() or status.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("descendant remained running after CI output failure")
 
 
 def test_sqlite_ioerr_on_healthy_filesystem_is_runner_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -7,8 +7,10 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
+from contextlib import AsyncExitStack, closing
 from http.client import HTTPResponse
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn, cast
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -337,11 +339,32 @@ async def _run_supported_cli(port: int, script_path: Path) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    drain = asyncio.create_task(process.communicate())
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
-    except TimeoutError:
-        process.kill()
-        await process.wait()
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(drain), timeout=60)
+    except BaseException as error:
+        try:
+            if process.returncode is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except BaseException as cleanup_error:  # noqa: BLE001 - preserve the original failure.
+            error.add_note(f"CLI termination failed: {cleanup_error!r}")
+        for task in (
+            cast(asyncio.Task[object], drain),
+            cast(asyncio.Task[object], asyncio.create_task(process.wait())),
+        ):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:  # noqa: BLE001 - retrieve the failure below.
+                    break
+            try:
+                task.result()
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve the original failure.
+                error.add_note(f"CLI cleanup failed: {cleanup_error!r}")
         raise
     assert process.returncode == 0, (
         f"supported devtools CLI failed ({process.returncode}); "
@@ -354,7 +377,18 @@ async def _run_isolated_mcp_scenario(
     telegram: _FailOnRpcClient,
     script_path: Path,
 ) -> None:
-    feedback_conn = sqlite3.connect(":memory:")
+    async with AsyncExitStack() as stack:
+        feedback_conn = stack.enter_context(closing(sqlite3.connect(":memory:")))
+        await _run_isolated_mcp_with_feedback(conn, telegram, script_path, feedback_conn, stack)
+
+
+async def _run_isolated_mcp_with_feedback(  # noqa: PLR0915
+    conn: sqlite3.Connection,
+    telegram: _FailOnRpcClient,
+    script_path: Path,
+    feedback_conn: sqlite3.Connection,
+    stack: AsyncExitStack,
+) -> None:
     feedback_conn.execute(
         "CREATE TABLE feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, submitted_at INTEGER NOT NULL, "
         "message TEXT NOT NULL, severity TEXT, context TEXT, model TEXT, harness TEXT)"
@@ -371,9 +405,33 @@ async def _run_isolated_mcp_scenario(
     state_dir.mkdir(parents=True, exist_ok=True)
     socket_path = get_daemon_socket_path(state_dir)
     unix_server = await asyncio.start_unix_server(api.handle_client, path=str(socket_path))
+    stack.callback(socket_path.unlink, missing_ok=True)
+
+    async def close_unix_server() -> None:
+        unix_server.close()
+        await unix_server.wait_closed()
+
+    stack.push_async_callback(close_unix_server)
     port = _unused_loopback_port()
     stop_event = asyncio.Event()
     http_task = asyncio.create_task(run_mcp_http_server(host="127.0.0.1", port=port, stop_event=stop_event))
+    body_error: BaseException | None = None
+
+    async def stop_http() -> None:
+        stop_event.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(http_task), timeout=10)
+        except TimeoutError:
+            http_task.cancel()
+        except BaseException as error:
+            if body_error is None:
+                raise
+            if body_error is not error:
+                body_error.add_note(f"HTTP shutdown failed: {error!r}")
+        finally:
+            await asyncio.gather(http_task, return_exceptions=True)
+
+    stack.push_async_callback(stop_http)
     try:
         await _wait_for_http(f"http://127.0.0.1:{port}/health", http_task)
         await _run_supported_cli(port, script_path)
@@ -386,17 +444,9 @@ async def _run_isolated_mcp_scenario(
             ).fetchone()
             is None
         )
-    finally:
-        stop_event.set()
-        try:
-            await asyncio.wait_for(http_task, timeout=10)
-        except TimeoutError:
-            http_task.cancel()
-            await asyncio.gather(http_task, return_exceptions=True)
-        unix_server.close()
-        await unix_server.wait_closed()
-        feedback_conn.close()
-        socket_path.unlink(missing_ok=True)
+    except BaseException as error:
+        body_error = error
+        raise
 
 
 @pytest.mark.asyncio
@@ -424,5 +474,177 @@ async def test_canonical_only_dialog_identity_over_mcp_http_cli(
     script_path.write_text(json.dumps({"steps": _acceptance_steps()}), encoding="utf-8")
     try:
         await _run_isolated_mcp_scenario(conn, telegram, script_path)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unix_start", "http_task"])
+async def test_isolated_scenario_closes_resources_on_start_failure(
+    make_synced_db: Callable[[], sqlite3.Connection], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    conn = make_synced_db()
+    feedback: list[sqlite3.Connection] = []
+    original_connect = sqlite3.connect
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        result = original_connect(*args, **kwargs)  # type: ignore[arg-type]
+        if args and args[0] == ":memory:":
+            feedback.append(result)
+        return result
+
+    async def fail_http(**_kwargs: object) -> None:
+        raise OSError("HTTP failed")
+
+    async def fail_unix(*_args: object, **_kwargs: object) -> asyncio.AbstractServer:
+        raise OSError("Unix start failed")
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    monkeypatch.setattr(
+        sys.modules[__name__], "load_config", lambda: SimpleNamespace(state=SimpleNamespace(dir=tmp_path))
+    )
+    monkeypatch.setattr(sys.modules[__name__], "run_mcp_http_server", fail_http)
+    if failure == "unix_start":
+        monkeypatch.setattr(asyncio, "start_unix_server", fail_unix)
+    try:
+        with pytest.raises(OSError, match="failed"):
+            await _run_isolated_mcp_scenario(conn, _FailOnRpcClient(), tmp_path / "unused")
+        assert not get_daemon_socket_path(tmp_path).exists()
+        assert len(feedback) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            feedback[0].execute("SELECT 1")
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cli_cancellation_kills_and_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class Child:
+        returncode: int | None = None
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        killed = False
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.started.set()
+            await self.stopped.wait()
+            self.waited = True
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            self.stopped.set()
+
+        async def wait(self) -> int:
+            self.waited = True
+            return -9
+
+    child = Child()
+
+    async def spawn(*_args: object, **_kwargs: object) -> Child:
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(_run_supported_cli(1, tmp_path / "unused"))
+    await child.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert child.killed and child.waited
+
+
+@pytest.mark.asyncio
+async def test_cli_repeated_cancellation_drains_real_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    children: list[asyncio.subprocess.Process] = []
+    marker = tmp_path / "started"
+
+    async def spawn(*_args: object, **_kwargs: object) -> asyncio.subprocess.Process:
+        code = (
+            "import os,time; from pathlib import Path; "
+            f"os.write(1, b'x' * 1000000); Path({str(marker)!r}).touch(); time.sleep(60)"
+        )
+        child = await original_spawn(
+            sys.executable, "-c", code, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(_run_supported_cli(1, tmp_path / "unused"))
+    async with asyncio.timeout(10):
+        while not marker.exists():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert children[0].returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_cli_reaps_child_when_communicate_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class Child:
+        returncode: int | None = None
+        killed = False
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            raise OSError("read failed")
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> int:
+            self.waited = True
+            return -9
+
+    child = Child()
+
+    async def spawn(*_args: object, **_kwargs: object) -> Child:
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    with pytest.raises(OSError, match="read failed"):
+        await _run_supported_cli(1, tmp_path / "unused")
+    assert child.killed and child.waited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_fails", [False, True])
+async def test_http_shutdown_error_preserves_body_error(
+    make_synced_db: Callable[[], sqlite3.Connection], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body_fails: bool
+) -> None:
+    conn = make_synced_db()
+
+    async def http(*, stop_event: asyncio.Event, **_kwargs: object) -> None:
+        await stop_event.wait()
+        raise OSError("shutdown failed")
+
+    async def ready(*_args: object) -> None:
+        return None
+
+    async def cli(*_args: object) -> None:
+        if body_fails:
+            raise ValueError("scenario failed")
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "load_config", lambda: SimpleNamespace(state=SimpleNamespace(dir=tmp_path))
+    )
+    monkeypatch.setattr(sys.modules[__name__], "run_mcp_http_server", http)
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_http", ready)
+    monkeypatch.setattr(sys.modules[__name__], "_run_supported_cli", cli)
+    try:
+        if body_fails:
+            with pytest.raises(ValueError, match="scenario failed") as result:
+                await _run_isolated_mcp_scenario(conn, _FailOnRpcClient(), tmp_path / "unused")
+            assert any("shutdown failed" in note for note in result.value.__notes__)
+        else:
+            with pytest.raises(OSError, match="shutdown failed"):
+                await _run_isolated_mcp_scenario(conn, _FailOnRpcClient(), tmp_path / "unused")
+        assert not get_daemon_socket_path(tmp_path).exists()
     finally:
         conn.close()

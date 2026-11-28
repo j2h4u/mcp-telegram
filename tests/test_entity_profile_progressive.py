@@ -45,11 +45,8 @@ from mcp_telegram.entity_profile.contracts import (
 )
 from mcp_telegram.entity_profile.full_user_normalization import normalize_full_user_response
 from mcp_telegram.entity_profile.refresh import (
-    DurableRefreshSliceResult,
     DurableRefreshTerminal,
     EntityProfileDemandAdapter,
-    EntityRefreshCoordinator,
-    RefreshEnqueueResult,
     RefreshLimits,
 )
 from mcp_telegram.entity_profile.repository import EntityProfileRepository, EntitySectionCommit
@@ -242,24 +239,9 @@ async def test_get_entity_info_returns_local_stub_without_waiting_or_acquiring()
     assert data["name"] == "Local User"
     assert data["completeness"] == "partial"
     assert sections["full_profile"]["reason"] == "not_observed"
-    assert coordinator.queue_depth == 0
     assert conn.total_changes == before
     await service.shutdown()
     conn.close()
-
-
-@pytest.mark.asyncio
-async def test_refresh_coordinator_reports_coalescing_and_queue_saturation() -> None:
-    coordinator = EntityRefreshCoordinator(
-        limits=RefreshLimits(max_queued_refreshes=1),
-    )
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.COALESCED
-    assert coordinator.enqueue(43) is RefreshEnqueueResult.REJECTED
-    assert coordinator.queue_depth == 1
-    coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
-    assert coordinator.enqueue(43) is RefreshEnqueueResult.QUEUED
-    await coordinator.shutdown()
 
 
 @pytest.mark.asyncio
@@ -267,10 +249,9 @@ async def test_local_projection_does_not_reject_persisted_work_when_waiter_queue
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     conn.commit()
-    service = _test_service(conn, limits=RefreshLimits(max_queued_refreshes=1))
+    service = _test_service(conn, limits=RefreshLimits())
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    coordinator.enqueue(99)
     service._profiles.save_core({"id": 42, "type": "user", "name": "Known"}, now=100)
     service._profiles.mark_pending(42, now=100)
     before = conn.total_changes
@@ -278,7 +259,6 @@ async def test_local_projection_does_not_reject_persisted_work_when_waiter_queue
         result = await service.get_entity_info({"entity_id": 42})
         assert result["ok"] is True
         assert conn.total_changes == before
-        assert coordinator.queue_depth == 1
         assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == (
             "pending",
         )
@@ -292,11 +272,10 @@ async def test_self_snapshot_remains_local_when_waiter_queue_is_full() -> None:
     conn = sqlite3.connect(":memory:")
     _apply_migrations(conn)
     conn.commit()
-    service = _test_service(conn, limits=RefreshLimits(max_queued_refreshes=1))
+    service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(service._deps, self_id=42, self_profile={"first_name": "Self", "username": "self"})
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    coordinator.enqueue(99)
     before = conn.total_changes
     try:
         result = await service.get_entity_info({"entity_id": 42})
@@ -414,7 +393,6 @@ async def test_flood_wait_refresh_failure_signals_terminal_waiter_and_persists_r
     )
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
     with pytest.raises(TelegramRpcThrottled):
         await EntityProfileDemandAdapter(coordinator).run_slice(
             _select_profile_budget(service, RpcAttemptBudget(limit=1))
@@ -1247,7 +1225,6 @@ async def test_durable_profile_budget_exhaustion_leaves_core_cursor_ready() -> N
     service._deps = replace(service._deps, client=ExhaustedClient())
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
     await EntityProfileDemandAdapter(coordinator).run_slice(_select_profile_budget(service, RpcAttemptBudget(limit=1)))
 
     assert conn.execute(
@@ -1274,7 +1251,6 @@ async def test_entity_info_entrypoint_returns_local_facts_without_rpc_scope() ->
     data = cast(dict[str, object], result["data"])
     assert data["name"] == "Known"
     assert data["completeness"] == "partial"
-    assert coordinator.queue_depth == 0
     assert conn.total_changes == before
     await service.shutdown()
     conn.close()
@@ -1505,7 +1481,6 @@ async def test_partial_detail_uses_canonical_identity_and_skips_core_resolution(
 
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
         await EntityProfileDemandAdapter(coordinator).run_slice(
             _select_profile_budget(service, RpcAttemptBudget(limit=1))
         )
@@ -1642,7 +1617,6 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
     try:
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
         await EntityProfileDemandAdapter(coordinator).run_slice(
             _select_profile_budget(service, RpcAttemptBudget(limit=1))
         )
@@ -1651,9 +1625,7 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         assert conn.execute(
             "SELECT acquisition_cursor, profile_revision FROM entity_profile_refresh_state WHERE entity_id=42"
         ).fetchone() == (1, 1)
-        coordinator.signal_terminal(DurableRefreshSliceResult(42, DurableRefreshTerminal.SUCCESS))
 
-        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
         await EntityProfileDemandAdapter(coordinator).run_slice(
             _select_profile_budget(service, RpcAttemptBudget(limit=1))
         )
@@ -1681,7 +1653,6 @@ async def test_production_schema_core_write_syncs_revision_before_next_section_a
         assert cursor.profile_revision == 2
         coordinator = reopened_service.refresh_coordinator
         assert coordinator is not None
-        assert coordinator.enqueue(42) is RefreshEnqueueResult.QUEUED
         await EntityProfileDemandAdapter(coordinator).run_slice(
             _select_profile_budget(reopened_service, RpcAttemptBudget(limit=1))
         )
@@ -2004,7 +1975,6 @@ async def test_durable_terminal_resolution_failure_does_not_make_local_read_retr
         result = await service.get_entity_info({"entity_id": 42})
         assert result["error"] == "entity_not_observed"
         assert conn.total_changes == before
-        assert coordinator.queue_depth == 0
         assert client.calls == 1
     finally:
         await service.shutdown()
@@ -2161,7 +2131,7 @@ async def test_local_read_keeps_existing_durable_refresh_enrollment_unchanged() 
         assert service._profiles.next_due_refresh(now=100) == before
         assert conn.total_changes == changes_before
         coordinator = service.refresh_coordinator
-        assert coordinator is not None and coordinator.queue_depth == 0
+        assert coordinator is not None
     finally:
         await service.shutdown()
         conn.close()

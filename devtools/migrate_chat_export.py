@@ -10,7 +10,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, cast
 
 from mcp_telegram.chat_export_checkpoint import Payload, base_records, census, fingerprint
 from mcp_telegram.chat_export_identity import write_export
@@ -55,14 +55,30 @@ def migrate_export(path: Path, output: Path) -> dict[str, int]:
         if fingerprint(path) != before:
             raise ValueError("Migration source changed while reading")
         os.link(temporary, output)
-        directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            _sync_directory(output.parent)
+        except OSError as error:
+            try:
+                if not output.samefile(temporary):
+                    raise RuntimeError(f"Migration destination changed; rollback not attempted: {output}") from error
+                output.unlink()
+                _sync_directory(output.parent)
+            except OSError as rollback_error:
+                raise RuntimeError(
+                    f"Migration publication failed; rollback durability is unknown: {output}"
+                ) from rollback_error
+            raise
         return {"from_version": version, "to_version": CURRENT_FORMAT_VERSION}
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _sync_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 if __name__ == "__main__":
@@ -70,4 +86,4 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
-    print(json.dumps(migrate_export(args.source, args.output)))
+    print(json.dumps(migrate_export(cast(Path, args.source), cast(Path, args.output))))

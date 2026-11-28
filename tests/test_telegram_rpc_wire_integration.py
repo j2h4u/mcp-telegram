@@ -1975,8 +1975,9 @@ async def test_photo_permit_reserves_before_physical_claim_and_checks_source(ima
     future.cancel()
 
 
+@pytest.mark.parametrize("kind", ["photo", "unsupported", "empty", "service", "invalid_response"])
 async def test_exact_photo_resolution_uses_guarded_wire_and_durable_budget(
-    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+    image_wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     from mcp_telegram.telegram_demand import durable_demand_context
     from mcp_telegram.telegram_image_download import PhotoObservation, PhotoTarget
@@ -2008,11 +2009,35 @@ async def test_exact_photo_resolution_uses_guarded_wire_and_durable_budget(
         id=5, access_hash=3, file_reference=b"ref", date=None, dc_id=2, sizes=[types.PhotoSize("m", 8, 8, 50)]
     )
     message = types.Message(
-        id=7, peer_id=types.PeerUser(100), date=None, message="", media=types.MessageMediaPhoto(photo=photo)
+        id=7,
+        peer_id=types.PeerUser(100),
+        date=None,
+        message="caption",
+        media=None if kind != "photo" else types.MessageMediaPhoto(photo=photo),
     )
-    state.future.set_result(types.messages.Messages(messages=[message], chats=[], users=[], topics=[]))
+    supplied: types.TypeMessage = message
+    if kind == "empty":
+        supplied = types.MessageEmpty(id=7, peer_id=types.PeerUser(100))
+    elif kind == "service":
+        supplied = types.MessageService(id=7, peer_id=types.PeerUser(100), date=None, action=types.MessageActionEmpty())
+    response: object = types.messages.Messages(messages=[supplied], chats=[], users=[], topics=[])
+    if kind == "invalid_response":
+        response = SimpleNamespace(messages=[message])
+    state.future.set_result(response)
+    if kind == "invalid_response":
+        with pytest.raises(ValueError, match="photo message response is invalid"):
+            await asyncio.wait_for(task, timeout=2)
+        return
+    if kind in {"empty", "service"}:
+        with pytest.raises(ValueError, match="photo message is unavailable"):
+            await asyncio.wait_for(task, timeout=2)
+        return
     result = await asyncio.wait_for(task, timeout=2)
-    assert result.locator.photo_id == 5
+    assert result.message is message
+    if kind == "unsupported":
+        assert result.locator is None
+    else:
+        assert result.locator is not None and result.locator.photo_id == 5
 
 
 async def test_same_dc_photo_iterator_uses_guarded_physical_file_request(
@@ -2033,6 +2058,7 @@ async def test_same_dc_photo_iterator_uses_guarded_physical_file_request(
             observation = await gate.resolve_photo(
                 PhotoTarget(100, 7), scope=binding, observation_order=1, budget=budget, source_fence=_PhotoFence()
             )
+            assert observation.locator is not None
             session = await gate.open_photo_download(
                 observation.locator,
                 scope=binding,
@@ -2163,6 +2189,7 @@ async def test_foreign_dc_photo_bootstrap_and_download_use_guarded_senders(
             observation = await gate.resolve_photo(
                 PhotoTarget(100, 7), scope=scope, observation_order=1, budget=budget, source_fence=_PhotoFence()
             )
+            assert observation.locator is not None
             session = await gate.open_photo_download(
                 observation.locator,
                 scope=scope,

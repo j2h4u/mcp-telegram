@@ -891,7 +891,7 @@ def _mapping(value: object) -> dict[str, object]:
 async def test_terminal_owner_releases_completion_admission(
     tmp_path: Path, entity_id: int, kind: str, section: str
 ) -> None:
-    from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter, RefreshEnqueueResult
+    from mcp_telegram.entity_profile.refresh import EntityProfileDemandAdapter
     from tests.test_entity_profile_full_user_pair import _pair_service, _PairClient
 
     path = tmp_path / "terminal.db"
@@ -914,13 +914,10 @@ async def test_terminal_owner_releases_completion_admission(
         await writer.run(prepare)
         coordinator = service.refresh_coordinator
         assert coordinator is not None
-        assert coordinator.enqueue(entity_id) is RefreshEnqueueResult.QUEUED
-        event = coordinator._completion_events[entity_id]
         await run_ready_slice(EntityProfileDemandAdapter(coordinator), now=100)
         assert conn.execute(
             "SELECT status FROM entity_profile_refresh_state WHERE entity_id=?", (entity_id,)
         ).fetchone() == ("complete",)
-        assert coordinator.queue_depth == 0 and event.is_set()
         assert service._profiles.refresh_state(entity_id, now=100) is None
     finally:
         await service.shutdown()
