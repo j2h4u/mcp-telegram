@@ -464,7 +464,13 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
     ) -> SliceOutcome:
         if not accepted or successor is None:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
-        if result.skip_reason is SkipReason.ACCESS_SKIP or (result.min_id is None and not _is_hot_page_drained(result)):
+        if (
+            result.min_id is None
+            and not _is_hot_page_drained(result)
+            and result.skip_reason is not SkipReason.ACCESS_SKIP
+        ):
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
+        if result.skip_reason is SkipReason.ACCESS_SKIP:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         if successor == selected.revision:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
@@ -476,11 +482,7 @@ class HotActivityDemandAdapter(DurableDemandAdapter):
 
 def _is_hot_page_drained(result: SweepResult) -> bool:
     """Return True when the current page fully drained the newest-side window."""
-    return (
-        result.hit_floor
-        or result.skip_reason is SkipReason.HISTORY_FLOOR
-        or len(result.fetched_ids) < _BACKFILL_BATCH_LIMIT
-    )
+    return result.hit_floor or result.exhausted
 
 
 def _save_hot_access_skip_state(

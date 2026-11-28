@@ -136,9 +136,15 @@ from .hydration_queue import HydrationPriority
 from .identity_observation import USERNAME_UNOBSERVED, observe_username
 from .image_authorization import ScopeToken
 from .linked_chat_fact import LinkedChatWork, linked_chat_fact_owner
-from .message_deletion_evidence import classify_channel_lookup, classify_dm_lookup, valid_channel_verification
+from .message_deletion_evidence import (
+    DmScanReceipt,
+    classify_channel_lookup,
+    classify_dm_lookup,
+    valid_channel_verification,
+)
 from .message_delivery_observations import observe_current
 from .messages.sqlite_bundle import (
+    ReceivedMessageScopeChangedError,
     all_messages_retained,
     find_unique_nonchannel_message_dialogs,
     insert_messages_with_fts,
@@ -3587,9 +3593,13 @@ class EventHandlerManager:
         return total_marked
 
     @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
-    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
         """Verify one bounded deletion page for the durable delta subqueue."""
-        return await self._scan_dm_gap_message_page(dialog_id, message_ids)
+        scope = self._client.capture_image_scope()
+        if scope is None or scope.scope.account_id != self._self_id:
+            raise ReceivedMessageScopeChangedError
+        marked = await self._scan_dm_gap_message_page(dialog_id, message_ids, scope)
+        return DmScanReceipt(marked, scope, self._client.claim_image_scope)
 
     @_rpc_scope(TelegramRpcSource.DELTA_SYNC)
     async def _scan_dm_gap_dialog(self, dialog_id: int, scan_started_at: int) -> int:
@@ -3601,18 +3611,14 @@ class EventHandlerManager:
         # Batch in groups of 100 (Telegram API limit)
         for batch_start in range(0, len(message_ids), 100):
             batch = message_ids[batch_start : batch_start + 100]
-            marked += await self._scan_dm_gap_message_page(dialog_id, batch)
+            marked += (await self.run_dm_gap_scan_page(dialog_id, batch)).marked
         return marked
 
-    async def _scan_dm_gap_message_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
-        scope = self._client.capture_image_scope()
-        if scope is None or scope.scope.account_id != self._self_id:
-            raise RuntimeError("DM gap scan scope unavailable")
-
+    async def _scan_dm_gap_message_page(self, dialog_id: int, message_ids: Sequence[int], scope: ScopeToken) -> int:
         def reserve(conn: sqlite3.Connection) -> tuple[int, ReactionObservationBoundary]:
             with write_transaction(conn):
                 if not self._client.claim_image_scope(scope):
-                    raise RuntimeError("DM gap scan scope changed")
+                    raise ReceivedMessageScopeChangedError
                 return allocate_observation_order(conn), allocate_observation_boundary(
                     conn, ReactionAggregateSource.HISTORY
                 )
@@ -3634,7 +3640,7 @@ class EventHandlerManager:
                     conn.execute("SELECT status FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone(),
                 )
                 if not self._client.claim_image_scope(scope):
-                    return 0
+                    raise ReceivedMessageScopeChangedError
                 can_mark_deleted = (
                     full_history_enabled(conn, dialog_id) and status is not None and status[0] == "synced"
                 )

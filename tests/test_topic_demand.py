@@ -31,6 +31,7 @@ from mcp_telegram.telegram_demand_progress import SliceOutcomeKind
 from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.topics.catalog import TopicCatalogRepository
+from mcp_telegram.topics.contracts import TopicSourceUnavailableError
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from mcp_telegram.topics.telegram_adapter import TelethonTelegramTopicGateway
 from tests.sqlite_writer_helpers import inline_writer
@@ -251,6 +252,44 @@ async def test_selected_topic_sibling_progresses_and_stale_revision_is_rejected(
     stale = await adapter.run_slice(RpcAttemptBudget(limit=4, selected=selected.selected))
     assert stale.kind is SliceOutcomeKind.STALE
     assert client.page_offsets == [0]
+
+
+@pytest.mark.asyncio
+async def test_new_request_before_start_keeps_its_budget_and_reason(db: sqlite3.Connection) -> None:
+    client = _CountingClient()
+    adapter = _adapter(db, client)
+    TopicCatalogRepository(db).request(42, "first")
+    budget = _selected_budget(adapter, 4)
+    original_run = adapter._writer.run
+
+    async def request_before_start[T](operation: Callable[[sqlite3.Connection], T]) -> T:
+        TopicCatalogRepository(db).request(42, "new request")
+        return await original_run(operation)
+
+    adapter._writer.run = request_before_start  # type: ignore[method-assign]
+    assert (await adapter.run_slice(budget)).kind is SliceOutcomeKind.STALE
+    assert budget.attempts == 0
+    assert client.attempts == []
+    assert TopicCatalogRepository(db).coverage(42)["reason"] == "new request"
+    assert db.execute("SELECT generation FROM topic_catalog_state WHERE dialog_id=42").fetchone() == (None,)
+
+
+@pytest.mark.asyncio
+async def test_old_page_error_preserves_new_request_reason(db: sqlite3.Connection) -> None:
+    class FailingOldPage(_CountingClient):
+        async def __call__(self, request: object) -> object:
+            await super().__call__(request)
+            TopicCatalogRepository(db).request(42, "new request")
+            raise TopicSourceUnavailableError("topic_count_changed")
+
+    client = FailingOldPage()
+    adapter = _adapter(db, client)
+    budget = _selected_budget(adapter, 4)
+    assert (await adapter.run_slice(budget)).kind is SliceOutcomeKind.STALE
+    assert budget.attempts == 4
+    assert TopicCatalogRepository(db).coverage(42)["reason"] == "new request"
+    fresh = _selected_budget(adapter, 4)
+    assert fresh.attempts == 0
 
 
 @pytest.mark.asyncio

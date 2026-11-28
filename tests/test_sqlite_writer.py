@@ -4,6 +4,8 @@ import asyncio
 import logging
 import sqlite3
 import threading
+from concurrent.futures import Future
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 
@@ -228,6 +230,117 @@ async def test_closed_connection_retires_writer_and_rejects_pending(tmp_path: Pa
     finally:
         finish.set()
         await writer.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["dequeued", "executing", "recovering", "settled"])
+async def test_worker_failure_settles_owned_and_queued_requests(  # noqa: PLR0915
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path, capacity=2)
+    started, finish = threading.Event(), threading.Event()
+    original_timing = sqlite_writer.current_timing
+    original_execute = writer._execute
+
+    def fail() -> None:
+        started.set()
+        assert finish.wait(2)
+        raise RuntimeError("injected worker failure")
+
+    def timing() -> object:
+        if stage == "dequeued" and threading.current_thread().name == "sync-db-writer":
+            fail()
+        return original_timing()
+
+    def execute(*args: object) -> bool:
+        if stage == "executing":
+            fail()
+        outcome = original_execute(*args)  # type: ignore[arg-type]
+        if stage == "settled":
+            fail()
+        return outcome
+
+    monkeypatch.setattr(sqlite_writer, "current_timing", timing)
+    monkeypatch.setattr(writer, "_execute", execute)
+
+    def callback(conn: sqlite3.Connection) -> None:
+        _insert(conn, 42)
+        if stage == "recovering":
+            raise ValueError("after commit")
+
+    if stage == "recovering":
+        monkeypatch.setattr(writer, "_recover", lambda *_args: fail())
+    current = asyncio.create_task(writer.run(callback))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        queued = asyncio.create_task(writer.run(lambda _conn: None))
+        waiting = asyncio.create_task(writer.run(lambda _conn: None))
+        await asyncio.sleep(0.02)
+        finish.set()
+        if stage == "settled":
+            await asyncio.wait_for(current, 1)
+        else:
+            with pytest.raises(RuntimeError, match="injected worker failure"):
+                await asyncio.wait_for(current, 1)
+        with pytest.raises(RuntimeError, match="retired"):
+            await asyncio.wait_for(queued, 1)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await asyncio.wait_for(waiting, 1)
+        with pytest.raises(RuntimeError, match="injected worker failure"):
+            await asyncio.wait_for(writer.aclose(), 1)
+        await asyncio.sleep(0)
+        assert writer._slots._value == 2
+        with closing(sqlite3.connect(path)) as reader:
+            rows = reader.execute("SELECT value FROM writer_values").fetchall()
+        assert rows == ([(42,)] if stage in {"recovering", "settled"} else [])
+    finally:
+        finish.set()
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_closes_transaction_before_reporting_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path, capacity=2)
+    cleanup_started, finish_cleanup = threading.Event(), threading.Event()
+    original_finish = writer._finish_worker
+
+    def fail_recovery(*_args: object) -> bool:
+        raise RuntimeError("recovery failed")
+
+    def delayed_finish(
+        conn: sqlite3.Connection | None, error: BaseException | None, result: Future[object] | None
+    ) -> None:
+        cleanup_started.set()
+        assert finish_cleanup.wait(2)
+        original_finish(conn, error, result)
+
+    def leave_transaction_open(conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA query_only = OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO writer_values VALUES (77)")
+        raise ValueError("callback failed")
+
+    monkeypatch.setattr(writer, "_recover", fail_recovery)
+    monkeypatch.setattr(writer, "_finish_worker", delayed_finish)
+    current = asyncio.create_task(writer.run(leave_transaction_open))
+    try:
+        assert await asyncio.to_thread(cleanup_started.wait, 1)
+        assert not current.done()
+        assert isinstance(writer.failure, RuntimeError)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await writer.run(lambda _conn: None)
+        finish_cleanup.set()
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await asyncio.wait_for(current, 1)
+        with closing(sqlite3.connect(path)) as reader:
+            assert reader.execute("SELECT value FROM writer_values").fetchall() == []
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await writer.aclose()
+    finally:
+        finish_cleanup.set()
 
 
 @pytest.mark.asyncio

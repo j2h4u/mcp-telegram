@@ -88,6 +88,8 @@ class TelethonFullHistoryPageAdapter(FullHistoryPagePort):
             ) from exc
         except (RPCError, TimeoutError, OSError) as exc:
             raise MessageHistoryUnavailableError(f"message history unavailable for dialog {dialog_id}") from exc
+        if isinstance(response, types.messages.MessagesNotModified):
+            raise MessageHistoryUnavailableError("Telegram history page was not modified")
         raw_messages = tuple(cast(Sequence[object], getattr(response, "messages", ()) or ()))
         raw_count = len(raw_messages)
         next_cursor = _history_cursor(raw_messages)
@@ -229,6 +231,8 @@ def _build_forward_gap_page(  # noqa: PLR0913, PLR0917 - response and request co
 ) -> ForwardGapPage:
     input_entity, response = fetched
     response, raw_messages = _forward_raw_messages(client, input_entity, response)
+    if response.messages and not raw_messages:
+        raise MessageHistoryUnavailableError("Telegram forward history page contains only empty messages")
     messages, stopped = _select_forward_messages(raw_messages, after_message_id, should_stop)
     complete = not stopped and (len(response.messages) < MESSAGE_HISTORY_PAGE_SIZE or not raw_messages)
     if raw_messages and isinstance(response, (types.messages.MessagesSlice, types.messages.ChannelMessages)):

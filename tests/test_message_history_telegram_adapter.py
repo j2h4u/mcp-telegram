@@ -210,16 +210,22 @@ async def test_forward_gap_cold_peer_warms_cache_then_defers_until_next_slice() 
 
 
 @pytest.mark.asyncio
-async def test_forward_gap_full_message_empty_page_is_terminal() -> None:
+async def test_forward_gap_full_message_empty_page_is_inconclusive() -> None:
     client = _ForwardClient()
     client.messages = [
         types.MessageEmpty(id=message_id, peer_id=types.PeerUser(user_id=7)) for message_id in range(1, 101)
     ]
 
-    page = await TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False)
+    with pytest.raises(MessageHistoryUnavailableError, match="only empty messages"):
+        await TelethonForwardGapPageAdapter(client).fetch_page(7, after_message_id=0, should_stop=lambda: False)
 
-    assert page.messages == ()
-    assert page.complete is True
+
+@pytest.mark.asyncio
+async def test_full_history_not_modified_is_inconclusive() -> None:
+    client = _ForwardClient()
+    client.forward_response = types.messages.MessagesNotModified(count=4)
+    with pytest.raises(MessageHistoryUnavailableError, match="not modified"):
+        await TelethonFullHistoryPageAdapter(client).fetch_page(7, before_message_id=0)
 
 
 @pytest.mark.asyncio

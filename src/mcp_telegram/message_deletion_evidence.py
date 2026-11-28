@@ -1,11 +1,13 @@
 """Classify bounded Telegram message lookups without positional assumptions."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.types import messages as message_types  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
+
+from .image_authorization import ScopeToken
 
 MAX_TARGETS = 99
 CHANNEL_ID_OFFSET = 1_000_000_000_000
@@ -28,6 +30,13 @@ def valid_channel_verification(dialog_id: int, target_ids: tuple[int, ...], cont
 class DeletionEvidence:
     deleted_ids: frozenset[int]
     surviving_messages: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DmScanReceipt:
+    marked: int
+    scope: ScopeToken
+    claim_scope: Callable[[ScopeToken], bool]
 
 
 def _unique_requested(items: Sequence[object], requested: frozenset[int]) -> dict[int, object]:

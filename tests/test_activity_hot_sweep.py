@@ -82,7 +82,6 @@ def _make_sweep_result(
     if not ids and skip_reason is SkipReason.NONE:
         skip_reason = SkipReason.HISTORY_FLOOR
     return SweepResult(
-        fetched_ids=ids,
         persisted=len(ids),
         min_id=min(ids) if min_id is None and ids else min_id,
         max_id=max(ids) if ids else None,
@@ -145,7 +144,8 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
         first_page = list(range(101, 201))
         second_page = [11, 12]
         call_log = _patch_sweep(
-            monkeypatch, {dialog_id: [_make_sweep_result(first_page), _make_sweep_result(second_page)]}
+            monkeypatch,
+            {dialog_id: [_make_sweep_result(first_page), _make_sweep_result(second_page), _make_sweep_result([])]},
         )
         adapter = HotActivityDemandAdapter(
             _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
@@ -177,9 +177,36 @@ async def test_hot_activity_adapter_resumes_page_window_before_advancing_cursor(
                 (dialog_id,),
             ).fetchone(),
         )
-        assert call_log[dialog_id] == [(0, 10), (min(first_page), 10)]
+        assert state["hot_cursor"] == 10
+        assert resume == (min(second_page), max(first_page))
+        await restarted.run_slice(_selected_budget(restarted))
+        state = _get_state(conn, dialog_id)
+        resume = cast(
+            tuple[int | None, int | None] | None,
+            conn.execute(
+                "SELECT hot_page_offset_id, hot_window_max_id FROM activity_dialog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        assert call_log[dialog_id] == [(0, 10), (min(first_page), 10), (min(second_page), 10)]
         assert state["hot_cursor"] == max(first_page)
         assert resume == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_hot_full_response_finishes_without_an_extra_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    with _make_db() as conn:
+        dialog_id = -100100000101
+        _enroll(conn, dialog_id, hot_cursor=10)
+        result = _make_sweep_result([11, 12])
+        result.exhausted = True
+        calls = _patch_sweep(monkeypatch, {dialog_id: [result]})
+        adapter = HotActivityDemandAdapter(
+            _FakeClient(), conn, asyncio.Event(), _POLICY, _TEST_TIMEOUT_S, writer=inline_writer(conn), account_id=123
+        )
+        await adapter.run_slice(_selected_budget(adapter))
+        assert calls[dialog_id] == [(0, 10)]
+        assert _get_state(conn, dialog_id)["hot_cursor"] == 12
 
 
 @pytest.mark.asyncio
@@ -280,7 +307,6 @@ async def test_hot_activity_adapter_full_page_without_min_id_retries(monkeypatch
             {
                 dialog_id: [
                     SweepResult(
-                        fetched_ids=fetched_ids,
                         persisted=len(fetched_ids),
                         min_id=None,
                         max_id=max(fetched_ids),
@@ -310,9 +336,9 @@ async def test_hot_activity_adapter_full_page_without_min_id_retries(monkeypatch
 async def test_hot_sweep_includes_adjacent_id_with_exclusive_filter(monkeypatch: pytest.MonkeyPatch) -> None:
     fetched: list[int] = []
 
-    async def exclusive_sweep(*args: object, min_id: int, **kwargs: object) -> SweepResult:
+    async def exclusive_sweep(*args: object, min_id: int, offset_id: int, **kwargs: object) -> SweepResult:
         del args, kwargs
-        page = [message_id for message_id in [11] if message_id > min_id]
+        page = [message_id for message_id in [11] if message_id > min_id and (not offset_id or message_id < offset_id)]
         fetched.extend(page)
         return _make_sweep_result(page)
 
@@ -325,6 +351,7 @@ async def test_hot_sweep_includes_adjacent_id_with_exclusive_filter(monkeypatch:
         )
         await adapter.run_slice(_selected_budget(adapter))
         assert fetched == [11]
+        await adapter.run_slice(_selected_budget(adapter))
         assert _get_state(conn, dialog_id)["hot_cursor"] == 11
 
 

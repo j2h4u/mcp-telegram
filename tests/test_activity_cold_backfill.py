@@ -114,7 +114,6 @@ class _FakeClient(HistoryScope):
 def _normal_result(ids: list[int], persisted: int | None = None) -> SweepResult:
     """A normal non-empty batch (SkipReason.NONE)."""
     return SweepResult(
-        fetched_ids=ids,
         persisted=persisted if persisted is not None else len(ids),
         min_id=min(ids) if ids else None,
         max_id=max(ids) if ids else None,
@@ -125,7 +124,6 @@ def _normal_result(ids: list[int], persisted: int | None = None) -> SweepResult:
 def _floor_result() -> SweepResult:
     """Genuine empty batch from a reachable peer — history floor."""
     return SweepResult(
-        fetched_ids=[],
         persisted=0,
         min_id=None,
         max_id=None,
@@ -136,7 +134,6 @@ def _floor_result() -> SweepResult:
 def _access_skip_result() -> SweepResult:
     """Transient access-loss (resolve_input_peer returned None or timeout)."""
     return SweepResult(
-        fetched_ids=[],
         persisted=0,
         min_id=None,
         max_id=None,
@@ -147,7 +144,6 @@ def _access_skip_result() -> SweepResult:
 def _flood_result(seconds: int) -> SweepResult:
     """TelegramRpcThrottled surfaced during the sweep."""
     return SweepResult(
-        fetched_ids=[],
         persisted=0,
         min_id=None,
         max_id=None,
@@ -494,14 +490,17 @@ async def test_history_floor_completes_peer(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_access_skip_does_not_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("reason", [SkipReason.ACCESS_SKIP, SkipReason.INCONCLUSIVE])
+async def test_access_skip_does_not_complete(monkeypatch: pytest.MonkeyPatch, reason: SkipReason) -> None:
     """ACCESS_SKIP sets cold_next_retry_at+pending, leaves cold_offset_id unchanged."""
     with _make_db() as conn:
         dialog_id = -100200000003
         prior_offset = 500
         _enroll(conn, dialog_id, cold_offset_id=prior_offset)
 
-        scripted = {dialog_id: [_access_skip_result()]}
+        result_page = _access_skip_result()
+        result_page.skip_reason = reason
+        scripted = {dialog_id: [result_page]}
         _patch_sweep(monkeypatch, scripted)
         shutdown = asyncio.Event()
         before = int(time.time())
@@ -511,9 +510,8 @@ async def test_access_skip_does_not_complete(monkeypatch: pytest.MonkeyPatch) ->
         )
 
         # Returns ZERO_PERSISTED (a peer was processed)
-        assert result.outcome == ColdPassOutcome.ZERO_PERSISTED, (
-            f"ACCESS_SKIP should return ZERO_PERSISTED, got {result.outcome}"
-        )
+        expected = ColdPassOutcome.INCONCLUSIVE if reason is SkipReason.INCONCLUSIVE else ColdPassOutcome.ZERO_PERSISTED
+        assert result.outcome == expected, f"ACCESS_SKIP should return ZERO_PERSISTED, got {result.outcome}"
         assert result.persisted == 0
 
         state = _get_state(conn, dialog_id)

@@ -3902,6 +3902,29 @@ def _delivery_session_hashes(session: Session, channel_ids: set[int]) -> dict[in
     return saved
 
 
+def _repair_delivery_session_hash(session: Session, peer_id: int, access_hash: int) -> bool:
+    if type(session) is not SQLiteSession or not access_hash:
+        return False
+    cursor = session._cursor()
+    try:
+        cursor.execute("UPDATE entities SET hash=? WHERE id=? AND (hash IS NULL OR hash=0)", (access_hash, peer_id))
+        return cursor.rowcount == 1
+    finally:
+        cursor.close()
+
+
+def _delivery_session_missing(session: Session, entity: object) -> bool:
+    peer_id = get_peer_id(entity)
+    try:
+        peer = session.get_input_entity(types.PeerUser(peer_id) if peer_id > 0 else peer_id)
+    except ValueError:
+        return True
+    if isinstance(peer, (types.InputPeerUser, types.InputPeerChannel)) and not peer.access_hash:
+        row = session._entity_to_row(entity) if type(session) is SQLiteSession else None
+        return row is None or not _repair_delivery_session_hash(session, peer_id, row[1])
+    return False
+
+
 class TelegramRpcGate(TelegramClient):
     _peer_access: PeerAccess | None
     """A Telethon client with account-global admission and transient retry.
@@ -4236,13 +4259,27 @@ class TelegramRpcGate(TelegramClient):
         capture_contact_note_intake(updates)
         capture_contact_intake(updates)
         self._install_delivery(envelope, updates, tuple(zip(state.orders, state.reaction_sequences, strict=True)))
-        await super()._preprocess_updates(updates, users, chats)  # type: ignore[misc]
+        await self._preprocess_replayed_entities(updates, users, chats)
         if updates:
             await asyncio.gather(*(self._dispatch_update(update) for update in updates))
         else:
             await self._complete_update_delivery()
         if self._delivery_failure.is_set():
             raise RuntimeError("retained Telegram update replay failed")
+
+    async def _preprocess_replayed_entities(
+        self, updates: list[object], users: list[object], chats: list[object]
+    ) -> None:
+        assert self._active_delivery is not None and self.session is not None
+        session = self.session
+        await super()._preprocess_updates(  # type: ignore[misc]
+            updates,
+            [user for user in users if _delivery_session_missing(session, user)],
+            [chat for chat in chats if _delivery_session_missing(session, chat)],
+        )
+        entities = {get_peer_id(entity): entity for entity in chain(users, chats)}
+        for update in updates:
+            vars(update)["_entities"] = entities
 
     def _capture_replayed_update(
         self, envelope: DeliveryEnvelope, updates: list[object], users: list[object], chats: list[object]
@@ -4272,12 +4309,7 @@ class TelegramRpcGate(TelegramClient):
     def _restore_delivery_message_box(self, account_id: int) -> None:
         snapshot = self._delivery_safe
         assert snapshot is not None and self.session is not None
-        for channel_id, access_hash in snapshot.channel_hashes.items():
-            self.session.process_entities(
-                types.contacts.ResolvedPeer(
-                    types.PeerChannel(channel_id), [types.ChannelForbidden(channel_id, access_hash, "")], []
-                )
-            )
+        self._ensure_delivery_channel_entities(snapshot)
         self._message_box.load(
             SessionState(
                 account_id,
@@ -4478,7 +4510,11 @@ class TelegramRpcGate(TelegramClient):
         channel_ids = snapshot.channels.keys() | snapshot.channel_hashes.keys()
         saved = _delivery_session_hashes(session, channel_ids)
         for channel_id, access_hash in snapshot.channel_hashes.items():
-            if saved.get(channel_id) == access_hash:
+            if saved.get(channel_id):
+                continue
+            if channel_id in saved and _repair_delivery_session_hash(
+                session, get_peer_id(types.PeerChannel(channel_id)), access_hash
+            ):
                 continue
             session.process_entities(
                 types.contacts.ResolvedPeer(
@@ -4486,7 +4522,7 @@ class TelegramRpcGate(TelegramClient):
                 )
             )
         for channel_id in snapshot.channels:
-            if channel_id not in saved and channel_id not in snapshot.channel_hashes:
+            if not saved.get(channel_id) and not snapshot.channel_hashes.get(channel_id):
                 raise ValueError("Could not find input entity for delivery channel")
 
     async def _save_states_and_entities(self) -> None:

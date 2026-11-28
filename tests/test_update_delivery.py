@@ -940,7 +940,7 @@ async def test_channel_checkpoint_batch_checks_real_session_and_survives_reopen(
         reopened = SQLiteSession(session.filename)
         try:
             peer = reopened.get_input_entity(types.PeerChannel(1000))
-            assert isinstance(peer, types.InputPeerChannel) and peer.access_hash == 9876
+            assert isinstance(peer, types.InputPeerChannel) and peer.access_hash == 1001
         finally:
             reopened.close()
         missing = snapshot.model_copy(update={"channels": {9999: 20}, "channel_hashes": {}})

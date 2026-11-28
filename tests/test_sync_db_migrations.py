@@ -19,6 +19,7 @@ from helpers import remove_v80_schema_for_historical_fixture
 from mcp_telegram.sync_db import (
     _CURRENT_SCHEMA_VERSION,
     _ENTITY_TABLE_DDL,
+    _MESSAGE_VERSIONS_DDL,
     _apply_migration_51,
     _apply_migration_52,
     _apply_migration_53,
@@ -846,7 +847,8 @@ def test_migration_v21_runs_from_v20_database(tmp_path: Path) -> None:
             "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', "
             "read_outbox_max_id INTEGER)"
         )
-        conn.execute("INSERT INTO schema_version VALUES (20, 1700000000)")
+        conn.execute(_MESSAGE_VERSIONS_DDL)
+        conn.executemany("INSERT INTO schema_version VALUES (?, 1700000000)", ((version,) for version in range(1, 21)))
         conn.commit()
 
     ensure_sync_schema(db_path)
@@ -998,7 +1000,8 @@ def test_migration_v23_runs_from_v22_database(tmp_path: Path) -> None:
             "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', "
             "read_outbox_max_id INTEGER)"
         )
-        conn.execute("INSERT INTO schema_version VALUES (22, 1700000000)")
+        conn.execute(_MESSAGE_VERSIONS_DDL)
+        conn.executemany("INSERT INTO schema_version VALUES (?, 1700000000)", ((version,) for version in range(1, 23)))
         conn.commit()
 
     ensure_sync_schema(db_path)
@@ -1144,7 +1147,10 @@ def test_migration_v24_backfill_three_shapes(tmp_path: Path) -> None:
             "CREATE TABLE synced_dialogs (dialog_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', "
             "read_outbox_max_id INTEGER)"
         )
-        pre_conn.execute("INSERT INTO schema_version VALUES (23, 1700000000)")
+        pre_conn.execute(_MESSAGE_VERSIONS_DDL)
+        pre_conn.executemany(
+            "INSERT INTO schema_version VALUES (?, 1700000000)", ((version,) for version in range(1, 24))
+        )
         pre_conn.commit()
         _seed_v24_fixtures(pre_conn)
 
@@ -1307,7 +1313,8 @@ def _make_v24_db(tmp_path: Path) -> Path:
             )"""
         )
         conn.execute(_V23_ACTIVITY_DIALOG_STATE_DDL)
-        conn.execute("INSERT INTO schema_version VALUES (24, 1700000000)")
+        conn.execute(_MESSAGE_VERSIONS_DDL)
+        conn.executemany("INSERT INTO schema_version VALUES (?, 1700000000)", ((version,) for version in range(1, 25)))
         conn.commit()
     return db_path
 
@@ -2150,12 +2157,13 @@ def test_v54_ledger_damage_does_not_replay_destructive_v53_cleanup(tmp_path: Pat
         conn.execute("DELETE FROM schema_version WHERE version=53")
         conn.commit()
 
-    ensure_sync_schema(db_path)
+    with pytest.raises(sqlite3.DatabaseError, match="incomplete"):
+        ensure_sync_schema(db_path)
     with _sync_db_connection(db_path) as conn:
         assert _fetchall_rows(
             conn, "SELECT dialog_id,message_id,old_text FROM message_versions ORDER BY dialog_id"
         ) == [(1, 1, "kept"), (2, 1, "discarded")]
-        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=53") == (53,)
+        assert _fetchone_row(conn, "SELECT version FROM schema_version WHERE version=53") is None
 
 
 def test_v53_delete_failure_rolls_back_all_version_history(tmp_path: Path) -> None:

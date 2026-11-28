@@ -35,6 +35,26 @@ def test_live_runtime_entity_dml_has_only_canonical_owners() -> None:
     assert findings == []
 
 
+def test_session_hash_repair_is_confined_to_the_owned_session_cursor() -> None:
+    gate = _gate()
+    path = gate.SOURCE_ROOT / "telegram_rpc.py"
+    source = path.read_text()
+    assert _entity_findings(gate, path, source) == []
+
+    for altered in (
+        source.replace(
+            'cursor = session._cursor()\n    try:\n        cursor.execute("UPDATE entities',
+            'cursor = conn.cursor()\n    try:\n        cursor.execute("UPDATE entities',
+            1,
+        ),
+        source.replace("type(session) is not SQLiteSession", "False", 1),
+        source.replace("SET hash=? WHERE id=? AND (hash IS NULL OR hash=0)", "SET hash=? WHERE id=?", 1),
+    ):
+        assert _entity_findings(gate, path, altered)
+    assert _entity_findings(gate, gate.SOURCE_ROOT / "rogue.py", source)
+    assert _entity_findings(gate, path, source + '\ndef rogue(conn):\n    conn.execute("DELETE FROM entities")\n')
+
+
 def test_message_sql_owners_name_the_split_persistence_modules() -> None:
     gate = _gate()
 

@@ -35,6 +35,7 @@ from mcp_telegram.delta_sync import (
 from mcp_telegram.dialog_sync import DialogLightReconciliationDemandAdapter, DialogReconciliationWorker
 from mcp_telegram.entity_profile.membership import MembershipSignalCounts
 from mcp_telegram.flood import TelegramRpcThrottled
+from mcp_telegram.message_deletion_evidence import DmScanReceipt
 from mcp_telegram.message_history.contracts import (
     HistoryAccessProbeResult,
     MessageHistoryAccessLostError,
@@ -69,7 +70,7 @@ from mcp_telegram.telegram_rpc_scheduler import (
     rpc_scope,
 )
 from tests.history_enrollment_helpers import seed_full_history_enrollment
-from tests.history_scope_helpers import HistoryScope
+from tests.history_scope_helpers import HistoryScope, dm_scan_receipt
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -411,7 +412,7 @@ def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(
     adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
             raise AssertionError("suspended DM maintenance must not run")
 
@@ -428,6 +429,32 @@ def test_delta_gap_status_uses_two_hour_fallback_and_immediate_explicit_refresh(
     conn.commit()
     assert adapter.status(200.0).release_at == 75.0  # type: ignore[union-attr]
     assert adapter.status(200.0).is_ready(200.0)  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_forward_placeholders_retry_without_advancing_cursor(conn: sqlite3.Connection) -> None:
+    dialog_id = 299
+    _seed_history_dialog(conn, dialog_id, status="synced", last_delta_checked_at=100)
+    conn.execute("UPDATE synced_dialogs SET delta_message_id=10 WHERE dialog_id=?", (dialog_id,))
+    conn.commit()
+
+    async def send_history(request: GetHistoryRequest) -> object:
+        del request
+        return types.messages.Messages(messages=[types.MessageEmpty(11, None)], topics=[], chats=[], users=[])
+
+    worker = DeltaSyncWorker(
+        TelethonForwardGapPageAdapter(_ForwardHistoryClient(send_history)),
+        conn,
+        asyncio.Event(),
+        writer=inline_writer(conn),
+    )
+    adapter = DeltaGapFillDemandAdapter(worker, account_id=123)
+    with patch("mcp_telegram.delta_sync.time.time", return_value=10_000):
+        outcome = await adapter.run_slice(_selected_budget(adapter))
+    assert outcome.kind is SliceOutcomeKind.RETRYABLE_FAILURE
+    assert conn.execute("SELECT delta_message_id FROM synced_dialogs WHERE dialog_id=?", (dialog_id,)).fetchone() == (
+        10,
+    )
 
 
 @pytest.mark.asyncio
@@ -579,10 +606,10 @@ async def test_delta_gap_adapter_resumes_dm_tombstone_cursor_after_restart(conn:
         def __init__(self) -> None:
             self.pages: list[tuple[int, ...]] = []
 
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id
             self.pages.append(tuple(message_ids))
-            return 0
+            return dm_scan_receipt()
 
     scanner = Scanner()
     adapter = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123)
@@ -610,7 +637,7 @@ async def test_dm_empty_and_terminal_scan_persists_weekly_completion(conn: sqlit
     conn.commit()
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
             raise AssertionError("empty DM history must not dispatch a lookup")
 
@@ -648,10 +675,10 @@ async def test_delta_gap_tombstone_cursor_does_not_skip_after_earlier_dialog_is_
         def __init__(self) -> None:
             self.dialog_ids: list[int] = []
 
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             assert message_ids == (1,)
             self.dialog_ids.append(dialog_id)
-            return 0
+            return dm_scan_receipt()
 
     scanner = Scanner()
     adapter = DmDeletionReconciliationDemandAdapter(conn, scanner, writer=inline_writer(conn), account_id=123)
@@ -700,9 +727,9 @@ async def test_dm_gap_scan_clears_removed_dialog_message_cursor_for_next_dialog(
     observed: list[tuple[int, tuple[int, ...]]] = []
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             observed.append((dialog_id, tuple(message_ids)))
-            return 0
+            return dm_scan_receipt()
 
     adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with patch("mcp_telegram.delta_sync.time.time", return_value=1_000):
@@ -749,10 +776,10 @@ async def test_prepare_quarantines_legacy_running_checkpoint_without_advancing_i
     calls: list[tuple[int, ...]] = []
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id
             calls.append(tuple(message_ids))
-            return 0
+            return dm_scan_receipt()
 
     prepare_dm_deletion_reconciliation(conn, now=200)
     state = _dm_reconciliation_state(conn)
@@ -780,7 +807,7 @@ async def test_dm_throttle_suspends_generation_and_never_retries_page(conn: sqli
     calls: list[tuple[int, ...]] = []
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id
             calls.append(tuple(message_ids))
             raise TelegramRpcThrottled(retry_after_seconds=22)
@@ -822,7 +849,7 @@ async def test_dm_typed_deferrals_restore_only_with_zero_dispatch_evidence(
     token_attempt_counts: list[int] = []
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
             token = current_demand_token()
             with rpc_scope(TelegramRpcSource.DELTA_SYNC):
@@ -885,7 +912,7 @@ async def test_dm_restore_write_failure_keeps_claim_blocked(conn: sqlite3.Connec
     conn.commit()
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
             raise TelegramRpcAdmissionDeferred(retry_after_seconds=3)
 
@@ -918,7 +945,7 @@ async def test_dm_admission_deferral_after_nested_dispatch_stays_claimed(conn: s
     _seed_dm_reconciliation_page(conn)
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
             current_demand_token().attempt_evidence.record_dispatch()
             raise TelegramRpcAdmissionDeferred(retry_after_seconds=3)
@@ -946,11 +973,11 @@ async def test_dm_missing_or_wrong_demand_identity_stays_claimed(
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
-            return 0
+            return dm_scan_receipt()
 
     @contextmanager
     def invalid_identity(_kind: DemandKind) -> Iterator[object | None]:
@@ -976,12 +1003,12 @@ async def test_dm_claim_write_failure_prevents_scanner_dispatch(conn: sqlite3.Co
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
             assert _dm_reconciliation_state(conn)["status"] == "verifying"
-            return 0
+            return dm_scan_receipt()
 
     conn.execute(
         """CREATE TRIGGER fail_dm_claim
@@ -1017,11 +1044,11 @@ async def test_dm_claim_commit_then_error_remains_blocked_after_reconstruction(
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
-            return 0
+            return dm_scan_receipt()
 
     adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     claim = adapter._claim_page
@@ -1052,7 +1079,7 @@ async def test_dm_throttle_remains_claimed_when_suspension_write_fails(conn: sql
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
@@ -1086,7 +1113,7 @@ async def test_dm_unknown_failure_stays_verifying_until_startup_quarantines_it(c
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
@@ -1112,11 +1139,11 @@ async def test_dm_success_before_cursor_commit_failure_stays_claimed(conn: sqlit
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
-            return 0
+            return dm_scan_receipt()
 
     conn.execute(
         """CREATE TRIGGER fail_dm_cursor_commit
@@ -1173,11 +1200,11 @@ async def test_invalid_dm_checkpoint_stays_raw_and_blocks_all_pages(
     calls = 0
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
-            return 0
+            return dm_scan_receipt()
 
     before = cast(
         tuple[object, ...] | None,
@@ -1197,9 +1224,9 @@ def test_dm_checkpoint_sql_read_failure_is_not_contained_as_metadata(conn: sqlit
         prepare_dm_deletion_reconciliation(conn, now=500)
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
-            return 0
+            return dm_scan_receipt()
 
     adapter = DmDeletionReconciliationDemandAdapter(conn, Scanner(), writer=inline_writer(conn), account_id=123)
     with pytest.raises(sqlite3.OperationalError):

@@ -23,6 +23,7 @@ from .rich_hydration_policy import (
     rich_composition_hydration_eligible,
 )
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL
+from .sqlite_schema import schema_version
 from .sqlite_values import row_first_int
 from .sync_transactions import enable_runtime_writes, write_transaction
 
@@ -1802,19 +1803,17 @@ def save_self_profile_last_success_at(conn: sqlite3.Connection, completed_at: fl
 
 def _schema_ready(conn: sqlite3.Connection) -> bool:
     """Return True if sync.db schema is at current version and WAL mode is active."""
+    version = schema_version(
+        conn,
+        _CURRENT_SCHEMA_VERSION,
+        {
+            "synced_dialogs": frozenset({"dialog_id", "status"}),
+            "messages": frozenset({"dialog_id", "message_id", "sent_at"}),
+            "message_versions": frozenset({"dialog_id", "message_id", "version", "old_text", "edit_date"}),
+        },
+    )
     row = cast(tuple[object | None, ...] | None, conn.execute("PRAGMA journal_mode").fetchone())
-    if row is None or str(row[0]).lower() != "wal":
-        return False
-    try:
-        row = cast(
-            tuple[object | None, ...] | None,
-            conn.execute("SELECT MAX(version), COUNT(DISTINCT version) FROM schema_version").fetchone(),
-        )
-        return bool(
-            row and row_first_int(row) >= _CURRENT_SCHEMA_VERSION and int(cast(int, row[1])) == _CURRENT_SCHEMA_VERSION
-        )
-    except sqlite3.OperationalError:
-        return False
+    return bool(version == _CURRENT_SCHEMA_VERSION and row and str(row[0]).lower() == "wal")
 
 
 def _apply_migration(
@@ -1864,7 +1863,16 @@ def _apply_migration(
 
 def _apply_migrations_1_to_5(conn: sqlite3.Connection, current: int) -> int:
     current = _apply_migration(
-        conn, current, 1, [_SYNCED_DIALOGS_DDL, _MESSAGES_DDL, _MESSAGES_INDEX_DDL, _MESSAGE_VERSIONS_DDL]
+        conn,
+        current,
+        1,
+        [
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)",
+            _SYNCED_DIALOGS_DDL,
+            _MESSAGES_DDL,
+            _MESSAGES_INDEX_DDL,
+            _MESSAGE_VERSIONS_DDL,
+        ],
     )
     current = _apply_migration(conn, current, 2, ["ALTER TABLE synced_dialogs ADD COLUMN access_lost_at INTEGER"])
 
@@ -5065,16 +5073,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:  # noqa: PLR0915
             raise
         logger.debug("sync_db WAL pragma skipped (DB locked), will retry next open")
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version    INTEGER NOT NULL,
-            applied_at INTEGER NOT NULL
-        )
-        """
+    has_ledger = cast(
+        tuple[object, ...] | None,
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'").fetchone(),
     )
-
-    row = cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+    row = (
+        cast(tuple[object | None, ...] | None, conn.execute("SELECT MAX(version) FROM schema_version").fetchone())
+        if has_ledger
+        else None
+    )
     current = row_first_int(row)
     current = _apply_migrations_1_to_5(conn, current)
     current = _apply_migrations_6_to_10(conn, current)
@@ -6377,6 +6384,8 @@ def ensure_sync_schema(db_path: Path) -> None:
             bootstrap_conn = _open_sync_db(db_path)
             if not _schema_ready(bootstrap_conn):
                 _apply_migrations(bootstrap_conn)
+                if not _schema_ready(bootstrap_conn):
+                    raise sqlite3.DatabaseError("sync database migration did not reach current schema")
 
             ensure_own_only_schema(bootstrap_conn)
             _ensure_scheduled_messages_fts(bootstrap_conn)

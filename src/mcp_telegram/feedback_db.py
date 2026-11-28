@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import cast
 
 from .feedback_contracts import VALID_SEVERITIES, VALID_STATUSES
-from .sqlite_values import row_first_int
+from .sqlite_schema import schema_version
 
 __all__ = [
     "VALID_SEVERITIES",
@@ -35,6 +35,10 @@ __all__ = [
 ]
 
 _FEEDBACK_SCHEMA_VERSION: int = 2
+_FEEDBACK_COLUMNS = {
+    "feedback": frozenset({"id", "submitted_at", "message", "severity", "context", "model", "harness"})
+}
+_FEEDBACK_V2_COLUMNS = {2: {"feedback": frozenset({"status", "status_changed_at", "status_comment"})}}
 
 _FEEDBACK_DDL = """
 CREATE TABLE IF NOT EXISTS feedback (
@@ -88,16 +92,15 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
     """
     conn = _open_feedback_db(db_path)
     try:
+        schema_version(conn, _FEEDBACK_SCHEMA_VERSION, _FEEDBACK_COLUMNS, versioned_columns=_FEEDBACK_V2_COLUMNS)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("BEGIN IMMEDIATE")
+        current = schema_version(
+            conn, _FEEDBACK_SCHEMA_VERSION, _FEEDBACK_COLUMNS, versioned_columns=_FEEDBACK_V2_COLUMNS
+        )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL)"
         )
-        row = cast(
-            tuple[object | None, ...] | None,
-            conn.execute("SELECT MAX(version) FROM schema_version").fetchone(),
-        )
-        current = row_first_int(row)
         if current < 1:
             conn.execute(_FEEDBACK_DDL)
             conn.execute("INSERT INTO schema_version VALUES (1, strftime('%s', 'now'))")
@@ -115,6 +118,14 @@ def ensure_feedback_schema(db_path: Path) -> sqlite3.Connection:
                 if name not in columns:
                     conn.execute(f"ALTER TABLE feedback ADD COLUMN {name} {definition}")
             conn.execute("INSERT INTO schema_version VALUES (?, strftime('%s', 'now'))", (_FEEDBACK_SCHEMA_VERSION,))
+        if (
+            current < _FEEDBACK_SCHEMA_VERSION
+            and schema_version(
+                conn, _FEEDBACK_SCHEMA_VERSION, _FEEDBACK_COLUMNS, versioned_columns=_FEEDBACK_V2_COLUMNS
+            )
+            != _FEEDBACK_SCHEMA_VERSION
+        ):
+            raise sqlite3.DatabaseError("feedback database migration did not reach current schema")
         conn.commit()
     except BaseException:
         conn.rollback()

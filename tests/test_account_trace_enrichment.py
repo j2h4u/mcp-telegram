@@ -613,6 +613,198 @@ async def test_trace_enrichment_floodwait_persists_retry_fragment(
 
 
 @pytest.mark.asyncio
+async def test_scoped_trace_keeps_partial_evidence_and_topic_cooldown(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+) -> None:
+    server, conn, client = trace_enrichment_server
+    server._ready = True
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    for dialog_id in (-1001, -1002):
+        seed_dialog(conn, dialog_id=dialog_id, name="Forum", dialog_type="Forum")
+        seed_synced_dialog(conn, dialog_id=dialog_id, status="synced")
+    conn.commit()
+
+    async def partial(dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
+        client.calls.append((dialog_id, kwargs))
+        yield fake_message(message_id=1)
+        raise TelegramRpcThrottled(retry_after_seconds=120)
+
+    request = b'{"method":"trace_account_messages","exact_account_id":101,"exact_dialog_id":-1001,"exact_topic_id":42,"coverage_goal":"best_effort_visible"}'
+    with patch.object(client, "iter_messages", side_effect=partial):
+        first, _, _ = await server._handle_client_line(request, "", None)
+        assert first.get("ok"), first
+        fragment = tuple(
+            cast(
+                Sequence[object],
+                conn.execute(
+                    "SELECT topic_id,status,last_error,next_retry_at FROM trace_coverage_fragments"
+                ).fetchone(),
+            )
+        )
+        second, _, _ = await server._handle_client_line(request, "", None)
+
+    assert client.calls == [(-1001, {"limit": 100, "reply_to": 42, "from_user": 101})]
+    assert fragment[:3] == (42, "flood_wait", "TelegramRpcThrottled:120")
+    assert (
+        tuple(
+            cast(
+                Sequence[object],
+                conn.execute(
+                    "SELECT topic_id,status,last_error,next_retry_at FROM trace_coverage_fragments"
+                ).fetchone(),
+            )
+        )
+        == fragment
+    )
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=-1001 AND message_id=1").fetchone()[0] == 1
+    for response in (first, second):
+        data = _dict(response["data"])
+        assert _dict(data["coverage"])["state"] != "complete"
+        assert any(gap["kind"] == "flood_wait" and gap["topic_id"] == 42 for gap in cast(list[dict], data["gaps"]))
+
+
+@pytest.mark.asyncio
+async def test_expired_budget_does_not_erase_topic_cooldown(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _, conn, client = trace_enrichment_server
+    client.exc = TelegramRpcThrottled(retry_after_seconds=120)
+    candidate = {"dialog_id": 222, "strategy": "dialog_scan", "topic_id": 42}
+    await trace_service._trace_enrich_visible_dialogs(101, [candidate])
+    before = tuple(
+        cast(
+            Sequence[object],
+            conn.execute("SELECT status,last_error,next_retry_at FROM trace_coverage_fragments").fetchone(),
+        )
+    )
+    await trace_service._trace_enrich_visible_dialogs(101, [candidate], deadline_ms=0)
+    assert (
+        tuple(
+            cast(
+                Sequence[object],
+                conn.execute("SELECT status,last_error,next_retry_at FROM trace_coverage_fragments").fetchone(),
+            )
+        )
+        == before
+    )
+
+
+@pytest.mark.asyncio
+async def test_channel_trace_searches_only_linked_discussion_topic(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+) -> None:
+    server, conn, client = trace_enrichment_server
+    server._ready = True
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    for dialog_id, kind in [(-1001, "Channel"), (-1002, "Forum"), (-1003, "Forum")]:
+        seed_dialog(conn, dialog_id=dialog_id, name="Dialog", dialog_type=kind)
+        seed_synced_dialog(conn, dialog_id=dialog_id, status="synced")
+    conn.execute("UPDATE dialogs SET linked_chat_id=-1002, linked_chat_resolved_at=1 WHERE dialog_id=-1001")
+    conn.commit()
+    client.exc = TelegramRpcThrottled(retry_after_seconds=120)
+    response, _, _ = await server._handle_client_line(
+        b'{"method":"trace_account_messages","exact_account_id":101,"exact_dialog_id":-1001,"exact_topic_id":42,"coverage_goal":"best_effort_visible"}',
+        "",
+        None,
+    )
+    assert response.get("ok"), response
+    assert client.calls == [(-1002, {"limit": 100, "reply_to": 42, "from_user": 101})]
+    data = _dict(response["data"])
+    assert _dict(data["coverage"])["state"] != "complete"
+    assert any(
+        gap["kind"] == "flood_wait" and gap["dialog_id"] == -1002 and gap["topic_id"] == 42
+        for gap in cast(list[dict], data["gaps"])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shorter_throttle", [False, True])
+async def test_concurrent_trace_success_cannot_clear_newer_cooldown(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    shorter_throttle: bool,
+) -> None:
+    server, conn, client = trace_enrichment_server
+    server._ready = True
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=-1001, name="Forum", dialog_type="Forum")
+    seed_synced_dialog(conn, dialog_id=-1001, status="synced")
+    conn.commit()
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def concurrent(dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+            yield fake_message(message_id=1)
+            if shorter_throttle:
+                raise TelegramRpcThrottled(retry_after_seconds=30)
+        else:
+            raise TelegramRpcThrottled(retry_after_seconds=120)
+
+    request = b'{"method":"trace_account_messages","exact_account_id":101,"exact_dialog_id":-1001,"exact_topic_id":42,"coverage_goal":"best_effort_visible"}'
+    with patch.object(client, "iter_messages", side_effect=concurrent):
+        first = asyncio.create_task(server._handle_client_line(request, "", None))
+        await started.wait()
+        second, _, _ = await server._handle_client_line(request, "", None)
+        before = tuple(
+            cast(
+                Sequence[object],
+                conn.execute("SELECT status,last_error,next_retry_at FROM trace_coverage_fragments").fetchone(),
+            )
+        )
+        release.set()
+        completed, _, _ = await first
+    assert second.get("ok") and completed.get("ok")
+    assert (
+        tuple(
+            cast(
+                Sequence[object],
+                conn.execute("SELECT status,last_error,next_retry_at FROM trace_coverage_fragments").fetchone(),
+            )
+        )
+        == before
+    )
+    assert before[:2] == ("flood_wait", "TelegramRpcThrottled:120")
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE dialog_id=-1001 AND message_id=1").fetchone()[0] == 1
+    assert _dict(_dict(completed["data"])["coverage"])["state"] != "complete"
+
+
+@pytest.mark.asyncio
+async def test_latched_candidate_cancels_and_drains_sibling(
+    trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
+    trace_service: DaemonAccountTraceService,
+) -> None:
+    _, _, client = trace_enrichment_server
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    async def messages(dialog_id: int, **kwargs: object) -> AsyncIterator[object]:
+        if dialog_id == 1:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        else:
+            await started.wait()
+            raise TelegramRpcThrottled(latched=True)
+        yield fake_message(message_id=1)
+
+    with patch.object(client, "iter_messages", side_effect=messages), pytest.raises(TelegramRpcThrottled):
+        await trace_service._trace_enrich_visible_dialogs(
+            101,
+            [
+                {"dialog_id": 1, "strategy": "dialog_scan", "topic_id": None},
+                {"dialog_id": 2, "strategy": "dialog_scan", "topic_id": None},
+            ],
+        )
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
 async def test_trace_enrichment_propagates_latched_protection_without_retry_fragment(
     trace_enrichment_server: tuple[DaemonAPIServer, sqlite3.Connection, FakeTraceClient],
 ) -> None:
