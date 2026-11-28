@@ -64,6 +64,7 @@ from mcp_telegram.flood import (
     TelegramRpcThrottled,
 )
 from mcp_telegram.image_authorization import ScopeToken
+from mcp_telegram.message_deletion_evidence import DmScanReceipt
 from mcp_telegram.message_history.contracts import ForwardGapPage
 from mcp_telegram.rpc_admission_observations import RpcAdmissionObservationAggregator
 from mcp_telegram.state import telegram_session_lease
@@ -3616,7 +3617,7 @@ class _RecordingDmPageScanner:
         self._manager = manager
         self.calls = 0
 
-    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
         self.calls += 1
         return await self._manager.run_dm_gap_scan_page(dialog_id, message_ids)
 
@@ -3945,7 +3946,7 @@ async def test_dm_local_deferral_after_nested_dispatch_keeps_page_claimed() -> N
     sender = _set_sender(gate, _request_value)
 
     class Scanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             del dialog_id, message_ids
             with rpc_scope(TelegramRpcSource.DELTA_SYNC):
                 await gate(_TestRequest("nested-dispatch"))

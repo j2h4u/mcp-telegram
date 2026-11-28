@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Callable
-from typing import cast
 
 from ..dialog_identity import read_dialog_identities
 from ..flood import TelegramRpcThrottled
@@ -64,17 +63,9 @@ class TopicSnapshotDemandAdapter:
         for dialog_id, _retry_at in repository.pending_rows():
             if target is not None and str(dialog_id) != target:
                 continue
-            row = cast(
-                tuple[object, object, object, object, object, object] | None,
-                self._conn.execute(
-                    "SELECT generation,scan_revision,revision,offset_date,offset_id,offset_topic "
-                    "FROM topic_catalog_state WHERE dialog_id=?",
-                    (dialog_id,),
-                ).fetchone(),
+            selected = WorkRevision(
+                WorkKey(self.demand_kind, self._account_id, str(dialog_id)), repository.selection_revision(dialog_id)
             )
-            if row is None:
-                row = (None, None, 0, None, 0, 0)
-            selected = WorkRevision(WorkKey(self.demand_kind, self._account_id, str(dialog_id)), repr(tuple(row)))
             if selected not in excluded:
                 return selected
         return None
@@ -102,7 +93,9 @@ class TopicSnapshotDemandAdapter:
         )
         if pending is None or pending[1] > time.time():
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
-        scan = await self._writer.run(lambda conn: TopicCatalogRepository(conn).begin_page(pending[0]))
+        scan = await self._writer.run(
+            lambda conn: TopicCatalogRepository(conn).begin_page(pending[0], selected.revision)
+        )
         if scan is None:
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if not TopicCatalogRepository(self._conn).acquisition_allowed(scan.dialog_id):

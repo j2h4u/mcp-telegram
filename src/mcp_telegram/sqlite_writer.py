@@ -165,6 +165,7 @@ class SQLiteWriter:
     def _work(self) -> None:
         conn: sqlite3.Connection | None = None
         shutdown_error: BaseException | None = None
+        item = None
         try:
             conn = open_runtime_sync_db(self._path)
             conn.row_factory = sqlite3.Row
@@ -182,12 +183,12 @@ class SQLiteWriter:
                     callback = _timed_callback(callback, timing)
                 if queue_wait >= _SLOW_QUEUE_SECONDS:
                     logger.warning("sqlite_writer_queue_slow queue_wait_seconds=%.3f", queue_wait)
-                try:
-                    if self._execute(conn, callback, context, result):
-                        conn = None
-                        return
-                finally:
-                    self._loop.call_soon_threadsafe(self._slots.release)
+                fatal = self._execute(conn, callback, context, result)
+                self._loop.call_soon_threadsafe(self._slots.release)
+                item = None
+                if fatal:
+                    conn = None
+                    return
         except BaseException as error:  # noqa: BLE001 - retire the thread for any fatal worker failure.
             shutdown_error = error
             with self._state_lock:
@@ -196,9 +197,11 @@ class SQLiteWriter:
                     self._ready.set_exception(error)
                 self._fail_pending(error)
         finally:
-            self._finish_worker(conn, shutdown_error)
+            self._finish_worker(conn, shutdown_error, item[1] if item is not None else None)
 
-    def _finish_worker(self, conn: sqlite3.Connection | None, error: BaseException | None) -> None:
+    def _finish_worker(
+        self, conn: sqlite3.Connection | None, error: BaseException | None, result: Future[object] | None
+    ) -> None:
         if conn is not None:
             try:
                 conn.close()
@@ -207,6 +210,11 @@ class SQLiteWriter:
                     error = close_error
                 else:
                     error.add_note(f"Closing SQLite writer connection failed: {type(close_error).__name__}")
+        if result is not None:
+            if not result.done():
+                assert error is not None
+                result.set_exception(error)
+            self._loop.call_soon_threadsafe(self._slots.release)
         if self._closed_future.done():
             return
         if error is None:

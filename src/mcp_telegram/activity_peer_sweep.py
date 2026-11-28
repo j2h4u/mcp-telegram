@@ -3,7 +3,7 @@
 This module provides:
   - SkipReason: structured per-call outcome with distinct ACCESS_SKIP vs
     HISTORY_FLOOR vs FLOOD_WAIT reasons (concern 3 fix).
-  - SweepResult: dataclass carrying fetched_ids, persisted, min/max_id,
+  - SweepResult: dataclass carrying persisted, min/max_id,
     skip_reason, flood_wait_seconds, and a hit_floor property.
   - sweep_peer_once: FloodWait-neutral per-peer self-search primitive.
   - enroll_activity_dialog: shared enrollment helper (reused by schedulers
@@ -110,6 +110,7 @@ class SkipReason(StrEnum):
     # set cold_status='complete' ONLY for this reason.
     FLOOD_WAIT = "flood_wait"
     # TelegramRpcThrottled surfaced. The caller owns the durable backoff write.
+    INCONCLUSIVE = "inconclusive"
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +122,6 @@ class SkipReason(StrEnum):
 class SweepResult:
     """Result of a single sweep_peer_once call."""
 
-    fetched_ids: list[int]
     persisted: int
     min_id: int | None  # min of batch — Tier-B downward cursor
     max_id: int | None  # max of batch — Tier-A high-water
@@ -134,6 +134,7 @@ class SweepResult:
     genuinely_new_keys: frozenset[tuple[int, int]] = field(default=frozenset(), compare=False)
     completed: bool = field(default=False, compare=False)
     accepted: bool = field(default=True, compare=False)
+    exhausted: bool = field(default=False, compare=False)
 
     @property
     def hit_floor(self) -> bool:
@@ -252,7 +253,7 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
             publish_supplied_identities(conn, referenced, observation_order=observation_order)
             if request.accept_page is not None and not request.accept_page(conn):
                 _require_sweep_scope(conn, request, scope)
-                return SweepResult([], 0, None, None, completed=False, accepted=False)
+                return SweepResult(0, None, None, completed=False, accepted=False)
             try:
                 extracted, genuinely_new_keys = _extract_sweep_messages(conn, request, batch)
             except Exception:
@@ -271,7 +272,7 @@ def _extract_and_persist_sweep_messages(  # noqa: PLR0913, PLR0917 - atomic page
                 publish_dialog_identity(conn, request.dialog_id, identity, identity_revision)
             _require_sweep_scope(conn, request, scope)
     except ReceivedMessageScopeChangedError:
-        return SweepResult([], 0, None, None, completed=False, accepted=False)
+        return SweepResult(0, None, None, completed=False, accepted=False)
     except Exception:
         logger.warning("sweep_peer_once_persistence_error dialog_id=%r", request.dialog_id, exc_info=True)
         return _access_skip_result(rpc_calls=2, pages_fetched=1)
@@ -327,7 +328,6 @@ def _coerce_peer_sweep_request(*args: object, **kwargs: object) -> PeerSweepRequ
 
 def _access_skip_result(*, rpc_calls: int = 0, pages_fetched: int = 0) -> SweepResult:
     return SweepResult(
-        fetched_ids=[],
         persisted=0,
         min_id=None,
         max_id=None,
@@ -339,7 +339,6 @@ def _access_skip_result(*, rpc_calls: int = 0, pages_fetched: int = 0) -> SweepR
 
 def _flood_wait_result(seconds: int, *, rpc_calls: int = 0) -> SweepResult:
     return SweepResult(
-        fetched_ids=[],
         persisted=0,
         min_id=None,
         max_id=None,
@@ -454,7 +453,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
     request = _coerce_peer_sweep_request(*args, **kwargs)
     scope = request.client.capture_image_scope()
     if scope is None:
-        return SweepResult([], 0, None, None, completed=False, accepted=False)
+        return SweepResult(0, None, None, completed=False, accepted=False)
     observed_at = int(time.time())
 
     # Step 1: entity-type-aware peer resolution from session
@@ -476,7 +475,7 @@ async def sweep_peer_once(*args: object, **kwargs: object) -> SweepResult:
         )
     )
     if observation is None:
-        return SweepResult([], 0, None, None, completed=False, accepted=False)
+        return SweepResult(0, None, None, completed=False, accepted=False)
     identity_revision, observation_order = observation
     rpc_calls += 1  # SearchRequest is a governed Telegram call attempt.
     search = await _search_self_messages(request, peer, rpc_calls=rpc_calls)
@@ -515,6 +514,21 @@ def _notify_sweep_membership(request: PeerSweepRequest, counts_list: list[Member
             logger.debug("membership_observer_failed")
 
 
+def _empty_search_page_is_complete(response: object) -> bool:
+    return getattr(response, "count", None) == 0 and not getattr(response, "inexact", False)
+
+
+def _classify_search_page(response: _SweepResultLike | None) -> tuple[list[_SweepMessageLike], bool] | None:
+    if isinstance(response, types.messages.MessagesNotModified):
+        return None
+    raw_batch = list(cast(_SweepResultLike, response).messages or [])
+    batch = [message for message in raw_batch if not isinstance(message, types.MessageEmpty)]
+    complete = isinstance(response, types.messages.Messages) and len(batch) == len(raw_batch)
+    if not raw_batch and _empty_search_page_is_complete(response):
+        complete = True
+    return (batch, complete) if batch or complete else None
+
+
 async def _persist_searched_page(  # noqa: PLR0913, PLR0917 - page observation context
     request: PeerSweepRequest,
     search: _SearchOutcome,
@@ -526,7 +540,10 @@ async def _persist_searched_page(  # noqa: PLR0913, PLR0917 - page observation c
 ) -> SweepResult:
     """Commit the searched page and report committed membership signals."""
     rpc_duration_s = search.rpc_duration_s
-    batch = list(cast(_SweepResultLike, search.result).messages or [])
+    classified = _classify_search_page(search.result)
+    if classified is None:
+        return SweepResult(0, None, None, skip_reason=SkipReason.INCONCLUSIVE, rpc_calls=rpc_calls)
+    batch, complete = classified
     identity = observe_response_dialog_identity(
         search.result, request.dialog_id, source="profile", observed_at=observed_at
     )
@@ -542,7 +559,7 @@ async def _persist_searched_page(  # noqa: PLR0913, PLR0917 - page observation c
     if isinstance(page_rows, SweepResult):
         return page_rows
     extracted, genuinely_new_keys = page_rows
-    return _sweep_page_result(request, batch, extracted, genuinely_new_keys, rpc_duration_s, rpc_calls)
+    return _sweep_page_result(request, batch, extracted, genuinely_new_keys, rpc_duration_s, rpc_calls, complete)
 
 
 def _sweep_page_result(  # noqa: PLR0913, PLR0917 - page outcome context
@@ -552,6 +569,7 @@ def _sweep_page_result(  # noqa: PLR0913, PLR0917 - page outcome context
     genuinely_new_keys: frozenset[tuple[int, int]],
     rpc_duration_s: float,
     rpc_calls: int,
+    complete: bool,
 ) -> SweepResult:
     """Describe the persisted page, distinguishing a reachable history floor."""
     # Step 5: genuinely empty batch from a reachable peer → history floor
@@ -566,7 +584,6 @@ def _sweep_page_result(  # noqa: PLR0913, PLR0917 - page outcome context
             _PACING.search.success_s,
         )
         return SweepResult(
-            fetched_ids=[],
             persisted=0,
             min_id=None,
             max_id=None,
@@ -591,7 +608,6 @@ def _sweep_page_result(  # noqa: PLR0913, PLR0917 - page outcome context
         _PACING.search.success_s,
     )
     return SweepResult(
-        fetched_ids=msg_ids,
         persisted=persisted,
         min_id=min(msg_ids) if msg_ids else None,
         max_id=max(msg_ids) if msg_ids else None,
@@ -602,6 +618,7 @@ def _sweep_page_result(  # noqa: PLR0913, PLR0917 - page outcome context
         genuinely_new=genuinely_new,
         genuinely_new_keys=genuinely_new_keys,
         completed=True,
+        exhausted=complete and len(batch) < request.limit,
     )
 
 

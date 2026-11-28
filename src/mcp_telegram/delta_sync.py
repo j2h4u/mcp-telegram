@@ -38,6 +38,7 @@ from .history_enrollment import full_history_enabled, request_delta_refresh
 from .hydration_queue import HydrationPriority
 from .image_authorization import ScopeToken
 from .message_contracts import ExtractedMessage
+from .message_deletion_evidence import DmScanReceipt
 from .message_history.contracts import (
     HistoryAccessObservation,
     HistoryAccessProbeResult,
@@ -258,7 +259,7 @@ class DmGapScanStaleError(DmGapScanStateError):
 class DmGapScanPage(Protocol):
     """Event-handler seam for one bounded Telegram deletion lookup page."""
 
-    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int: ...
+    def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> Awaitable[DmScanReceipt]: ...
 
 
 def _delta_gap_fill_error_result(exc: BaseException) -> tuple[str, str]:
@@ -1076,6 +1077,8 @@ class DeltaGapFillDemandAdapter:
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
         if isinstance(error, TimeoutError):
             raise error
+        if isinstance(error, MessageHistoryUnavailableError):
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
         if error is not None or self._worker._last_delta_slice_access_lost:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         if self._worker._last_delta_slice_stale:
@@ -1241,8 +1244,14 @@ class DmDeletionReconciliationDemandAdapter:
         self._write_transition(conn, state, verifying)
         return verifying
 
-    def _commit_page(
-        self, conn: sqlite3.Connection, state: _DmGapScanState, dialog_id: int, next_cursor: int, now: int
+    def _commit_page(  # noqa: PLR0913, PLR0917
+        self,
+        conn: sqlite3.Connection,
+        state: _DmGapScanState,
+        dialog_id: int,
+        next_cursor: int,
+        now: int,
+        receipt: DmScanReceipt,
     ) -> str:
         advanced = _DmGapScanState(
             "running",
@@ -1255,7 +1264,16 @@ class DmDeletionReconciliationDemandAdapter:
             None,
             now,
         )
-        self._write_transition(conn, state, advanced)
+        with write_transaction(conn):
+            if receipt.scope.scope.account_id != self._account_id or bound_profile_account(conn) != self._account_id:
+                raise ReceivedMessageScopeChangedError
+            if not receipt.claim_scope(receipt.scope):
+                raise ReceivedMessageScopeChangedError
+            if _load_dm_gap_scan_state(conn) != state:
+                raise DmGapScanStaleError("DM deletion reconciliation state changed during a slice")
+            _store_dm_gap_scan_state(conn, advanced)
+            if not receipt.claim_scope(receipt.scope):
+                raise ReceivedMessageScopeChangedError
         return _dm_gap_scan_revision(advanced)
 
     def _select_page(self, conn: sqlite3.Connection, now: int) -> tuple[_DmGapScanState, int, tuple[int, ...]] | None:
@@ -1308,7 +1326,13 @@ class DmDeletionReconciliationDemandAdapter:
                     raise DmGapScanStateError("DM deletion reconciliation demand identity is invalid")
                 with acquisition_context(AcquisitionKind.MESSAGE_LOOKUP):
                     with rpc_attempt_budget(budget):
-                        await self._scanner.run_dm_gap_scan_page(dialog_id, page)
+                        receipt = await self._scanner.run_dm_gap_scan_page(dialog_id, page)
+            return await self._writer.run(
+                lambda conn: self._commit_page(conn, state, dialog_id, page[-1], int(time.time()), receipt)
+            )
+        except ReceivedMessageScopeChangedError:
+            await self._writer.run(lambda conn: self._restore_after_proven_defer(conn, state, int(time.time())))
+            raise
         except TelegramRpcAdmissionDeferred:
             await self._handle_zero_dispatch_deferral(state, budget, token)
             raise
@@ -1323,10 +1347,6 @@ class DmDeletionReconciliationDemandAdapter:
         except TelegramRpcThrottled:
             await self._handle_throttle(state)
             raise
-
-        return await self._writer.run(
-            lambda conn: self._commit_page(conn, state, dialog_id, page[-1], int(time.time()))
-        )
 
     async def run_slice(self, budget: RpcAttemptBudget) -> SliceOutcome:
         """Claim and verify at most one page, failing closed on ambiguity."""
@@ -1346,8 +1366,13 @@ class DmDeletionReconciliationDemandAdapter:
             state, dialog_id, page = selected
             claimed = await self._writer.run(lambda conn: self._claim_page(conn, state, int(time.time())))
             successor = await self._verify_claimed_page(claimed, dialog_id, page, budget)
-        except DmGapScanStaleError:
-            return SliceOutcome(selected_revision, SliceOutcomeKind.STALE)
+        except (ReceivedMessageScopeChangedError, DmGapScanStaleError) as exc:
+            kind = (
+                SliceOutcomeKind.RETRYABLE_FAILURE
+                if isinstance(exc, ReceivedMessageScopeChangedError)
+                else SliceOutcomeKind.STALE
+            )
+            return SliceOutcome(selected_revision, kind)
         except InvalidDmDeletionCheckpointError:
             logger.warning("dm_deletion_reconciliation_checkpoint_invalid_during_slice")
             return SliceOutcome(selected_revision, SliceOutcomeKind.NO_PROGRESS)

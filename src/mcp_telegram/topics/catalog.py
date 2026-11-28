@@ -150,9 +150,22 @@ class TopicCatalogRepository:
             ).fetchall(),
         )
 
-    def begin_page(self, dialog_id: int) -> TopicScan | None:
+    def selection_revision(self, dialog_id: int) -> str:
+        row = cast(
+            tuple[int | None, int | None, int, int | None, int, int] | None,
+            self._conn.execute(
+                "SELECT generation,scan_revision,revision,offset_date,offset_id,offset_topic "
+                "FROM topic_catalog_state WHERE dialog_id=?",
+                (dialog_id,),
+            ).fetchone(),
+        )
+        return repr(tuple(row) if row is not None else (None, None, 0, None, 0, 0))
+
+    def begin_page(self, dialog_id: int, selected_revision: str | None = None) -> TopicScan | None:
         with write_savepoint(self._conn):
             if not self.acquisition_allowed(dialog_id):
+                return None
+            if selected_revision is not None and self.selection_revision(dialog_id) != selected_revision:
                 return None
             self.bootstrap()
             row = cast(
@@ -352,20 +365,34 @@ class TopicCatalogRepository:
                 self._conn.execute(
                     "UPDATE topic_catalog_state SET reason=?,retry_at=NULL,capability_observation_order=? "
                     "WHERE dialog_id=? AND generation=? "
-                    "AND revision=? AND capability_observation_order<=?",
+                    "AND revision=? AND offset_date IS ? AND offset_id=? AND offset_topic=? "
+                    "AND capability_observation_order<=?",
                     (
                         reason,
                         scan.observation_order,
                         scan.dialog_id,
                         scan.generation,
                         scan.revision,
+                        scan.cursor.offset_date,
+                        scan.cursor.offset_id,
+                        scan.cursor.offset_topic,
                         scan.observation_order,
                     ),
                 )
                 return
             changed = self._conn.execute(
-                "UPDATE topic_catalog_state SET reason=?,retry_at=? WHERE dialog_id=? AND generation=?",
-                (reason, retry_at, scan.dialog_id, scan.generation),
+                "UPDATE topic_catalog_state SET reason=?,retry_at=? WHERE dialog_id=? AND generation=? "
+                "AND revision=? AND offset_date IS ? AND offset_id=? AND offset_topic=?",
+                (
+                    reason,
+                    retry_at,
+                    scan.dialog_id,
+                    scan.generation,
+                    scan.revision,
+                    scan.cursor.offset_date,
+                    scan.cursor.offset_id,
+                    scan.cursor.offset_topic,
+                ),
             ).rowcount
             if changed and reason in _RESTART_SCAN_REASONS:
                 self._reset_scan(scan.dialog_id)
@@ -380,13 +407,30 @@ class TopicCatalogRepository:
             changed = self._conn.execute(
                 "UPDATE topic_catalog_state SET applicable=0,pending=0,reason='not_topic_capable',retry_at=NULL "
                 ", capability_observation_order=? WHERE dialog_id=? AND revision=? AND generation=? "
-                "AND capability_observation_order<=?",
-                (scan.observation_order, scan.dialog_id, scan.revision, scan.generation, scan.observation_order),
+                "AND offset_date IS ? AND offset_id=? AND offset_topic=? AND capability_observation_order<=?",
+                (
+                    scan.observation_order,
+                    scan.dialog_id,
+                    scan.revision,
+                    scan.generation,
+                    scan.cursor.offset_date,
+                    scan.cursor.offset_id,
+                    scan.cursor.offset_topic,
+                    scan.observation_order,
+                ),
             ).rowcount
             active = (
                 self._conn.execute(
-                    "SELECT 1 FROM topic_catalog_state WHERE dialog_id=? AND generation=?",
-                    (scan.dialog_id, scan.generation),
+                    "SELECT 1 FROM topic_catalog_state WHERE dialog_id=? AND generation=? AND revision=? "
+                    "AND offset_date IS ? AND offset_id=? AND offset_topic=?",
+                    (
+                        scan.dialog_id,
+                        scan.generation,
+                        scan.revision,
+                        scan.cursor.offset_date,
+                        scan.cursor.offset_id,
+                        scan.cursor.offset_topic,
+                    ),
                 ).fetchone()
                 is not None
             )

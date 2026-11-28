@@ -55,6 +55,7 @@ from mcp_telegram.folders.ports import FolderSnapshotRepository
 from mcp_telegram.folders.reference_demand import FolderPeerMetadataDemandAdapter
 from mcp_telegram.folders.worker import FolderProjectionDemandAdapter, FolderProjectionWorker
 from mcp_telegram.image_authorization import ActiveSources
+from mcp_telegram.message_deletion_evidence import DmScanReceipt
 from mcp_telegram.message_fact_refresh import (
     MessageFactRefreshDemandAdapter,
     MessageFactRefreshDeps,
@@ -95,7 +96,7 @@ from mcp_telegram.telegram_rpc_consumers import (
 from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, current_rpc_scope, rpc_scope
 from mcp_telegram.topics.demand import TopicSnapshotDemandAdapter
 from tests.helpers import build_mock_message
-from tests.history_scope_helpers import HistoryScope
+from tests.history_scope_helpers import HistoryScope, dm_scan_receipt
 from tests.sqlite_writer_helpers import inline_writer
 
 
@@ -178,9 +179,9 @@ class _IdleFolderRepository(FolderSnapshotRepository):
 
 
 class _DmGapScanner(DmGapScanPage):
-    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+    async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
         del dialog_id, message_ids
-        return 0
+        return dm_scan_receipt()
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,7 +541,7 @@ async def test_claim_write_failure_preserves_demand_for_reclaim_before_scanner(
     calls = 0
 
     class RecordingScanner:
-        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> int:
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
             nonlocal calls
             del dialog_id, message_ids
             calls += 1
@@ -551,7 +552,7 @@ async def test_claim_write_failure_preserves_demand_for_reclaim_before_scanner(
                 ).fetchone(),
             )
             assert row is not None and isinstance(row[0], str) and '"status": "verifying"' in row[0]
-            return 0
+            return dm_scan_receipt()
 
     composed = replace(dependencies, dm_gap_scanner=RecordingScanner())
     first = TelegramDemandCoordinator(
@@ -575,6 +576,131 @@ async def test_claim_write_failure_preserves_demand_for_reclaim_before_scanner(
     assert kind in recovered.ready_kinds
     await recovered._execute_slice(kind)
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dm_scope_retry_keeps_running_revision_eligible_in_coordinator(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]],
+) -> None:
+    dependencies, _ = composition_dependencies
+    conn = dependencies.conn
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.execute("INSERT INTO synced_dialogs(dialog_id,status) VALUES (211,'synced')")
+    conn.execute("INSERT INTO full_history_enrollment(dialog_id,enabled,updated_at) VALUES (211,1,0)")
+    conn.execute("INSERT INTO entities(id,type,updated_at) VALUES (211,'user',1)")
+    conn.execute("INSERT INTO messages(dialog_id,message_id,sent_at) VALUES (211,1,1)")
+    conn.execute(
+        "INSERT INTO daemon_state(key,value) VALUES ('delta_dm_gap_scan_state',?)",
+        (
+            json.dumps(
+                {
+                    "status": "running",
+                    "generation": 1,
+                    "scan_started_at": 100,
+                    "dialog_id_cursor": None,
+                    "message_cursor": 0,
+                    "next_run_at": 0,
+                    "policy_version": 1,
+                    "reason": None,
+                    "state_changed_at": 99,
+                }
+            ),
+        ),
+    )
+    conn.commit()
+
+    class Scanner:
+        calls = 0
+
+        async def run_dm_gap_scan_page(self, dialog_id: int, message_ids: Sequence[int]) -> DmScanReceipt:
+            del dialog_id, message_ids
+            self.calls += 1
+            receipt = dm_scan_receipt()
+            if self.calls == 1:
+                return DmScanReceipt(0, receipt.scope, lambda _: False)
+            return receipt
+
+    scanner = Scanner()
+    deps = replace(dependencies, account_id=123, dm_gap_scanner=scanner)
+    monotonic = [0.0]
+    coordinator = TelegramDemandCoordinator(
+        build_durable_adapter_map(deps),
+        dependencies.shutdown_event,
+        clock=lambda: 1_000,
+        monotonic_clock=lambda: monotonic[0],
+    )
+    kind = DemandKind.DM_DELETION_RECONCILIATION
+    await coordinator._execute_slice(kind)
+    coordinator._active_kind = None
+    assert scanner.calls == 1
+    row = cast(
+        tuple[str], conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    )
+    state = cast(dict[str, object], json.loads(row[0]))
+    assert (state["status"], state["message_cursor"]) == ("running", 0)
+    coordinator.scan(now=1_000)
+    assert kind not in coordinator.ready_kinds
+    monotonic[0] = 10_000
+    coordinator.scan(now=1_000)
+    assert kind in coordinator.ready_kinds
+    await coordinator._execute_slice(kind)
+    assert scanner.calls == 2
+    row = cast(
+        tuple[str], conn.execute("SELECT value FROM daemon_state WHERE key='delta_dm_gap_scan_state'").fetchone()
+    )
+    state = cast(dict[str, object], json.loads(row[0]))
+    assert state["message_cursor"] == 1
+
+
+@pytest.mark.asyncio
+async def test_hot_inconclusive_page_is_retried_after_backoff(
+    composition_dependencies: tuple[DemandCompositionDependencies, dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram.activity_peer_sweep import SkipReason, SweepResult
+    from tests.test_activity_hot_sweep import _enroll
+
+    dependencies, _ = composition_dependencies
+    conn = dependencies.conn
+    now = int(time.time())
+    conn.execute("UPDATE dialog_directory_state SET account_id=123 WHERE singleton=1")
+    conn.commit()
+    _enroll(conn, -100100000100, hot_cursor=10)
+    calls = 0
+
+    async def sweep(*args: object, **kwargs: object) -> SweepResult:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        if calls == 1:
+            return SweepResult(0, None, None, skip_reason=SkipReason.INCONCLUSIVE)
+        return SweepResult(1, 11, 11, exhausted=True)
+
+    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.sweep_peer_once", sweep)
+    monotonic = [0.0]
+    wall = [float(now)]
+    monkeypatch.setattr("mcp_telegram.activity_hot_sweep.time.time", lambda: wall[0])
+    deps = replace(dependencies, account_id=123)
+    coordinator = TelegramDemandCoordinator(
+        build_durable_adapter_map(deps),
+        dependencies.shutdown_event,
+        clock=lambda: wall[0],
+        monotonic_clock=lambda: monotonic[0],
+    )
+    kind = DemandKind.HOT_ACTIVITY_PAGE
+    await coordinator._execute_slice(kind)
+    coordinator._active_kind = None
+    assert calls == 1
+    coordinator.scan(now=wall[0])
+    assert kind not in coordinator.ready_kinds
+    monotonic[0] += 10_000
+    wall[0] += 10_000
+    coordinator.scan(now=wall[0])
+    assert kind in coordinator.ready_kinds
+    await coordinator._execute_slice(kind)
+    assert calls == 2
+    assert conn.execute("SELECT hot_cursor FROM activity_dialog_state WHERE dialog_id=-100100000100").fetchone() == (
+        11,
+    )
 
 
 def test_linked_chat_adapter_selects_due_demand_and_passes_one_attempt_budget(

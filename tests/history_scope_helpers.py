@@ -2,6 +2,7 @@
 
 from mcp_telegram.auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from mcp_telegram.image_authorization import ScopeCell, ScopeToken
+from mcp_telegram.message_deletion_evidence import DmScanReceipt
 
 
 class HistoryScope:
@@ -20,3 +21,10 @@ class HistoryScope:
 
     def claim_image_scope(self, token: ScopeToken) -> bool:
         return self.cell.claim(token)
+
+
+def dm_scan_receipt(account_id: int = 123) -> DmScanReceipt:
+    scope = HistoryScope(account_id)
+    token = scope.capture_scope()
+    assert token is not None
+    return DmScanReceipt(0, token, scope.claim_scope)

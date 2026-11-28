@@ -274,6 +274,8 @@ class ColdPeerPageDemandAdapter(DurableDemandAdapter):
             return SliceOutcome(selected, SliceOutcomeKind.STALE)
         if result.flood_wait_seconds is not None:
             return SliceOutcome(selected, SliceOutcomeKind.DEFERRED)
+        if result.outcome is ColdPassOutcome.INCONCLUSIVE:
+            return SliceOutcome(selected, SliceOutcomeKind.RETRYABLE_FAILURE)
         revision = result.committed_revision
         if revision is None or revision == selected.revision:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
@@ -299,6 +301,7 @@ class ColdPassOutcome(StrEnum):
     # The loop must NOT idle 300s while more peers are due.
     FLOOD_WAIT = "flood_wait"
     # A peer encountered FloodWait; cold_next_retry_at was written.
+    INCONCLUSIVE = "inconclusive"
 
 
 @dataclass
@@ -451,13 +454,13 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
             accepted=accepted,
         )
 
-    if result.skip_reason is SkipReason.ACCESS_SKIP:
+    if result.skip_reason in (SkipReason.ACCESS_SKIP, SkipReason.INCONCLUSIVE):
         next_retry_at = int(ctx.now + pacing.history.access_retry_s)
         accepted = _save_claimed_cold_state(
             ctx,
             cold_status="pending",
             cold_next_retry_at=next_retry_at,
-            cold_last_error="access_skip",
+            cold_last_error=result.skip_reason.value,
         )
         logger.debug(
             "activity_cold_backfill_access_skip dialog_id=%r retry_delay_s=%.3f cold_next_retry_at=%d duration_s=%.3f",
@@ -466,7 +469,11 @@ def _finish_cold_backfill_peer(ctx: _ColdPeerFinishContext, pacing: ColdBackfill
             next_retry_at,
             time.monotonic() - ctx.started_at,
         )
-        return ColdPassResult(outcome=ColdPassOutcome.ZERO_PERSISTED, persisted=0, accepted=accepted)
+        outcome = {
+            SkipReason.INCONCLUSIVE: ColdPassOutcome.INCONCLUSIVE,
+            SkipReason.ACCESS_SKIP: ColdPassOutcome.ZERO_PERSISTED,
+        }[result.skip_reason]
+        return ColdPassResult(outcome=outcome, persisted=0, accepted=accepted)
 
     if result.skip_reason is SkipReason.HISTORY_FLOOR:
         accepted = _save_claimed_cold_state(

@@ -59,7 +59,7 @@ from .resolver import Candidates, Resolved, _parse_tme_link, latinize, resolve
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
 from .telegram_access import ACCESS_LOST_ERRORS
-from .telegram_demand import AcquisitionKind
+from .telegram_demand import AcquisitionKind, current_demand_token, transferred_demand_context
 from .telegram_rpc_scheduler import TelegramRpcSource, rpc_scope
 from .telethon_dialog import classify_dialog_type
 
@@ -230,6 +230,7 @@ class _TraceCandidateMessagesContext:
     target_user_id: int
     now: int
     deadline_at: float
+    topic_id: int | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -754,25 +755,20 @@ class DaemonAccountTraceService:
             result["skipped"] = 1
             return result
 
-        iter_kwargs: dict[str, object] = {"limit": max_per_dialog}
-        if topic_id is not None:
-            iter_kwargs["reply_to"] = int(topic_id)
-        if strategy == "author_search":
-            iter_kwargs["from_user"] = target_user_id
-
         result["attempted"] = 1
         fetched, status = await _trace_enrich_candidate_messages(
             _TraceCandidateMessagesContext(
                 client=self._deps.client,
                 writer=self._deps.writer,
                 dialog_id=dialog_id,
-                iter_kwargs=iter_kwargs,
+                iter_kwargs=_trace_candidate_iter_kwargs(max_per_dialog, topic_id, strategy, target_user_id),
                 target_user_id=target_user_id,
                 now=now,
                 deadline_at=deadline_at,
+                topic_id=topic_id,
             )
         )
-        if status is not None:
+        if status is not None and not fetched:
             result["status"] = status
             return result
 
@@ -793,25 +789,26 @@ class DaemonAccountTraceService:
                 )
                 persisted = write_result.accepted_count
 
-                status = _trace_candidate_status_after_fetch(
+                fetch_status = _trace_candidate_status_after_fetch(
                     fetched_count=len(fetched),
                     max_per_dialog=max_per_dialog,
                     deadline_ms=deadline_ms,
                     deadline_at=deadline_at,
                 )
-                _upsert_trace_coverage_fragment(
-                    _TraceCoverageFragmentUpsertRequest(
-                        conn=conn,
-                        target_user_id=target_user_id,
-                        dialog_id=dialog_id,
-                        topic_id=topic_id,
-                        status=status,
-                        fetched_at=now,
-                        last_error=f"BudgetExceeded:{deadline_ms}" if status == "budget_exceeded" else None,
-                        now=now,
+                if status is None:
+                    _upsert_trace_coverage_fragment(
+                        _TraceCoverageFragmentUpsertRequest(
+                            conn=conn,
+                            target_user_id=target_user_id,
+                            dialog_id=dialog_id,
+                            topic_id=topic_id,
+                            status=fetch_status,
+                            fetched_at=now,
+                            last_error=f"BudgetExceeded:{deadline_ms}" if fetch_status == "budget_exceeded" else None,
+                            now=now,
+                        )
                     )
-                )
-                return persisted, persisted_duplicate_count, status, write_result.membership_counts
+                return persisted, persisted_duplicate_count, status or fetch_status, write_result.membership_counts
 
         persisted, duplicates, persisted_status, membership_counts = await self._deps.writer.run(persist)
         if self._deps.observe_membership is not None:
@@ -944,6 +941,7 @@ class DaemonAccountTraceService:
                         owner_account_id=self._deps.self_id,
                         exact_dialog_id=scope.exact_dialog_id,
                         exact_topic_id=scope.exact_topic_id,
+                        scope_dialog_ids=scope.scope_dialog_ids,
                         linked_chat_map=scope.linked_chat_map,
                         direct_chat_excluded=direct_chat_excluded,
                     )
@@ -1123,12 +1121,21 @@ def _mark_budget_exceeded_candidates(
     request: _TraceVisibleBudgetContext,
 ) -> None:
     for candidate in candidates:
+        dialog_id = _row_int(cast(Mapping[str, object], candidate), "dialog_id")
+        topic_id = _row_int_or_none(candidate, "topic_id")
+        retry_at = fragment_next_retry_at(
+            conn, target_user_id=request.target_user_id, dialog_id=dialog_id, topic_id=topic_id
+        )
+        if retry_at is not None and retry_at > request.now:
+            request.result["dialogs_skipped"] += 1
+            _trace_increment_status(request.result, "pending")
+            continue
         _upsert_trace_coverage_fragment(
             _TraceCoverageFragmentUpsertRequest(
                 conn=conn,
                 target_user_id=request.target_user_id,
-                dialog_id=_row_int(cast(Mapping[str, object], candidate), "dialog_id"),
-                topic_id=_row_int_or_none(candidate, "topic_id"),
+                dialog_id=dialog_id,
+                topic_id=topic_id,
                 status="budget_exceeded",
                 last_error=f"BudgetExceeded:{request.deadline_ms}",
                 now=request.now,
@@ -1145,10 +1152,13 @@ async def _run_trace_visible_candidates(
 
     async def run_candidate(candidate: dict[str, object]) -> _TraceCandidateEnrichmentResult:
         async with semaphore:
-            with rpc_scope(
-                TelegramRpcSource.ACCOUNT_TRACE,
-                deadline=request.deadline_at,
-                acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+            with (
+                transferred_demand_context(token),
+                rpc_scope(
+                    TelegramRpcSource.ACCOUNT_TRACE,
+                    deadline=request.deadline_at,
+                    acquisition_kind=AcquisitionKind.MESSAGE_HISTORY_PAGE,
+                ),
             ):
                 return await request.service._trace_enrich_one_candidate(
                     target_user_id=request.target_user_id,
@@ -1158,10 +1168,16 @@ async def _run_trace_visible_candidates(
                     deadline_at=request.deadline_at,
                 )
 
-    return cast(
-        list[_TraceCandidateEnrichmentResult],
-        await asyncio.gather(*(run_candidate(candidate) for candidate in request.candidates)),
-    )
+    with rpc_scope(TelegramRpcSource.ACCOUNT_TRACE):
+        token = current_demand_token()
+        tasks = [asyncio.create_task(run_candidate(candidate)) for candidate in request.candidates]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
 
 def _trace_post_author_aliases(resolved_account: dict) -> list[str]:
@@ -1588,6 +1604,17 @@ def _parse_trace_account_navigation_scope(
     )
 
 
+def _trace_candidate_iter_kwargs(
+    max_per_dialog: int, topic_id: int | None, strategy: str, target_user_id: int
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {"limit": max_per_dialog}
+    if topic_id is not None:
+        kwargs["reply_to"] = topic_id
+    if strategy == "author_search":
+        kwargs["from_user"] = target_user_id
+    return kwargs
+
+
 def _trace_enrich_candidate_precheck(request: _TraceEnrichPrecheckContext) -> str | None:
     with write_transaction(request.conn):
         next_retry_at = fragment_next_retry_at(
@@ -1597,18 +1624,6 @@ def _trace_enrich_candidate_precheck(request: _TraceEnrichPrecheckContext) -> st
             topic_id=request.topic_id,
         )
         if next_retry_at is not None and next_retry_at > request.now:
-            _upsert_trace_coverage_fragment(
-                _TraceCoverageFragmentUpsertRequest(
-                    conn=request.conn,
-                    target_user_id=request.target_user_id,
-                    dialog_id=request.dialog_id,
-                    topic_id=request.topic_id,
-                    status="pending",
-                    fetched_at=request.now,
-                    last_error=None,
-                    now=request.now,
-                )
-            )
             return "pending"
 
         if request.strategy in {"access_lost", "unsupported", "signature_only"}:
@@ -1666,18 +1681,18 @@ async def _trace_enrich_candidate_messages(
     except TelegramRpcThrottled as exc:
         _raise_if_latched(exc)
         seconds = exc.retry_after_seconds
-        if seconds is None:
-            return fetched, "flood_wait"
+        caught_at = int(time.time())
         await request.writer.run(
             lambda conn: _persist_trace_coverage_fragment(
                 _TraceCoverageFragmentUpsertRequest(
                     conn=conn,
                     target_user_id=request.target_user_id,
                     dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
                     status="flood_wait",
                     last_error=f"TelegramRpcThrottled:{seconds}",
-                    next_retry_at=request.now + seconds,
-                    now=request.now,
+                    next_retry_at=caught_at + seconds if seconds is not None else None,
+                    now=caught_at,
                 )
             )
         )
@@ -1690,6 +1705,7 @@ async def _trace_enrich_candidate_messages(
                     conn=conn,
                     target_user_id=request.target_user_id,
                     dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
                     status="access_lost",
                     last_error=error_type,
                     now=request.now,
@@ -1705,6 +1721,7 @@ async def _trace_enrich_candidate_messages(
                     conn=conn,
                     target_user_id=request.target_user_id,
                     dialog_id=request.dialog_id,
+                    topic_id=request.topic_id,
                     status="partial",
                     last_error=error_type,
                     now=request.now,
@@ -1846,6 +1863,7 @@ class _TraceCandidateBuildRequest:
     owner_account_id: int | None = None
     exact_dialog_id: int | None = None
     exact_topic_id: int | None = None
+    scope_dialog_ids: list[int] | None = None
     max_dialogs: int = _TRACE_ENRICHMENT_MAX_DIALOGS
     linked_chat_map: dict[int, int] | None = None
     direct_chat_excluded: bool = False
@@ -2033,6 +2051,12 @@ def _upsert_trace_coverage_fragment(
             last_error = excluded.last_error,
             next_retry_at = excluded.next_retry_at,
             updated_at = excluded.updated_at
+        WHERE NOT (
+            trace_coverage_fragments.status = 'flood_wait'
+            AND trace_coverage_fragments.next_retry_at > ?
+            AND (excluded.status != 'flood_wait'
+                 OR COALESCE(excluded.next_retry_at, 0) <= trace_coverage_fragments.next_retry_at)
+        )
         """,
         (
             request.target_user_id,
@@ -2046,6 +2070,7 @@ def _upsert_trace_coverage_fragment(
             request.next_retry_at,
             timestamp,
             timestamp,
+            int(time.time()),
         ),
     )
 
@@ -2075,9 +2100,11 @@ def _trace_coverage_fragments(request: _TraceCoverageBuildRequest) -> list[dict[
     fragments = coverage_fragments(
         request.conn,
         target_user_id=request.target_user_id,
-        exact_dialog_id=request.exact_dialog_id,
+        exact_dialog_id=None if request.scope_dialog_ids else request.exact_dialog_id,
         exact_topic_id=request.exact_topic_id,
     )
+    if request.scope_dialog_ids:
+        fragments = [fragment for fragment in fragments if _row_int(fragment, "dialog_id") in request.scope_dialog_ids]
     if request.direct_chat_excluded:
         return [fragment for fragment in fragments if _row_int(fragment, "dialog_id") != request.target_user_id]
     return fragments
@@ -2207,11 +2234,11 @@ def _trace_gap_for_fragment_status(
             dialog_id=dialog_id,
             topic_id=topic_id,
         )
-    if status == "unsupported":
+    if status in {"unsupported", "partial", "pending"}:
         return _TraceGapCandidate(
             kind="history_incomplete",
             severity="warning",
-            detail="This dialog type is not supported for targeted enrichment.",
+            detail="Targeted trace enrichment has not completed.",
             dialog_id=dialog_id,
             topic_id=topic_id,
         )
@@ -2243,20 +2270,7 @@ def _build_trace_gaps(
     request: _TraceGapBuildRequest,
 ) -> list[dict[str, object]]:
     """Build controlled Account Trace coverage gaps and actions."""
-    fragment_rows = (
-        coverage_fragments(
-            request.conn,
-            target_user_id=request.target_user_id,
-            exact_dialog_id=request.exact_dialog_id,
-            exact_topic_id=request.exact_topic_id,
-        )
-        if request.coverage_goal == "best_effort_visible"
-        else []
-    )
-    if request.direct_chat_excluded:
-        fragment_rows = [
-            fragment for fragment in fragment_rows if _row_int(fragment, "dialog_id") != request.target_user_id
-        ]
+    fragment_rows = _trace_gap_fragments(request)
     considered_dialogs = _collect_trace_gap_dialogs(request, fragment_rows=fragment_rows)
     status_by_dialog = dialog_statuses(request.conn, considered_dialogs)
     gaps = _collect_trace_gaps_for_dialog_statuses(
@@ -2269,6 +2283,26 @@ def _build_trace_gaps(
     if not request.evidence and not gaps:
         gaps.append(_build_observed_zero_trace_gap())
     return gaps
+
+
+def _trace_gap_fragments(request: _TraceGapBuildRequest) -> list[dict[str, object]]:
+    fragment_rows = (
+        coverage_fragments(
+            request.conn,
+            target_user_id=request.target_user_id,
+            exact_dialog_id=None if request.scope_dialog_ids else request.exact_dialog_id,
+            exact_topic_id=request.exact_topic_id,
+        )
+        if request.coverage_goal == "best_effort_visible"
+        else []
+    )
+    if request.scope_dialog_ids:
+        fragment_rows = [row for row in fragment_rows if _row_int(row, "dialog_id") in request.scope_dialog_ids]
+    if request.direct_chat_excluded:
+        fragment_rows = [
+            fragment for fragment in fragment_rows if _row_int(fragment, "dialog_id") != request.target_user_id
+        ]
+    return fragment_rows
 
 
 def _collect_trace_gap_dialogs(
@@ -2415,12 +2449,14 @@ def _collect_trace_candidate_dialogs(
 ) -> None:
     request = state.request
     if request.exact_dialog_id is not None:
-        _add_trace_candidate_dialog(
-            state=state,
-            dialog_id=request.exact_dialog_id,
-            origin="exact_dialog",
-            include_inaccessible=True,
-        )
+        for dialog_id in request.scope_dialog_ids or [request.exact_dialog_id]:
+            _add_trace_candidate_dialog(
+                state=state,
+                dialog_id=dialog_id,
+                origin="exact_dialog",
+                include_inaccessible=True,
+            )
+        return
     for row in request.observed_rows:
         _add_trace_candidate_dialog(
             state=state,
@@ -2465,11 +2501,12 @@ def _add_trace_candidate_dialog(
             "status": meta["status"],
             "strategy": strategy,
             "origin": origin,
-            "topic_id": request.exact_topic_id if request.exact_dialog_id == dialog_id else None,
+            "topic_id": request.exact_topic_id if request.exact_dialog_id is not None else None,
         }
     )
     state.seen.add(dialog_id)
-    _trace_add_linked_chat_candidate(state, dialog_id=dialog_id, strategy=strategy)
+    if request.exact_dialog_id is None:
+        _trace_add_linked_chat_candidate(state, dialog_id=dialog_id, strategy=strategy)
 
 
 def _trace_candidate_metadata(

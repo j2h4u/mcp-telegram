@@ -5,7 +5,8 @@ Tach owns the Python import graph. This focused AST gate owns smaller contracts
 that cannot be expressed by an import graph alone:
 
 * SQL that reads ``messages`` belongs to a reviewed repository/query owner.
-* Runtime DML for the exact ``entities`` table belongs to ``entity_store``.
+* Runtime DML for the canonical ``entities`` table belongs to ``entity_store``;
+  one exact Session-owned hash repair is checked separately.
 * The structured Telegram-content marker is constructed by its canonical
   wrapper, rather than by each tool independently.
 * List and Inbox message envelopes are constructed by their canonical delivery
@@ -1454,6 +1455,39 @@ def _authorized_image_source_sql(relative: str, snippet: _SqlSnippet) -> bool:
     return expected is not None and " ".join(snippet.text.split()) == " ".join(expected.split())
 
 
+_SESSION_HASH_REPAIR_SQL = "UPDATE entities SET hash=? WHERE id=? AND (hash IS NULL OR hash=0)"
+_SESSION_GUARD = ast.dump(ast.parse("if type(session) is not SQLiteSession or not access_hash: return False").body[0])
+_SESSION_CURSOR = ast.dump(ast.parse("cursor = session._cursor()").body[0])
+
+
+def _authorized_session_hash_repair(relative: str, snippet: _SqlSnippet, tree: ast.Module) -> bool:
+    if relative != "telegram_rpc.py" or snippet.function != "_repair_delivery_session_hash":
+        return False
+    if " ".join(snippet.text.split()) != _SESSION_HASH_REPAIR_SQL:
+        return False
+    return any(
+        isinstance(node, ast.FunctionDef)
+        and node.name == snippet.function
+        and [ast.dump(statement) for statement in node.body[:2]] == [_SESSION_GUARD, _SESSION_CURSOR]
+        and [
+            ast.dump(statement)
+            for statement in ast.walk(node)
+            if isinstance(statement, ast.Assign) and "cursor" in _assignment_names(statement)
+        ]
+        == [_SESSION_CURSOR]
+        and any(
+            isinstance(call, ast.Call)
+            and call.lineno == snippet.line
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "execute"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "cursor"
+            for call in ast.walk(node)
+        )
+        for node in tree.body
+    )
+
+
 def violations_for(path: Path, source: str) -> list[Finding]:
     relative = _relative(path)
     tree = ast.parse(source, filename=str(path))
@@ -1492,6 +1526,7 @@ def violations_for(path: Path, source: str) -> list[Finding]:
                 "direct INSERT/UPDATE/DELETE/REPLACE entities SQL is outside canonical entity_store.py ownership",
             )
             for snippet in entity_dml_hits
+            if not _authorized_session_hash_repair(relative, snippet, tree)
         )
     identity_hits = [
         snippet

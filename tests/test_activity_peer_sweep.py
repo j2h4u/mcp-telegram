@@ -17,6 +17,7 @@ from contextlib import closing
 from typing import cast
 
 import pytest
+from telethon.tl import types
 
 from helpers import build_mock_message
 from mcp_telegram.activity_peer_sweep import (
@@ -325,7 +326,6 @@ def test_sweep_peer_once_resolve_none_returns_access_skip(monkeypatch: pytest.Mo
         assert calls == []
         assert result.rpc_calls == 1, "resolution attempt is the only governed RPC"
         assert result == SweepResult(
-            fetched_ids=[],
             persisted=0,
             min_id=None,
             max_id=None,
@@ -507,7 +507,6 @@ def test_sweep_peer_once_floodwait_reports_seconds(monkeypatch: pytest.MonkeyPat
         assert request.limit == 50
         assert result.rpc_calls == 2, "resolution and reached search each count once"
         assert result == SweepResult(
-            fetched_ids=[],
             persisted=0,
             min_id=None,
             max_id=None,
@@ -571,7 +570,6 @@ def test_sweep_peer_once_success_invokes_pacing_sleep(
             for record in caplog.records
         )
         assert result == SweepResult(
-            fetched_ids=[8],
             persisted=1,
             min_id=8,
             max_id=8,
@@ -611,7 +609,6 @@ def test_sweep_peer_once_floodwait_does_not_invoke_pacing_sleep(monkeypatch: pyt
 
         assert result.rpc_calls == 2, "a SearchRequest FloodWait still counts its attempt"
         assert result == SweepResult(
-            fetched_ids=[],
             persisted=0,
             min_id=None,
             max_id=None,
@@ -699,7 +696,6 @@ def test_sweep_peer_once_timeout_returns_access_skip(monkeypatch: pytest.MonkeyP
         assert called is True
         assert result.rpc_calls == 2, "a timed out SearchRequest still counts its attempt"
         assert result == SweepResult(
-            fetched_ids=[],
             persisted=0,
             min_id=None,
             max_id=None,
@@ -763,9 +759,9 @@ def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.Monkey
             del client, dialog_id
             return object()
 
-        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> _FakeSweepResult:
+        async def fake_call_with_timeout(client: object, request: object, *, timeout_s: float) -> object:
             del client, request, timeout_s
-            return _FakeSweepResult(messages=[])
+            return types.messages.Messages(messages=[], topics=[], chats=[], users=[])
 
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", fake_resolve_input_peer)
         monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", fake_call_with_timeout)
@@ -784,13 +780,54 @@ def test_sweep_peer_once_empty_batch_is_history_floor(monkeypatch: pytest.Monkey
         )
 
         assert result == SweepResult(
-            fetched_ids=[],
             persisted=0,
             min_id=None,
             max_id=None,
             skip_reason=SkipReason.HISTORY_FLOOR,
         )
         assert result.rpc_calls == 2
+
+
+@pytest.mark.parametrize(
+    "kind", ["full", "slice", "empty_slice", "empty_exact", "empty_inexact", "placeholder", "not_modified"]
+)
+async def test_search_response_shape_controls_exhaustion(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    with closing(_make_db()) as conn:
+
+        async def resolve(client: object, dialog_id: int) -> object:
+            del client, dialog_id
+            return object()
+
+        async def search(client: object, request: object, *, timeout_s: float) -> object:
+            del client, request, timeout_s
+            message = types.Message(id=8, peer_id=types.PeerUser(111), date=None, message="hello")
+            if kind == "full":
+                return types.messages.Messages(messages=[message], topics=[], chats=[], users=[])
+            if kind == "not_modified":
+                return types.messages.MessagesNotModified(count=10)
+            if kind == "placeholder":
+                return types.messages.Messages(
+                    messages=[types.MessageEmpty(8, types.PeerUser(111))], topics=[], chats=[], users=[]
+                )
+            return types.messages.MessagesSlice(
+                count=0 if kind in {"empty_exact", "empty_inexact"} else 10,
+                messages=[] if kind.startswith("empty_") else [message],
+                topics=[],
+                chats=[],
+                users=[],
+                inexact=kind == "empty_inexact",
+            )
+
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.resolve_input_peer", resolve)
+        monkeypatch.setattr("mcp_telegram.activity_peer_sweep.call_with_timeout", search)
+        result = await sweep_peer_once(
+            _FakeClient(), conn, 111, offset_id=0, min_id=1, limit=20, timeout_s=10, writer=inline_writer(conn)
+        )
+        assert result.exhausted is (kind == "full")
+        assert (result.skip_reason is SkipReason.INCONCLUSIVE) is (
+            kind in {"empty_slice", "empty_inexact", "placeholder", "not_modified"}
+        )
+        assert result.hit_floor is (kind == "empty_exact")
 
 
 def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -847,7 +884,6 @@ def test_sweep_peer_once_persists_only_extractable_messages(monkeypatch: pytest.
 
         assert inserted == [[(101, "msg-8"), (101, "msg-5")]]
         assert result == SweepResult(
-            fetched_ids=[8, 3, 5],
             persisted=2,
             min_id=3,
             max_id=8,
@@ -1016,7 +1052,7 @@ def test_save_dialog_state_rejects_unknown_columns():
 def test_hit_floor_only_for_history_floor():
     """hit_floor is True ONLY for HISTORY_FLOOR, False for all other SkipReasons."""
     for reason in SkipReason:
-        r = SweepResult(fetched_ids=[], persisted=0, min_id=None, max_id=None, skip_reason=reason)
+        r = SweepResult(persisted=0, min_id=None, max_id=None, skip_reason=reason)
         expected = reason is SkipReason.HISTORY_FLOOR
         assert r.hit_floor == expected, f"hit_floor expected {expected} for {reason!r}, got {r.hit_floor}"
 

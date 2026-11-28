@@ -27,6 +27,86 @@ CHANNEL = -1_000_000_000_123
 UNTRACKED_CHANNEL = -1_000_000_000_789
 
 
+def _peer_row(path: Path, peer_id: int) -> tuple[int, str | None] | None:
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as reader:
+        return reader.execute("SELECT hash, name FROM entities WHERE id=?", (peer_id,)).fetchone()
+
+
+@pytest.mark.parametrize("session_hash", [0, 222])
+async def test_replay_preserves_newer_session_peer_and_passes_original_packet_to_callback(
+    tmp_path: Path, session_hash: int
+) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    reopened = None
+    try:
+        await client.start_update_delivery(99)
+        await _mixed(client, users=[types.User(55, access_hash=111, first_name="old")])
+        session = cast(SQLiteSession, client.session)
+        session.process_entities([types.User(55, access_hash=222, first_name="new")])
+        assert session._conn is not None
+        session._conn.execute("UPDATE entities SET hash=? WHERE id=55", (session_hash,))
+        session.save()
+        session.close()
+        reopened = _client(tmp_path / "session", writer, channel=False)
+        observed: list[str | None] = []
+
+        async def observe(update: object) -> None:
+            observed.append(cast(types.User, vars(update)["_entities"][55]).first_name)
+
+        reopened.add_event_handler(observe, events.Raw())
+        await reopened.start_update_delivery(99)
+        assert observed and set(observed) == {"old"}
+        assert _peer_row(tmp_path / "session.session", 55) == (session_hash or 111, "new")
+        assert _pending(path) is None and _safe(path).pts == 12
+    finally:
+        if reopened is not None:
+            cast(SQLiteSession, reopened.session).close()
+        cast(SQLiteSession, client.session).close()
+        await writer.aclose()
+
+
+async def test_completed_restore_preserves_newer_channel_and_repairs_missing_material(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    writer = await SQLiteWriter.open(path)
+    client = _client(tmp_path / "session", writer)
+    session = cast(SQLiteSession, client.session)
+    try:
+        await client.start_update_delivery(99)
+        for update in await _mixed(client, chats=[types.ChannelForbidden(123, 777, "old")]):
+            await client._dispatch_update(update)
+        _put_channel(session, 888, title="new")
+        session.save()
+        client._restore_delivery_message_box(99)
+        session.save()
+        assert _peer_row(tmp_path / "session.session", CHANNEL) == (888, "new")
+        cached = client._mb_entity_cache.get(123)
+        assert cached is not None and cached.hash == 888
+        assert session._conn is not None
+        session._conn.execute(
+            "UPDATE entities SET hash=0, username='retained', phone='123', date=12345 WHERE id=?", (CHANNEL,)
+        )
+        client._restore_delivery_message_box(99)
+        session.save()
+        assert _peer_row(tmp_path / "session.session", CHANNEL) == (777, "new")
+        with closing(sqlite3.connect(f"file:{tmp_path / 'session.session'}?mode=ro", uri=True)) as reader:
+            assert reader.execute("SELECT username, phone, date FROM entities WHERE id=?", (CHANNEL,)).fetchone() == (
+                "retained",
+                123,
+                12345,
+            )
+        session._conn.execute("DELETE FROM entities WHERE id=?", (CHANNEL,))
+        client._restore_delivery_message_box(99)
+        session.save()
+        assert _peer_row(tmp_path / "session.session", CHANNEL) == (777, None)
+        cached = client._mb_entity_cache.get(123)
+        assert cached is not None and cached.hash == 777
+    finally:
+        session.close()
+        await writer.aclose()
+
+
 def _durable_peers(path: Path) -> dict[int, int]:
     with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as reader:
         return dict(reader.execute("SELECT id,hash FROM entities"))
@@ -91,8 +171,8 @@ def _observe_writes(session: SQLiteSession, monkeypatch: pytest.MonkeyPatch) -> 
     [
         ("same", 456, 0),
         ("missing", 456, 1),
-        ("different", 456, 1),
-        ("full", 777, 1),
+        ("different", 999, 0),
+        ("full", 999, 0),
         ("min", 456, 0),
         ("empty", None, 0),
     ],
