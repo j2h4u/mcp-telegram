@@ -9309,6 +9309,7 @@ def test_trace_candidate_includes_linked_group_as_author_search() -> None:
             target_user_id=_TARGET_USER_ID,
             observed_rows=[],
             exact_dialog_id=_CHANNEL_ID,
+            scope_dialog_ids=[_CHANNEL_ID, _LINKED_CHAT_ID],
             linked_chat_map=linked_chat_map,
         )
     )
@@ -9325,9 +9326,19 @@ def test_trace_candidate_includes_linked_group_as_author_search() -> None:
         f"expected author_search for linked group, got {strategies[_LINKED_CHAT_ID]!r}"
     )
 
-    # Origin of the linked-group candidate must be "linked_chat".
+    # Both candidates come from the resolved exact scope.
     origins = {c["dialog_id"]: c["origin"] for c in candidates}
-    assert origins[_LINKED_CHAT_ID] == "linked_chat"
+    assert origins[_LINKED_CHAT_ID] == "exact_dialog"
+
+    unscoped = _trace_candidate_dialogs(
+        _TraceCandidateBuildRequest(
+            conn=conn,
+            target_user_id=_TARGET_USER_ID,
+            observed_rows=[],
+            linked_chat_map=linked_chat_map,
+        )
+    )
+    assert any(c["dialog_id"] == _LINKED_CHAT_ID and c["strategy"] == "author_search" for c in unscoped)
 
 
 # -------- (c) Query-side proof: evidence contains linked-chat messages --------
