@@ -445,7 +445,7 @@ def _publish(checkpoint: Checkpoint, peers: list[Payload], output: Path) -> Payl
         if _fingerprint(output) != checkpoint.state("published"):
             raise FileExistsError(f"Export destination changed independently: {output}")
         checkpoint.mark("pending_publish", _fingerprint(temporary))
-        if output.exists():
+        if checkpoint.state("published") is not None:
             temporary.replace(output)
         else:
             os.link(temporary, output)

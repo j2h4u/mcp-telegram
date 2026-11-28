@@ -166,6 +166,30 @@ def test_access_lost_suspends_due_selection_and_release_until_restored() -> None
     conn.close()
 
 
+@pytest.mark.parametrize("linked_id", [None, 2222222222])
+def test_retained_link_fact_reports_suspended_refresh_and_resumes(linked_id: int | None) -> None:
+    conn = _db()
+    channel_id = -1001234567893
+    generation = capture_generation(conn, channel_id)
+    assert publish(conn, channel_id, generation, linked_id, 10)
+    generation = capture_generation(conn, channel_id)
+    invalidate_from_update(conn, channel_id, 20)
+    conn.commit()
+    assert set_access_lost(conn, channel_id, 30, reason="test").changed
+    fact = read_fact(conn, channel_id)
+    assert fact.state is (LinkedChatState.KNOWN_NONE if linked_id is None else LinkedChatState.KNOWN_LINK)
+    assert fact.linked_chat_id == (None if linked_id is None else -1002222222222)
+    assert fact.resolved_at == 10 and fact.refresh_pending and fact.suspended
+    with write_transaction(conn):
+        assert next_due(conn, 40) is None and next_release_at(conn) is None
+    assert restore_access_after_revalidation(conn, channel_id, 50)
+    assert not read_fact(conn, channel_id).suspended
+    with write_transaction(conn):
+        assert next_due(conn, 50) == LinkedChatWork(channel_id, generation + 1, 20)
+    assert read_fact(conn, channel_id).resolved_at == 10
+    conn.close()
+
+
 def test_access_lifecycle_suspends_and_restores_linked_chat_demand_without_changing_ledger() -> None:
     conn = _db()
     suspended_channel = -1001234567898

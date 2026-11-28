@@ -1252,7 +1252,7 @@ depends_on = ["mcp_telegram.message_images.limits", ]
 [[modules]]
 path = "mcp_telegram.message_images.worker"
 layer = "application"
-depends_on = ["mcp_telegram.entity_profile.membership", "mcp_telegram.message_images.limits", "mcp_telegram.entity_profile.repository", "mcp_telegram.flood", "mcp_telegram.image_authorization", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.observation_order", "mcp_telegram.sqlite_writer", "mcp_telegram.sync_transactions", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_progress", "mcp_telegram.telegram_image_download", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.message_images.contracts", "mcp_telegram.message_images.fence", "mcp_telegram.message_images.repository", "mcp_telegram.message_images.store"]
+depends_on = ["mcp_telegram.entity_profile.membership", "mcp_telegram.message_images.limits", "mcp_telegram.entity_profile.repository", "mcp_telegram.flood", "mcp_telegram.image_authorization", "mcp_telegram.messages.sqlite_bundle", "mcp_telegram.messages.telegram_adapter", "mcp_telegram.reactions.contracts", "mcp_telegram.observation_order", "mcp_telegram.sqlite_writer", "mcp_telegram.sync_transactions", "mcp_telegram.telegram_demand", "mcp_telegram.telegram_demand_progress", "mcp_telegram.telegram_image_download", "mcp_telegram.telegram_rpc_consumers", "mcp_telegram.telegram_rpc_scheduler", "mcp_telegram.message_images.contracts", "mcp_telegram.message_images.fence", "mcp_telegram.message_images.repository", "mcp_telegram.message_images.store"]
 
 [[modules]]
 path = "mcp_telegram.message_images.limits"

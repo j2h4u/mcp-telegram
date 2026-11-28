@@ -122,6 +122,7 @@ from .telegram_image_download import (
     PhotoSourceFence,
     PhotoSourceToken,
     PhotoTarget,
+    PhotoUnsupportedError,
     PhotoWork,
     iter_photo_chunks,
     photo_locator_from_message,
@@ -7616,19 +7617,31 @@ class TelegramRpcGate(TelegramClient):
             request, scope=scope, budget=budget, source_fence=source_fence, setup=True, dialog_id=target.dialog_id
         )
         message = self._photo_message_from_response(response, target)
-        locator = photo_locator_from_message(message)
+        try:
+            locator = photo_locator_from_message(message)
+        except PhotoUnsupportedError:
+            locator = None
         if not self.claim_image_scope(token):
             raise ValueError("photo observation scope changed")
         self._photo_locators.clear()
-        self._photo_locators[id(locator)] = (locator, token, target.dialog_id)
+        if locator is not None:
+            self._photo_locators[id(locator)] = (locator, token, target.dialog_id)
         return PhotoObservation(message, locator)
 
     @staticmethod
     def _photo_message_from_response(response: object, target: PhotoTarget) -> object:
+        if type(response) not in (
+            types.messages.Messages,
+            types.messages.MessagesSlice,
+            types.messages.ChannelMessages,
+        ):
+            raise ValueError("photo message response is invalid")
         messages = getattr(response, "messages", None)
         if not isinstance(messages, list) or len(messages) != 1:
             raise ValueError("photo message is unavailable")
         message = messages[0]
+        if type(message) is not types.Message:
+            raise ValueError("photo message is unavailable")
         peer = cast(object, getattr(message, "peer_id", None))
         if getattr(message, "id", None) != target.message_id or peer is None or get_peer_id(peer) != target.dialog_id:
             raise ValueError("photo response does not match the requested message")

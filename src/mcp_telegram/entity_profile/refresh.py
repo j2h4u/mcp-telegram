@@ -1,8 +1,7 @@
-"""Bounded, single-flight profile enrichment refreshes."""
+"""Bounded durable profile enrichment refreshes."""
 
 from __future__ import annotations
 
-import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -45,7 +44,6 @@ class RefreshLimits:
     foreground_resolve_seconds: float = 3.0
     per_rpc_seconds: float = 8.0
     whole_refresh_seconds: float = 25.0
-    max_queued_refreshes: int = 128
     foreground_refresh_wait_seconds: float = 15.0
     flood_retry_base_seconds: int = PROFILE_FLOOD_RETRY_BASE_SECONDS
     flood_retry_cap_seconds: int = PROFILE_FLOOD_RETRY_CAP_SECONDS
@@ -62,28 +60,15 @@ class RefreshLimits:
             raise ValueError("foreground resolve budget cannot exceed per-RPC budget")
         if self.per_rpc_seconds > self.whole_refresh_seconds:
             raise ValueError("per-RPC budget cannot exceed whole-refresh budget")
-        _validate_positive_integer(self.max_queued_refreshes, "refresh queue capacity")
         _validate_positive_integer(self.flood_retry_base_seconds, "Flood retry base")
         _validate_positive_integer(self.flood_retry_cap_seconds, "Flood retry cap")
         if self.flood_retry_base_seconds > self.flood_retry_cap_seconds:
             raise ValueError("entity profile Flood retry base cannot exceed cap")
 
 
-class RefreshEnqueueResult(StrEnum):
-    """Result of attempting to admit one entity refresh."""
-
-    QUEUED = "queued"
-    COALESCED = "coalesced"
-    REJECTED = "rejected"
-
-    def __bool__(self) -> bool:
-        """Keep the pre-queue API's truthiness for existing callers."""
-        return self is RefreshEnqueueResult.QUEUED
-
-
 @dataclass(frozen=True, slots=True)
 class DurableRefreshSliceResult:
-    """Foreground waiter result plus the independent durable slice receipt."""
+    """Durable profile slice result and its terminal state."""
 
     entity_id: int
     terminal: DurableRefreshTerminal | None = None
@@ -92,7 +77,7 @@ class DurableRefreshSliceResult:
 
 
 class DurableRefreshTerminal(StrEnum):
-    """Terminal state for the foreground wait associated with one refresh attempt."""
+    """Terminal state of one durable refresh attempt."""
 
     SUCCESS = "success"
     FAILURE = "failure"
@@ -102,7 +87,7 @@ type DurableRefreshSliceCallback = Callable[[RpcAttemptBudget], Awaitable[Durabl
 
 
 class EntityRefreshCoordinator:
-    """Coalesce foreground waiters around the durable entity refresh queue."""
+    """Run bounded slices from the durable entity refresh queue."""
 
     def __init__(
         self,
@@ -110,32 +95,14 @@ class EntityRefreshCoordinator:
         limits: RefreshLimits | None = None,
     ) -> None:
         self._limits = limits or RefreshLimits()
-        self._completion_events: dict[int, asyncio.Event] = {}
         self._closed = False
         self._durable_status_callback: DurableRefreshStatusCallback | None = None
         self._durable_slice_callback: DurableRefreshSliceCallback | None = None
 
     @property
-    def queue_depth(self) -> int:
-        """Return process-local refresh admissions with foreground waiters."""
-        return len(self._completion_events)
-
-    @property
     def is_closed(self) -> bool:
         """Return whether this coordinator has stopped admitting refresh work."""
         return self._closed
-
-    def enqueue(self, entity_id: int) -> RefreshEnqueueResult:
-        """Register foreground interest in durable work and coalesce duplicates."""
-        if self._closed:
-            return RefreshEnqueueResult.REJECTED
-        if entity_id in self._completion_events:
-            return RefreshEnqueueResult.COALESCED
-        if self.queue_depth >= self._limits.max_queued_refreshes:
-            return RefreshEnqueueResult.REJECTED
-
-        self._completion_events[entity_id] = asyncio.Event()
-        return RefreshEnqueueResult.QUEUED
 
     def bind_durable_executor(
         self,
@@ -162,19 +129,8 @@ class EntityRefreshCoordinator:
         with rpc_scope(TelegramRpcSource.ENTITY_INFO_REFRESH, response_timeout_seconds=timeout_seconds):
             return await self._durable_slice_callback(budget)
 
-    def signal_terminal(self, result: DurableRefreshSliceResult) -> None:
-        """Release coalesced waiters after durable success or persisted failure."""
-        if result.terminal is None:
-            return
-        event = self._completion_events.pop(result.entity_id, None)
-        if event is not None:
-            event.set()
-
     async def shutdown(self) -> None:
         self._closed = True
-        for event in self._completion_events.values():
-            event.set()
-        self._completion_events.clear()
 
 
 class EntityProfileDemandAdapter(DurableDemandAdapter):
@@ -227,8 +183,6 @@ class EntityProfileDemandAdapter(DurableDemandAdapter):
     def _finish_slice(self, selected: WorkRevision, result: DurableRefreshSliceResult | None) -> SliceOutcome:
         if result is None:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
-        if result.terminal is not None:
-            self._coordinator.signal_terminal(result)
         if result.outcome is None:
             return SliceOutcome(selected, SliceOutcomeKind.NO_PROGRESS)
         return result.outcome

@@ -5,6 +5,7 @@ Works offline; cannot detect messages deleted after the original export.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import tempfile
@@ -15,7 +16,7 @@ from typing import TextIO, cast
 
 import ijson  # type: ignore[import-untyped]
 
-from mcp_telegram.chat_export_checkpoint import base_records, fingerprint
+from mcp_telegram.chat_export_checkpoint import Checkpoint, base_records, fingerprint, read_checkpoint_options
 from mcp_telegram.chat_export_identity import IdentityIndex
 from mcp_telegram.chat_export_projection import omit_empty_fields
 from mcp_telegram.chat_export_schema import IDENTITY_FORMAT_VERSION, SPARSE_FORMAT_VERSION, read_export_version
@@ -765,14 +766,236 @@ def _write_public_export(  # noqa: PLR0912, PLR0915
     return counts
 
 
-def _rollback(published: list[tuple[Path, Path]]) -> None:
-    for temporary, destination in reversed(published):
+def _sync_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _create_pair_checkpoint(path: Path, options: dict[str, object]) -> int:
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for suffix in ("-journal", "-wal", "-shm"):
+            auxiliary = path.with_name(path.name + suffix)
+            if auxiliary.exists() or auxiliary.is_symlink():
+                raise FileExistsError(f"Public export checkpoint auxiliary path already exists: {auxiliary}")
+        checkpoint = Checkpoint(temporary)
         try:
-            identity = destination.lstat()
+            checkpoint.mark("options", options)
+        finally:
+            checkpoint.close()
+        os.link(temporary, path)
+        _sync_directory(path.parent)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _pair_checkpoint(path: Path, options: dict[str, object]) -> tuple[Checkpoint, int]:
+    if not path.exists() and not path.is_symlink():
+        descriptor = _create_pair_checkpoint(path, options)
+    else:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(descriptor)
+            raise
+    try:
+        saved = read_checkpoint_options(path)
+        if any(saved.get(key) != options[key] for key in ("source", "private", "public")):
+            raise ValueError("Public export checkpoint belongs to another operation")
+        return Checkpoint(path), descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _stage_pair(checkpoint: Checkpoint, source: Path, destinations: tuple[Path, Path]) -> None:
+    staged: list[Path] = []
+    provisional: list[list[object]] = []
+    retained = False
+    try:
+        with ExitStack() as stack:
+            streams = []
+            for destination in destinations:
+                descriptor, name = tempfile.mkstemp(
+                    prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+                )
+                staged.append(Path(name))
+                streams.append(stack.enter_context(os.fdopen(descriptor, "w", encoding="utf-8")))
+                identity = os.fstat(descriptor)
+                provisional.append([name, [identity.st_dev, identity.st_ino]])
+                _sync_directory(destination.parent)
+                checkpoint.mark("staging", provisional)
+            source_index = stack.enter_context(IdentityIndex())
+            public_index = stack.enter_context(IdentityIndex())
+            counts = _write_public_export(source, streams[1], streams[0], source_index, public_index)
+            for stream in streams:
+                stream.flush()
+                os.fsync(stream.fileno())
+        for parent in {item.parent for item in staged}:
+            _sync_directory(parent)
+        records = [[str(item), fingerprint(item)] for item in staged]
+        if any(record[1] is None for record in records):
+            raise FileNotFoundError("Public export staging file disappeared")
+        retained = True
+        checkpoint.mark_many({"stages": records, "counts": counts, "staging": None})
+    finally:
+        if not retained:
+            _discard_provisional(provisional, destinations)
+
+
+def _valid_staging_path(temporary: Path, destination: Path) -> bool:
+    return (
+        temporary.parent == destination.parent
+        and temporary.name.startswith(f".{destination.name}.")
+        and temporary.name.endswith(".tmp")
+    )
+
+
+def _discard_provisional(staging: list[list[object]], destinations: tuple[Path, Path]) -> None:
+    for stage, destination in zip(staging, destinations, strict=False):
+        temporary = Path(cast(str, stage[0]))
+        if not _valid_staging_path(temporary, destination):
+            continue
+        try:
+            identity = temporary.lstat()
         except FileNotFoundError:
             continue
-        if os.path.samestat(identity, temporary.stat()):
+        if [identity.st_dev, identity.st_ino] == stage[1] and not temporary.is_symlink():
+            temporary.unlink()
+            _sync_directory(temporary.parent)
+
+
+def _publish_pair_file(stage: list[object], destination: Path) -> None:
+    temporary = Path(cast(str, stage[0]))
+    if not _valid_staging_path(temporary, destination):
+        raise ValueError("Invalid public export staging path")
+    staged = fingerprint(temporary)
+    current = fingerprint(destination)
+    if staged != stage[1] and not (staged is None and current == stage[1]):
+        raise ValueError("Public export staging file changed")
+    if current is None:
+        os.link(temporary, destination)
+    elif current != stage[1]:
+        raise FileExistsError(f"Public export destination changed: {destination}")
+    _sync_directory(destination.parent)
+
+
+def _pair_stages(checkpoint: Checkpoint, destinations: tuple[Path, Path]) -> list[list[object]]:
+    stages = cast(list[list[object]], checkpoint.state("stages"))
+    if len(stages) != len(destinations) or any(stage[1] is None for stage in stages):
+        raise ValueError("Invalid public export checkpoint")
+    return stages
+
+
+def _finish_pair(checkpoint: Checkpoint, destinations: tuple[Path, Path]) -> dict[str, int]:
+    stages = _pair_stages(checkpoint, destinations)
+    for stage, destination in zip(stages, destinations, strict=True):
+        _publish_pair_file(stage, destination)
+    return cast(dict[str, int], checkpoint.state("counts"))
+
+
+def _discard_pair(checkpoint: Checkpoint, destinations: tuple[Path, Path]) -> None:
+    stages = _pair_stages(checkpoint, destinations)
+    for stage, destination in reversed(tuple(zip(stages, destinations, strict=True))):
+        temporary = Path(cast(str, stage[0]))
+        if not _valid_staging_path(temporary, destination):
+            raise ValueError("Invalid public export staging path")
+        if not destination.is_symlink() and fingerprint(destination) == stage[1]:
             destination.unlink()
+        _sync_directory(destination.parent)
+    for stage, destination in zip(stages, destinations, strict=True):
+        temporary = Path(cast(str, stage[0]))
+        if not temporary.is_symlink() and fingerprint(temporary) == stage[1]:
+            temporary.unlink()
+            _sync_directory(destination.parent)
+
+
+def _ensure_pair_staged(checkpoint: Checkpoint, source: Path, destinations: tuple[Path, Path]) -> None:
+    if checkpoint.state("stages") is not None:
+        return
+    provisional = checkpoint.state("staging")
+    if provisional is not None:
+        _discard_provisional(cast(list[list[object]], provisional), destinations)
+        checkpoint.mark("staging", None)
+    if any(item.exists() or item.is_symlink() for item in destinations):
+        raise FileExistsError("Output already exists")
+    _stage_pair(checkpoint, source, destinations)
+
+
+def _rollback_pair(checkpoint: Checkpoint, checkpoint_path: Path, destinations: tuple[Path, Path]) -> None:
+    checkpoint.mark("rollback", True)
+    if checkpoint.state("stages") is not None:
+        _discard_pair(checkpoint, destinations)
+    staging = checkpoint.state("staging")
+    if staging is not None:
+        _discard_provisional(cast(list[list[object]], staging), destinations)
+    checkpoint.close()
+    checkpoint_path.unlink()
+    _sync_directory(checkpoint_path.parent)
+
+
+def _owned_pair_published(checkpoint: Checkpoint, destinations: tuple[Path, Path]) -> bool:
+    stages = checkpoint.state("stages")
+    if stages is None:
+        return False
+    return any(
+        stage[1] is not None and not destination.is_symlink() and fingerprint(destination) == stage[1]
+        for stage, destination in zip(cast(list[list[object]], stages), destinations, strict=True)
+    )
+
+
+def _check_pair_namespace(source: Path, destinations: tuple[Path, Path], checkpoint_path: Path) -> None:
+    reserved = {checkpoint_path.with_name(checkpoint_path.name + suffix) for suffix in ("", "-journal", "-wal", "-shm")}
+    if any(candidate in reserved or candidate.resolve() in reserved for candidate in (source, *destinations)):
+        raise ValueError("Source or output collides with public export checkpoint")
+
+
+def _prepare_pair(
+    checkpoint: Checkpoint, checkpoint_path: Path, destinations: tuple[Path, Path], options: dict[str, object]
+) -> bool:
+    if checkpoint.state("rollback"):
+        _rollback_pair(checkpoint, checkpoint_path, destinations)
+        return False
+    saved = cast(dict[str, object], checkpoint.state("options"))
+    if saved["source_fingerprint"] != options["source_fingerprint"]:
+        if not _owned_pair_published(checkpoint, destinations):
+            _rollback_pair(checkpoint, checkpoint_path, destinations)
+        raise ValueError("Input changed since public export started")
+    return True
+
+
+def _publish_owned_pair(
+    checkpoint: Checkpoint,
+    checkpoint_path: Path,
+    source: Path,
+    destinations: tuple[Path, Path],
+    source_fingerprint: object,
+) -> dict[str, int]:
+    try:
+        _ensure_pair_staged(checkpoint, source, destinations)
+        if fingerprint(source) != source_fingerprint:
+            raise ValueError("Input changed during filtering")
+        counts = _finish_pair(checkpoint, destinations)
+    except Exception:
+        _rollback_pair(checkpoint, checkpoint_path, destinations)
+        raise
+    stages = cast(list[list[object]], checkpoint.state("stages"))
+    checkpoint.close()
+    for stage in stages:
+        Path(cast(str, stage[0])).unlink(missing_ok=True)
+    checkpoint_path.unlink()
+    _sync_directory(checkpoint_path.parent)
+    return counts
 
 
 def sanitize_export(path: Path, output: Path, removed_output: Path | None = None) -> dict[str, int]:
@@ -782,44 +1005,33 @@ def sanitize_export(path: Path, output: Path, removed_output: Path | None = None
     paths = (path, *destinations)
     if len({item.resolve() for item in paths}) != len(paths):
         raise ValueError("Source and both outputs must differ")
-    for destination in destinations:
-        if destination.exists() and destination.samefile(path):
-            raise ValueError("Output must differ from the original export")
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError("Output already exists")
-    before = fingerprint(path)
-    with ExitStack() as stack:
-        staged = []
-        streams = []
-        for destination in destinations:
-            descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
-            temporary = Path(name)
-            stack.callback(temporary.unlink, missing_ok=True)
-            streams.append(stack.enter_context(os.fdopen(descriptor, "w", encoding="utf-8")))
-            staged.append((temporary, destination))
-        source_index = stack.enter_context(IdentityIndex())
-        public_index = stack.enter_context(IdentityIndex())
-        counts = _write_public_export(path, streams[1], streams[0], source_index, public_index)
-        for stream in streams:
-            stream.flush()
-            os.fsync(stream.fileno())
-        if fingerprint(path) != before:
-            raise ValueError("Input changed during filtering")
-        published: list[tuple[Path, Path]] = []
-        try:
-            for temporary, destination in staged:
-                os.link(temporary, destination)
-                published.append((temporary, destination))
-            for parent in {destination.parent for destination in destinations}:
-                directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory)
-                finally:
-                    os.close(directory)
-        except BaseException:
-            _rollback(published)
-            raise
-        return counts
+    path = path.resolve()
+    destinations = (
+        destinations[0].parent.resolve() / destinations[0].name,
+        destinations[1].parent.resolve() / destinations[1].name,
+    )
+    checkpoint_path = destinations[1].with_name(f".{destinations[1].name}.public-resume.sqlite3")
+    _check_pair_namespace(path, destinations, checkpoint_path)
+    if (
+        not checkpoint_path.exists()
+        and not checkpoint_path.is_symlink()
+        and any(item.exists() or item.is_symlink() for item in destinations)
+    ):
+        raise FileExistsError("Output already exists")
+    options: dict[str, object] = {
+        "source": str(path),
+        "source_fingerprint": fingerprint(path),
+        "private": str(destinations[0]),
+        "public": str(destinations[1]),
+    }
+    checkpoint, descriptor = _pair_checkpoint(checkpoint_path, options)
+    try:
+        if not _prepare_pair(checkpoint, checkpoint_path, destinations, options):
+            return sanitize_export(path, destinations[1], destinations[0])
+        return _publish_owned_pair(checkpoint, checkpoint_path, path, destinations, options["source_fingerprint"])
+    finally:
+        checkpoint.close()
+        os.close(descriptor)
 
 
 if __name__ == "__main__":
@@ -828,4 +1040,8 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("removed_output", nargs="?", type=Path)
     args = parser.parse_args()
-    print(json.dumps(sanitize_export(args.export, args.output, args.removed_output)))
+    print(
+        json.dumps(
+            sanitize_export(cast(Path, args.export), cast(Path, args.output), cast(Path | None, args.removed_output))
+        )
+    )

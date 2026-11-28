@@ -127,7 +127,18 @@ def test_docker_inspection_timeout_is_transient_and_bounded() -> None:
     ],
 )
 def test_docker_inspection_projects_only_readiness_state(state: str, health: str, expected: ProbeResult) -> None:
-    payload = json.dumps({"Status": state, "ExitCode": 1, "Health": {"Status": health}})
+    payload = json.dumps(
+        {
+            "Status": state,
+            "ExitCode": 0 if state == "running" else 1,
+            "Health": {"Status": health},
+            "Running": state == "running",
+            "Paused": False,
+            "Restarting": state == "restarting",
+            "Dead": state == "dead",
+            "OOMKilled": False,
+        }
+    )
     completed = subprocess.CompletedProcess(["docker", "inspect"], 0, stdout=payload, stderr="")
     with patch("devtools.runtime_wait.subprocess.run", return_value=completed) as run:
         assert inspect_container("mcp-telegram", 5) == expected
@@ -140,6 +151,35 @@ def test_docker_inspection_projects_only_readiness_state(state: str, health: str
         "{{json .State}}",
         "mcp-telegram",
     ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("Running", False),
+        ("Paused", True),
+        ("Restarting", True),
+        ("Dead", True),
+        ("OOMKilled", True),
+        ("ExitCode", 1),
+        ("Running", None),
+    ],
+)
+def test_healthy_rejects_contradictory_state(field: str, value: object) -> None:
+    state: dict[str, object] = {
+        "Status": "running",
+        "Running": True,
+        "Paused": False,
+        "Restarting": False,
+        "Dead": False,
+        "OOMKilled": False,
+        "ExitCode": 0,
+        "Health": {"Status": "healthy"},
+    }
+    state[field] = value
+    completed = subprocess.CompletedProcess(["docker", "inspect"], 0, stdout=json.dumps(state), stderr="")
+    with patch("devtools.runtime_wait.subprocess.run", return_value=completed):
+        assert inspect_container("mcp-telegram", 5) == ProbeResult("inspection returned contradictory container state")
 
 
 def test_missing_container_is_a_terminal_diagnostic() -> None:

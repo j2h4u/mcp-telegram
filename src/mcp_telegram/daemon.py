@@ -1599,7 +1599,6 @@ async def _compose_sync_main_context(  # noqa: PLR0913, PLR0914, PLR0915 - compo
                 foreground_refresh_wait_seconds=config.entity_profile.foreground_refresh_wait_seconds,
                 per_rpc_seconds=config.entity_profile.rpc_timeout_seconds,
                 whole_refresh_seconds=config.entity_profile.refresh_timeout_seconds,
-                max_queued_refreshes=config.entity_profile.max_queued_refreshes,
             ),
             full_user_pair_enabled=config.entity_profile.full_user_pair_enabled,
             automatic_group_history=config.scheduling.automatic_group_history,

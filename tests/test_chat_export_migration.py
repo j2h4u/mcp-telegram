@@ -10,6 +10,42 @@ from devtools.migrate_chat_export import migrate_export
 from mcp_telegram.chat_export_checkpoint import ORDER, census
 
 
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_migration_directory_sync_failure_rolls_back_owned_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rollback_fails: bool
+) -> None:
+    source, output = tmp_path / "source.json", tmp_path / "out.json"
+    source.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "group": {"dialog_id": "-1"},
+                "metadata": {"order": ORDER, "peers": [{"dialog_id": "-1"}]},
+                "admin_events": [],
+                "messages": [],
+                "export": {"messages": 0, "admin_events": 0, "reactors": 0},
+            }
+        )
+    )
+    before = source.read_bytes()
+    calls = 0
+
+    def sync(_path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1 or rollback_fails:
+            raise OSError("injected directory sync failure")
+
+    monkeypatch.setattr("devtools.migrate_chat_export._sync_directory", sync)
+    with pytest.raises(
+        RuntimeError if rollback_fails else OSError,
+        match="rollback durability is unknown" if rollback_fails else "injected",
+    ):
+        migrate_export(source, output)
+    assert not output.exists()
+    assert source.read_bytes() == before
+
+
 def test_migration_preserves_incremental_base_and_repeats_identically(tmp_path: Path) -> None:
     source = tmp_path / "original.json"
     data = {

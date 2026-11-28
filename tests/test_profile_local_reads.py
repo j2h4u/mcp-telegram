@@ -68,7 +68,6 @@ def local_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[L
     service.bind_demand_sink(MagicMock(offer=MagicMock(side_effect=AssertionError("query offered demand"))))
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    monkeypatch.setattr(coordinator, "enqueue", MagicMock(side_effect=AssertionError("query admitted work")))
     try:
         yield conn, service
     finally:
@@ -206,7 +205,7 @@ async def test_background_reconciliation_survives_restart_beyond_waiter_capacity
     path = tmp_path / "backfill.sqlite"
     ensure_sync_schema(path)
     conn = sqlite3.connect(path)
-    service = _test_service(conn, limits=RefreshLimits(max_queued_refreshes=1))
+    service = _test_service(conn, limits=RefreshLimits())
     service._deps = replace(service._deps, self_id=42)
     with write_savepoint(conn):
         conn.executemany(
@@ -234,7 +233,6 @@ async def test_background_reconciliation_survives_restart_beyond_waiter_capacity
     assert [await service.reconcile_history_profiles() for _ in range(6)] == [32, 32, 32, 32, 1, 0]
     assert offered_counts == [32, 64, 96, 128, 129]
     assert service.refresh_coordinator is not None
-    assert service.refresh_coordinator.queue_depth == 0
     await service.shutdown()
     conn.close()
 

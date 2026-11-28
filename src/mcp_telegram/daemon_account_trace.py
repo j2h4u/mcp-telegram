@@ -1000,6 +1000,7 @@ class DaemonAccountTraceService:
             )
         )
         _apply_trace_unknown_link_coverage(scope, coverage=coverage, gaps=gaps)
+        _apply_trace_suspended_link_coverage(self._deps.conn, scope, coverage=coverage, gaps=gaps)
         return self._build_trace_account_success_payload(
             _TraceAccountPayloadContext(
                 resolved_account=resolved_account,
@@ -1055,6 +1056,38 @@ def _apply_trace_unknown_link_coverage(
                 severity="warning",
                 detail="Discussion linkage was unknown when this page sequence began. "
                 "This page and its continuations cover retained channel messages only.",
+                dialog_id=scope.exact_dialog_id,
+            )
+        )
+    )
+    coverage["state"] = "partial" if coverage["observed_message_count"] else "unknown"
+    coverage["dialogs_with_gaps"] = max(1, int(coverage["dialogs_with_gaps"]))
+
+
+def _apply_trace_suspended_link_coverage(
+    conn: sqlite3.Connection,
+    scope: _TraceAccountMessagesScope,
+    *,
+    coverage: dict,
+    gaps: list[dict[str, object]],
+) -> None:
+    if scope.exact_dialog_id is None:
+        return
+    fact = read_linked_chat_fact(conn, scope.exact_dialog_id)
+    if not fact.suspended:
+        return
+    if fact.state is LinkedChatState.KNOWN_LINK:
+        retained = f"Last observed linked dialog: {fact.linked_chat_id}, at Unix time {fact.resolved_at}."
+    elif fact.state is LinkedChatState.KNOWN_NONE:
+        retained = f"No linked dialog was observed at Unix time {fact.resolved_at}."
+    else:
+        retained = "No discussion linkage has been observed."
+    gaps.append(
+        _trace_gap(
+            _TraceGapCandidate(
+                kind="history_incomplete",
+                severity="warning",
+                detail="Discussion linkage refresh is pending and suspended because access is lost. " + retained,
                 dialog_id=scope.exact_dialog_id,
             )
         )
@@ -1509,7 +1542,7 @@ async def _resolve_trace_account_signature_scope(
         return None
 
     meta = dialog_metadata(deps.conn, exact_dialog_id)
-    if _trace_strategy_for_dialog(meta["dialog_type"], status=meta["status"]) != "signature_only":
+    if _trace_strategy_for_dialog(meta["dialog_type"], status=None) != "signature_only":
         return None
 
     resolution = (

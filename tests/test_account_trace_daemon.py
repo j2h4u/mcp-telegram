@@ -29,6 +29,7 @@ from account_trace_fixtures import (
     seed_topic,
     seed_trace_fragment,
 )
+from mcp_telegram.access_lifecycle import restore_access_after_revalidation, set_access_lost
 from mcp_telegram.account_trace_sqlite import (
     TraceMessageQueryRequest,
     build_evidence_query,
@@ -46,6 +47,7 @@ from mcp_telegram.daemon_account_trace import (
 )
 from mcp_telegram.daemon_api import DaemonAPIServer
 from mcp_telegram.flood import FloodWaitKillSwitchStatus
+from mcp_telegram.linked_chat_fact import invalidate_from_update
 from mcp_telegram.models import (
     TraceCoverageGap,
     TraceCoverageSummary,
@@ -1395,6 +1397,51 @@ async def test_trace_access_lost_dialog_gap_has_no_sync_action(
     access_lost = next(gap for gap in gaps if gap["kind"] == "access_lost")
     assert access_lost["severity"] == "warning"
     assert "action" not in access_lost
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked_id", [None, -100456])
+async def test_trace_reports_suspended_retained_discussion_link(
+    trace_server: tuple[DaemonAPIServer, sqlite3.Connection, AsyncMock], linked_id: int | None
+) -> None:
+    server, conn, client = trace_server
+    server._ready = True
+    _forbid_trace_acquisition(client)
+    seed_entity(conn, entity_id=101, name="Alice", username="alice")
+    seed_dialog(conn, dialog_id=-100123, name="Channel", dialog_type="Channel")
+    seed_dialog(conn, dialog_id=-100456, name="Discussion", dialog_type="Supergroup")
+    seed_synced_dialog(conn, dialog_id=-100123)
+    seed_synced_dialog(conn, dialog_id=-100456)
+    conn.execute(
+        "UPDATE dialogs SET linked_chat_id=?, linked_chat_resolved_at=100 WHERE dialog_id=-100123", (linked_id,)
+    )
+    if linked_id is not None:
+        seed_message(conn, dialog_id=linked_id, message_id=5, sent_at=5, sender_id=101)
+    invalidate_from_update(conn, -100123, 110)
+    conn.commit()
+    assert set_access_lost(conn, -100123, 120, reason="test").changed
+    request = b'{"method":"trace_account_messages","exact_account_id":101,"exact_dialog_id":-100123,"view":"messages"}'
+    result, _, _ = await server._handle_client_line(request, "", None)
+    assert result["ok"] is True
+    data = _dict(result["data"])
+    gap = next(g for g in cast(list[dict], data["gaps"]) if "linkage refresh is pending" in g["detail"])
+    assert gap["kind"] == "history_incomplete" and "suspended" in gap["detail"] and "100" in gap["detail"]
+    if linked_id is not None:
+        assert str(linked_id) in gap["detail"]
+        evidence = cast(list[dict], cast(list[dict], data["groups"])[0]["evidence"])
+        assert evidence[0]["dialog_id"] == linked_id
+    else:
+        assert "No linked dialog" in gap["detail"]
+    projected = _trace_structured_content(dict(data), TraceAccountMessages(exact_account_id=101, view="messages"))
+    projected = cast(dict[str, object], omit_none_mapping_values(structured_result(projected).structured_content))
+    validate(projected, cast(dict[str, object], TOOL_REGISTRY["trace_account_messages"].output_schema))
+    assert any("linkage refresh is pending" in g["detail"] for g in cast(list[dict], projected["gaps"]))
+    assert restore_access_after_revalidation(conn, -100123, 130)
+    resumed, _, _ = await server._handle_client_line(request, "", None)
+    assert all(
+        "linkage refresh is pending" not in g["detail"] for g in cast(list[dict], _dict(resumed["data"])["gaps"])
+    )
+    assert client.mock_calls == []
 
 
 @pytest.mark.asyncio

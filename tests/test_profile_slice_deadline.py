@@ -63,7 +63,6 @@ async def _assert_cancelled(
     with pytest.raises(asyncio.CancelledError):
         await task
     if phase == "cancel_commit":
-        assert coordinator.queue_depth == 0
         profile = service._profiles.read(42, now=100)
         assert profile is not None and profile.detail.get("personal_channel_id") == 123
 
@@ -101,8 +100,6 @@ async def test_deadline_drains_real_writer_and_fences_result(
     coordinator = service.refresh_coordinator
     assert coordinator is not None
     coordinator._limits = service._deps.refresh_limits
-    if phase in {"commit", "cancel_commit"}:
-        assert coordinator.enqueue(42)
     adapter = EntityProfileDemandAdapter(coordinator)
     task = asyncio.create_task(run_ready_slice(adapter, now=100))
     try:
@@ -124,8 +121,6 @@ async def test_deadline_drains_real_writer_and_fences_result(
         assert conn.execute("SELECT status FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() != (
             "failed",
         )
-        if phase == "commit":
-            assert coordinator.queue_depth == 0
     finally:
         release.set()
         await service.shutdown()

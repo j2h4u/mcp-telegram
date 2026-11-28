@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Literal, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -182,7 +182,6 @@ async def test_registered_default_and_collection_outputs_are_closed_and_lossless
     _publish(conn, section, [values[section]])
     service = _test_service(conn, limits=RefreshLimits(), account_id=77)
     monkeypatch.setattr(service, "_write_profiles", AsyncMock(side_effect=AssertionError("read queued writer")))
-    monkeypatch.setattr(service.refresh_coordinator, "enqueue", MagicMock(side_effect=AssertionError("read enrolled")))
 
     @asynccontextmanager
     async def connection():
@@ -619,7 +618,6 @@ async def test_common_chats_overview_pages_and_trace_share_published_baseline(
     assert all(item["local_state"]["status"] == "not_synced" for item in cast(list[dict], diagnostic["items"]))
     conn.commit()
     service = _test_service(conn, limits=RefreshLimits(), account_id=77)
-    monkeypatch.setattr(service.refresh_coordinator, "enqueue", MagicMock(side_effect=AssertionError("read enrolled")))
 
     @asynccontextmanager
     async def connection():

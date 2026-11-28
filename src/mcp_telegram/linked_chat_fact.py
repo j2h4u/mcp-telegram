@@ -153,8 +153,8 @@ def _linked_chat_state(resolved_at: int | None, linked_chat_id: int | None) -> L
     )
 
 
-def _is_suspended(conn: sqlite3.Connection, channel_id: int, pending: bool, resolved_at: int | None) -> bool:
-    if not pending or resolved_at is not None:
+def _is_suspended(conn: sqlite3.Connection, channel_id: int, pending: bool) -> bool:
+    if not pending:
         return False
     row = cast(
         tuple[int],
@@ -173,7 +173,7 @@ def read_fact(conn: sqlite3.Connection, channel_id: int) -> LinkedChatFact:
         pending,
         requested_at,
         retry_at,
-        _is_suspended(conn, channel_id, pending, resolved_at),
+        _is_suspended(conn, channel_id, pending),
     )
 
 

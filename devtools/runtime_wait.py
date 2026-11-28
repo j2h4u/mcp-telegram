@@ -89,6 +89,13 @@ def inspect_container(container: str, timeout: float) -> ProbeResult:  # noqa: P
     health_status = health.get("Status")
     if not isinstance(health_status, str):
         return ProbeResult(f"container state is {container_state}; health status unavailable")
+    if health_status == "healthy" and (
+        records.get("Running") is not True
+        or any(records.get(field) is not False for field in ("Paused", "Restarting", "Dead", "OOMKilled"))
+        or type(records.get("ExitCode")) is not int
+        or records["ExitCode"] != 0
+    ):
+        return ProbeResult("inspection returned contradictory container state")
     return ProbeResult(health_status)
 
 

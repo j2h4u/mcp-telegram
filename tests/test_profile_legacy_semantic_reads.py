@@ -53,7 +53,6 @@ async def test_profile_default_read_preserves_facts_without_acquisition(
     monkeypatch.setattr(service, "_write_profiles", AsyncMock(side_effect=AssertionError("read queued writer")))
     coordinator = service.refresh_coordinator
     assert coordinator is not None
-    monkeypatch.setattr(coordinator, "enqueue", MagicMock(side_effect=AssertionError("read enrolled profile")))
     service.bind_demand_sink(MagicMock(offer=MagicMock(side_effect=AssertionError("read offered acquisition"))))
 
     @asynccontextmanager

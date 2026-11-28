@@ -14,6 +14,24 @@ from mcp_telegram import chat_export_cli as cli
 type Payload = dict[str, object]
 
 
+def test_initial_publication_does_not_replace_racing_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    output = tmp_path / "out.json"
+    checkpoint = cli.Checkpoint(tmp_path / "checkpoint.sqlite3")
+    link = cli.os.link
+
+    def race(source: str | Path, destination: str | Path) -> None:
+        Path(destination).write_text("foreign")
+        link(source, destination)
+
+    monkeypatch.setattr(cli.os, "link", race)
+    try:
+        with pytest.raises(FileExistsError):
+            cli._publish(checkpoint, [{"dialog_id": -1, "group": {"dialog_id": -1}}], output)
+        assert output.read_text() == "foreign"
+    finally:
+        checkpoint.close()
+
+
 class Identity(TypedDict):
     role: str
     is_admin: bool

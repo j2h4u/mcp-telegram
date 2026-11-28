@@ -129,7 +129,6 @@ async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_recei
     first = await service.get_entity_info({"entity_id": 42})
 
     assert first["ok"] is True
-    assert coordinator.queue_depth == 0
     assert client.full_user_calls == 2
     assert (
         conn.execute(
@@ -150,7 +149,6 @@ async def test_disabled_baseline_scope_reuse_survives_restart_without_pair_recei
     second = await restarted.get_entity_info({"entity_id": 42})
 
     assert second["ok"] is True
-    assert restarted_coordinator.queue_depth == 0
     assert restarted_client.full_user_calls == 0
     assert (
         reopened.execute(
@@ -190,7 +188,6 @@ async def test_ownership_invalid_cached_profile_admits_refresh_and_offers_demand
     assert data["name"] == "Target"
     assert data["completeness"] == "partial"
     assert "about" not in data and "phone" not in data
-    assert coordinator.queue_depth == 0
     assert sink.kinds == []
     assert conn.execute("SELECT * FROM entity_profile_refresh_state WHERE entity_id=42").fetchone() == before
 
@@ -233,7 +230,6 @@ async def test_ownership_invalid_cached_profile_preserves_failed_retry_state(tmp
     assert data["name"] == "Target"
     assert data["completeness"] == "partial"
     assert "about" not in data and "phone" not in data
-    assert coordinator.queue_depth == 0
     assert sink.kinds == []
     assert (
         conn.execute(
@@ -271,7 +267,6 @@ async def test_public_local_read_does_not_requeue_failed_refresh(tmp_path: Path)
 
     assert result["ok"] is True
     assert cast(dict[str, object], result["data"])["about"] == "about"
-    assert coordinator.queue_depth == 0
     assert client.full_user_calls == calls_before
     assert (
         conn.execute(
@@ -338,7 +333,6 @@ async def test_same_account_scope_rotation_keeps_local_facts_without_mutation(tm
 
     assert result["ok"] is True
     assert cast(dict[str, object], result["data"])["about"] == "about"
-    assert coordinator.queue_depth == 0
     assert {table: conn.execute(f"SELECT * FROM {table} WHERE entity_id=42").fetchall() for table in before} == before
     assert "auth_scope" not in str(result)
     await service.shutdown()
