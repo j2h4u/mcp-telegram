@@ -9,6 +9,20 @@ from .scheduled_write_fence import invalidate_scheduled_dialog_permits
 from .sync_transactions import require_write_transaction
 
 
+def invalidate_scheduled_continuity(conn: sqlite3.Connection, dialog_id: int, now: int, reason: str) -> None:
+    """Persist the need for a new complete queue observation."""
+    require_write_transaction(conn)
+    _invalidate_permits(conn, dialog_id)
+    conn.execute(
+        "INSERT INTO scheduled_reconciliation_state(dialog_id,discovery_due_at,dirty_since,dirty_generation,updated_at,coverage_state,coverage_reason) "
+        "VALUES (?, ?, ?, 1, ?, 'unknown', ?) ON CONFLICT(dialog_id) DO UPDATE SET "
+        "discovery_due_at=CASE WHEN coverage_state='complete' OR discovery_due_at IS NULL THEN excluded.discovery_due_at ELSE discovery_due_at END, "
+        "dirty_since=CASE WHEN coverage_state='complete' OR discovery_due_at IS NULL THEN excluded.dirty_since ELSE dirty_since END, "
+        "dirty_generation=dirty_generation+1,coverage_state='unknown',coverage_reason=excluded.coverage_reason,updated_at=excluded.updated_at",
+        (dialog_id, now, now, now, reason),
+    )
+
+
 def _invalidate_permits(conn: sqlite3.Connection, dialog_id: int) -> None:
     row = cast(
         tuple[int | None] | None,

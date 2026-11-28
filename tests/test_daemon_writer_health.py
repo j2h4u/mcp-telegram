@@ -29,6 +29,34 @@ class _ReadyAPI:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stopping", [False, True])
+async def test_critical_task_cancellation_requires_shutdown(stopping: bool) -> None:
+    shutdown = ShutdownRequest()
+    api = _ReadyAPI()
+    ctx = cast(
+        _SyncMainContext,
+        SimpleNamespace(
+            shutdown_event=shutdown.event,
+            shutdown_request=shutdown,
+            api_server=api,
+            rpc_observation_sink=None,
+            background_tasks=set(),
+        ),
+    )
+    task = _create_tracked_task(
+        ctx, asyncio.Event().wait(), name="reconnect_catch_up_loop", critical=True, fail_on_cancel=True
+    )
+    await asyncio.sleep(0)
+    if stopping:
+        shutdown.event.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert api._ready is stopping
+    assert shutdown.reason_code == (None if stopping else "critical_task_failed")
+
+
+@pytest.mark.asyncio
 async def test_retired_owner_clears_readiness_and_requests_shutdown(tmp_path: Path) -> None:
     path = tmp_path / "sync.db"
     ensure_sync_schema(path)

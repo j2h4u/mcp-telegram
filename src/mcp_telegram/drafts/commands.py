@@ -17,6 +17,7 @@ from telethon.tl import types  # type: ignore[import-untyped]
 from telethon.tl.functions.messages import SaveDraftRequest  # type: ignore[import-untyped]
 from telethon.utils import get_peer_id  # type: ignore[import-untyped]
 
+from mcp_telegram.draft_write_fence import DraftWriteRejectedError, draft_write_context
 from mcp_telegram.drafts.contracts import MAX_DRAFT_TEXT_LENGTH, DraftScope, project_draft_result
 from mcp_telegram.drafts.history import (
     MAX_DRAFT_RESULT_BYTES,
@@ -319,7 +320,8 @@ class DraftCommandOwner:
                     return duplicate
                 with demand_context(DemandKind.DRAFT_MUTATION):
                     require_execution_mode(ExecutionMode.INLINE)
-                    return await self._execute_new(command)
+                    with draft_write_context(command.scope):
+                        return await self._execute_new(command)
             except DraftCommandError as exc:
                 return self._failure(exc, command)
             except DraftPreflightBusyError:
@@ -482,12 +484,19 @@ class DraftCommandOwner:
         return await self._writer.run(persist)
 
     async def _dispatch(
-        self, command: _Command, request: SaveDraftRequest, backup_history_id: int | None, *, intended_absent: bool
+        self,
+        command: _Command,
+        request: SaveDraftRequest,
+        backup_history_id: int | None,
+        *,
+        intended_absent: bool,
     ) -> dict[str, object]:
         budget = RpcAttemptBudget(1)
         try:
             with rpc_attempt_budget(budget):
                 response = await self._client(request)
+        except DraftWriteRejectedError as exc:
+            return await self._settle_fence_rejection(command, request, exc, budget, backup_history_id, intended_absent)
         except BaseException as exc:
             result = self._dispatch_failure(command, exc, budget, backup_history_id)
             if not isinstance(exc, Exception):
@@ -511,9 +520,40 @@ class DraftCommandOwner:
             await self._verify_acknowledged(command, request, intended_absent, result)
         else:
             await self._recover()
-            if budget.attempts:
-                await self._verify_unknown(command, request, intended_absent, result)
+            await self._verify_dispatched_unknown(command, request, intended_absent, result, budget)
             await self._finish(command, result)
+        return result
+
+    async def _verify_dispatched_unknown(
+        self,
+        command: _Command,
+        request: SaveDraftRequest,
+        intended_absent: bool,
+        result: dict[str, object],
+        budget: RpcAttemptBudget,
+    ) -> None:
+        if budget.attempts:
+            await self._verify_unknown(command, request, intended_absent, result)
+
+    async def _settle_fence_rejection(  # noqa: PLR0913, PLR0917 - preserve dispatch context
+        self,
+        command: _Command,
+        request: SaveDraftRequest,
+        error: DraftWriteRejectedError,
+        budget: RpcAttemptBudget,
+        backup_history_id: int | None,
+        intended_absent: bool,
+    ) -> dict[str, object]:
+        if budget.attempts:
+            result = self._dispatch_failure(command, error, budget, backup_history_id)
+            await self._recover()
+            await self._verify_unknown(command, request, intended_absent, result)
+        else:
+            result = self._failure(
+                DraftCommandError("version_conflict", "The draft changed; read its current version."), command
+            )
+            result.update(save_acknowledged=False, backup_history_id=backup_history_id)
+        await self._finish(command, result)
         return result
 
     async def _checkpoint_ack(self, command: _Command, result: dict[str, object]) -> None:

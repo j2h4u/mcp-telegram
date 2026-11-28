@@ -28,8 +28,9 @@ from telethon.tl.functions.contacts import AddContactRequest, DeleteContactsRequ
 from telethon.tl.tlobject import TLRequest  # type: ignore[import-untyped]
 from telethon.tl.types import MsgsAck, MsgsStateInfo  # type: ignore[import-untyped]
 
+from .draft_write_fence import DraftWriteRejectedError
 from .image_authorization import ScopeToken
-from .native_write_fence import FolderWriteRejected, NoteWriteRejected
+from .native_write_fence import ContactWriteRejected, FolderWriteRejected, NoteWriteRejected
 from .peer_access import PeerAccessRejectedError
 from .scheduled_write_fence import ScheduledWriteRejected
 from .telegram_demand import RpcReadTimeoutError
@@ -733,7 +734,14 @@ class GuardedMTProtoSender(MTProtoSender):
         owned = packet.state
         try:
             claimed = self._authority.claim_write(owned.owner, packet.permit)
-        except (ScheduledWriteRejected, FolderWriteRejected, NoteWriteRejected, PeerAccessRejectedError) as error:
+        except (
+            ScheduledWriteRejected,
+            FolderWriteRejected,
+            NoteWriteRejected,
+            ContactWriteRejected,
+            DraftWriteRejectedError,
+            PeerAccessRejectedError,
+        ) as error:
             if not owned.state.future.done():
                 owned.state.future.set_exception(error)
             self.defer_packet(packet)

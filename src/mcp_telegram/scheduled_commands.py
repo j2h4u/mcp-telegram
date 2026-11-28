@@ -33,6 +33,7 @@ from .rich_content import capture_rich_message, decode_rich_message
 from .scheduled_contracts import SCHEDULED_OPERATION_KEY_LIMIT, scheduled_message_version
 from .scheduled_messages import mark_scheduled_messages_removed, upsert_scheduled_message
 from .scheduled_receipts_schema import SCHEDULED_OPERATION_RECEIPT_DDL as _SCHEDULED_OPERATION_RECEIPT_DDL
+from .scheduled_state import invalidate_scheduled_continuity
 from .scheduled_write_fence import (
     ScheduledMutationCheck,
     ScheduledMutationFence,
@@ -284,15 +285,15 @@ def finish_scheduled_operation(  # noqa: PLR0913 - one receipt transition needs 
 
 
 def settle_interrupted_scheduled_operations(
-    conn: sqlite3.Connection, account_id: int, *, now: int | None = None
+    conn: sqlite3.Connection, account_id: int, *, now: int | None = None, dialog_id: int | None = None
 ) -> int:
     """Make prior-process pending operations unknown; they are never replayed."""
     require_write_transaction(conn)
     timestamp = int(time.time()) if now is None else now
     cursor = conn.execute(
         "UPDATE scheduled_operation_receipts SET outcome='unknown',mutation_dispatched=NULL,"
-        "result_json='{}',updated_at=? WHERE account_id=? AND outcome='pending'",
-        (timestamp, account_id),
+        "result_json='{}',updated_at=? WHERE account_id=? AND outcome='pending' AND (? IS NULL OR dialog_id=?)",
+        (timestamp, account_id, dialog_id, dialog_id),
     )
     return cursor.rowcount
 
@@ -461,9 +462,14 @@ def _parse_command(request: Mapping[str, object], account_id: int) -> ScheduledC
 
 
 def _current_state(
-    conn: sqlite3.Connection, account_id: int, dialog_id: int, message_id: int | None
+    conn: sqlite3.Connection, account_id: int, dialog_id: int, message_id: int | None, operation_key: str = ""
 ) -> tuple[Mapping[str, object] | None, int]:
     _require_scheduled_account(conn, account_id)
+    if conn.execute(
+        "SELECT 1 FROM scheduled_operation_receipts WHERE account_id=? AND dialog_id=? AND outcome='pending' AND operation_key<>? LIMIT 1",
+        (account_id, dialog_id, operation_key),
+    ).fetchone():
+        raise ScheduledCommandError("scheduled_state_unknown", "A prior scheduled operation is unresolved.")
     coverage = cast(
         tuple[object, ...] | None,
         conn.execute(
@@ -1022,6 +1028,7 @@ class ScheduledCommandOwner:
         request_recovery: Callable[[int, str], Awaitable[None]],
         prioritize_baseline: Callable[[int, int], Awaitable[bool]],
         postflight: Callable[[int], Awaitable[bool]] | None = None,
+        wake_recovery: Callable[[], None] | None = None,
     ) -> None:
         if type(account_id) is not int or account_id <= 0:
             raise ValueError("account_id must be positive")
@@ -1035,6 +1042,7 @@ class ScheduledCommandOwner:
         self._request_recovery = request_recovery
         self._prioritize_baseline = prioritize_baseline
         self._postflight = postflight
+        self._wake_recovery = wake_recovery
         self._locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
 
     async def execute(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -1069,6 +1077,7 @@ class ScheduledCommandOwner:
         duplicate = read_scheduled_operation(self._reader, command.account_id, command.operation_key)
         if duplicate is not None:
             return self._duplicate(command, duplicate)
+        await self._settle_dialog_pending(command)
         access = cast(
             tuple[object] | None,
             self._reader.execute(f"SELECT {not_access_lost_sql('?')}", (command.dialog_id,)).fetchone(),
@@ -1094,7 +1103,9 @@ class ScheduledCommandOwner:
             )
         try:
             row, coverage_order = await self._writer.run(
-                lambda conn: _current_state(conn, command.account_id, command.dialog_id, command.scheduled_message_id)
+                lambda conn: _current_state(
+                    conn, command.account_id, command.dialog_id, command.scheduled_message_id, command.operation_key
+                )
             )
         except ScheduledCommandError as error:
             if error.code != "scheduled_state_unknown":
@@ -1115,6 +1126,31 @@ class ScheduledCommandOwner:
             }
         _validate_current_item(command, row)
         return await self._prepare_dispatch(command, row, coverage_order, peer)
+
+    async def _settle_dialog_pending(self, command: ScheduledCommand) -> None:
+        def settle(conn: sqlite3.Connection) -> bool:
+            with write_transaction(conn):
+                _require_scheduled_account(conn, command.account_id)
+                pending = cast(
+                    tuple[int] | None,
+                    conn.execute(
+                        "SELECT 1 FROM scheduled_operation_receipts WHERE account_id=? AND dialog_id=? AND outcome='pending' LIMIT 1",
+                        (command.account_id, command.dialog_id),
+                    ).fetchone(),
+                )
+                if pending is None:
+                    return False
+                invalidate_scheduled_continuity(
+                    conn, command.dialog_id, int(time.time()), "scheduled_mutation_interrupted"
+                )
+                settle_interrupted_scheduled_operations(conn, command.account_id, dialog_id=command.dialog_id)
+                return True
+
+        try:
+            if await self._writer.run(settle):
+                self._wake_scheduled_recovery()
+        except Exception as error:  # noqa: BLE001 - pending receipt remains the admission barrier.
+            logger.warning("scheduled_pending_settlement_failed error_type=%s", type(error).__name__)
 
     async def _prepare_dispatch(
         self, command: ScheduledCommand, row: Mapping[str, object] | None, coverage_order: int, peer: object
@@ -1151,7 +1187,11 @@ class ScheduledCommandOwner:
                         raise ScheduledWriteRejected("scheduled_receipt_changed")
                     try:
                         live_row, live_coverage = _current_state(
-                            conn, command.account_id, command.dialog_id, command.scheduled_message_id
+                            conn,
+                            command.account_id,
+                            command.dialog_id,
+                            command.scheduled_message_id,
+                            command.operation_key,
                         )
                     except ScheduledCommandError as error:
                         raise ScheduledWriteRejected(error.code) from error
@@ -1219,9 +1259,12 @@ class ScheduledCommandOwner:
                 message="The scheduled change was rejected before confirmation.",
                 required_action="Read the local scheduled queue before starting a new operation.",
             )
-        await self._finish_receipt(command, outcome, dispatched, result)
+        persisted = await self._finish_receipt(command, outcome, dispatched, result)
         if dispatched:
-            await self._offer_recovery(command.dialog_id, "scheduled_mutation_unknown")
+            if outcome == "unknown" and persisted:
+                self._wake_scheduled_recovery()
+            else:
+                await self._offer_recovery(command.dialog_id, "scheduled_mutation_unknown")
         return result
 
     async def _dispatch_success(  # noqa: PLR0913, PLR0917 - mutation evidence travels together.
@@ -1295,6 +1338,13 @@ class ScheduledCommandOwner:
         except Exception as error:  # noqa: BLE001 - recovery scheduling cannot change the command outcome.
             logger.warning("scheduled_recovery_offer_failed error_type=%s", type(error).__name__)
 
+    def _wake_scheduled_recovery(self) -> None:
+        if self._wake_recovery is not None:
+            try:
+                self._wake_recovery()
+            except Exception as error:  # noqa: BLE001 - durable recovery remains scheduled.
+                logger.warning("scheduled_recovery_wake_failed error_type=%s", type(error).__name__)
+
     def _duplicate(self, command: ScheduledCommand, receipt: ScheduledOperationReceipt) -> dict[str, object]:
         if receipt.request_fingerprint != command.fingerprint():
             raise ScheduledOperationConflictError("operation key has a different intent")
@@ -1348,9 +1398,14 @@ class ScheduledCommandOwner:
                     command.operation_key,
                     outcome=outcome,
                     mutation_dispatched=dispatched,
-                    result=result,
+                    result={**result, "receipt_persisted": True},
                     scheduled_message_id=scheduled_message_id,
                 )
+                if outcome == "unknown":
+                    _require_scheduled_account(conn, command.account_id)
+                    invalidate_scheduled_continuity(
+                        conn, command.dialog_id, int(time.time()), "scheduled_mutation_unknown"
+                    )
 
         try:
             await self._writer.run(finish)

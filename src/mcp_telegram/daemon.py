@@ -147,7 +147,7 @@ from .reactions.contracts import ReactionAggregateSource, ReactionObservationBou
 from .reactions.persistence import allocate_observation_boundary
 from .reactions.telegram_adapter import TelethonTelegramReactionGateway
 from .read_state import apply_read_cursor, apply_reconciled_unread_count
-from .reconnect import run_reconnect_catch_up_loop
+from .reconnect import ContinuityRecoveryUnavailableError, run_reconnect_catch_up_loop
 from .rpc_admission_observations import RpcAdmissionObservationAggregator
 from .runtime_observations import (
     RecoveryObservationAdapter,
@@ -1132,12 +1132,13 @@ def _start_rich_history_cleanup(ctx: _SyncMainContext) -> None:
     _create_tracked_task(ctx, _cleanup_rich_history(ctx, ctx.api_server.self_id), name="rich_history_cleanup")
 
 
-def _create_tracked_task(
+def _create_tracked_task(  # noqa: PLR0913 - task lifecycle policy is explicit at registration
     ctx: _SyncMainContext,
     coro: Awaitable[object],
     *,
     name: str | None = None,
     critical: bool = False,
+    fail_on_cancel: bool = False,
     demand_kind: DemandKind | None = None,
 ) -> asyncio.Task[object]:
     """Create an asyncio task and track it for shutdown cancellation."""
@@ -1159,15 +1160,23 @@ def _create_tracked_task(
         if not started:
             concrete_coro.close()
         ctx.background_tasks.discard(t)
-        _handle_tracked_task_completion(ctx, t, critical=critical)
+        _handle_tracked_task_completion(ctx, t, critical=critical, fail_on_cancel=fail_on_cancel)
 
     task.add_done_callback(_on_done)
     return task
 
 
-def _handle_tracked_task_completion(ctx: _SyncMainContext, task: asyncio.Task[object], *, critical: bool) -> None:
+def _handle_tracked_task_completion(
+    ctx: _SyncMainContext, task: asyncio.Task[object], *, critical: bool, fail_on_cancel: bool = False
+) -> None:
     """Record and route an exception from a tracked background task."""
-    exc = task.exception() if not task.cancelled() else None
+    exc = (
+        RuntimeError("critical task cancelled unexpectedly")
+        if task.cancelled() and fail_on_cancel and not ctx.shutdown_event.is_set()
+        else None
+        if task.cancelled()
+        else task.exception()
+    )
     if exc is None:
         return
     _observe_runtime(ctx, "runtime.task_failed", "failed", type(exc).__name__, payload={"task_name": task.get_name()})
@@ -1866,16 +1875,18 @@ async def _wait_for_startup_identity(
             if not task.done():
                 task.cancel()
 
-    if startup.done_event.is_set():
-        return startup.result()
     if shutdown_event.is_set():
         raise asyncio.CancelledError
+    if startup.done_event.is_set():
+        return startup.result()
     startup.fail("startup identity deadline expired")
     return startup.result()
 
 
 async def _prime_runtime(ctx: _SyncMainContext) -> None:
     """Wait for coordinator-owned startup identity before enabling readers."""
+    if ctx.shutdown_event.is_set():
+        return
     if ctx.coordinator is None or ctx.demand_runtime is None:
         raise RuntimeError("demand runtime is unavailable")
     ctx.api_server.startup_detail = "fetching account info"
@@ -1908,9 +1919,9 @@ async def _prime_runtime(ctx: _SyncMainContext) -> None:
     except Exception:
         logger.warning("out=1 backfill skipped — non-fatal", exc_info=True)
 
+    if ctx.shutdown_event.is_set():
+        return
     ctx.api_server._ready = True
-    if ctx.api_server._ready:
-        pass
     logger.info("daemon ready — serving requests on %s", ctx.socket_path)
 
 
@@ -2614,6 +2625,9 @@ async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
         await runtime.scheduled_reconciler.invalidate_continuity(dialog_id, reason)
         runtime.coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
 
+    def wake_recovery() -> None:
+        runtime.coordinator.offer(DemandKind.SCHEDULED_DISCOVERY)
+
     async def prioritize_baseline(selected_account_id: int, dialog_id: int) -> bool:
         if ctx.shutdown_event.is_set() or runtime.coordinator.state in {
             CoordinatorState.STOPPING,
@@ -2679,6 +2693,7 @@ async def _bind_scheduled_commands(ctx: _SyncMainContext) -> None:
             request_recovery=request_recovery,
             prioritize_baseline=prioritize_baseline,
             postflight=scheduled_postflight,
+            wake_recovery=wake_recovery,
         )
     )
 
@@ -2992,8 +3007,11 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
         await _release_updates_after_replay(ctx, update_barrier)
 
         async def recover_projections() -> None:
-            await draft_owner.request_recovery("reconnect_observed")
-            await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).request_recovery())
+            try:
+                await draft_owner.request_recovery("reconnect_observed")
+                await ctx.writer.run(lambda conn: TopicCatalogRepository(conn).request_recovery())
+            except sqlite3.OperationalError as exc:
+                raise ContinuityRecoveryUnavailableError from exc
             if ctx.coordinator is not None:
                 ctx.coordinator.offer(DemandKind.TOPIC_SNAPSHOT)
 
@@ -3010,9 +3028,13 @@ async def sync_main() -> None:  # noqa: PLR0915 - composition root owns startup 
                 on_reconnect=recover_projections,
             ),
             name="reconnect_catch_up_loop",
+            critical=True,
+            fail_on_cancel=True,
         )
 
         await _prime_runtime(ctx)
+        if shutdown_request.event.is_set():
+            return
         _start_rich_history_cleanup(ctx)
         _offer_startup_demands(ctx)
         await _run_daemon_lifetime(ctx)
