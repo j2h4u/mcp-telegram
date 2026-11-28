@@ -67,7 +67,7 @@ class _Harness:
             self if client is None else client,
             self.conn,
             writer=inline_writer(self.conn),
-            account_id=100,
+            account_id=self.scope.account_id,
             resolve_peer=self.resolve_peer,
             preflight=self.preflight,
             request_recovery=self.recover,
@@ -89,7 +89,7 @@ class _Harness:
                 raw_peer = types.PeerChannel(-self.scope.dialog_id - 1_000_000_000_000)
             observation = normalize_update_draft(
                 types.UpdateDraftMessage(raw_peer, self.remote, top_msg_id=self.scope.top_message_id),
-                account_id=100,
+                account_id=self.scope.account_id,
                 source=DraftObservationSource.SNAPSHOT,
                 observed_at=at,
             )
@@ -100,7 +100,7 @@ class _Harness:
         assert claim is not None
         applied = self.repository.apply_snapshot(
             observations,
-            SnapshotCoverage(100, True, len(observations), source_order_at=at),
+            SnapshotCoverage(self.scope.account_id, True, len(observations), source_order_at=at),
             claim_token=claim,
         )
         assert applied.accepted
@@ -359,6 +359,9 @@ async def test_server_flood_wait_is_persisted_as_rejected_through_actual_gate(
             raise TelegramRpcThrottled(latched=True)
 
         monkeypatch.setattr(gate, "_observe_flood", observe_then_latch)
+    harness.scope = DraftScope(42, 200)
+    harness.repository.bind_account(42)
+    harness.publish()
     owner = harness.new_owner(gate)
     request = harness.command("create", "server-flood", text="still unsent")
     result = await owner.execute(request)
@@ -372,7 +375,7 @@ async def test_server_flood_wait_is_persisted_as_rejected_through_actual_gate(
     }
     assert ("account_protection" if latched else "20 seconds") in str(result["message"])
     assert "new operation_key" in str(result["required_action"])
-    receipt = read_draft_operation(harness.conn, 100, "server-flood")
+    receipt = read_draft_operation(harness.conn, 42, "server-flood")
     assert receipt is not None and receipt.outcome == "rejected" and receipt.result == result
     assert await harness.new_owner(gate).execute(request) == result
     assert len(wire[3].frames) == 1 and harness.remote is None
@@ -387,6 +390,9 @@ async def test_generic_throttle_after_physical_dispatch_remains_unknown(
         monkeypatch,
         TelegramRpcThrottled(None if latched else 20, latched=latched),
     )
+    harness.scope = DraftScope(42, 200)
+    harness.repository.bind_account(42)
+    harness.publish()
     owner = harness.new_owner(wire[0])
     request = harness.command("create", "uncertain-throttle", text="maybe saved")
     result = await owner.execute(request)

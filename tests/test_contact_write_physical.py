@@ -14,11 +14,14 @@ from mcp_telegram.contacts.commands import ContactCommandOwner
 from mcp_telegram.contacts.contracts import ContactProfileAcquisition
 from mcp_telegram.contacts.domain import ContactWriteAuthority
 from mcp_telegram.contacts.guard import ContactPeerGuard
+from mcp_telegram.contacts.intake import invalidate_contact
 from mcp_telegram.contacts.state import read_contact_command_state
 from mcp_telegram.native_write_fence import ContactWriteRejected, NoteWriteRejected
 from mcp_telegram.sqlite_writer import SQLiteWriter
 from mcp_telegram.sync_transactions import write_transaction
+from mcp_telegram.telegram_demand import demand_context
 from mcp_telegram.telegram_rpc import TelegramRpcGate, _AdmissionAwareSender
+from mcp_telegram.telegram_rpc_consumers import DemandKind
 from mcp_telegram.telegram_rpc_scheduler import current_rpc_scope
 from mcp_telegram.telegram_transport import GuardedConnectionTcpFull, GuardedMTProtoSender
 from tests.test_native_write_physical import physical_note as physical_note
@@ -26,10 +29,12 @@ from tests.test_telegram_transport import _Writer
 
 
 @pytest.mark.parametrize("action", ["create", "update", "delete"])
-@pytest.mark.parametrize("terminal", ["acknowledged", "unknown", "rejected"])
+@pytest.mark.parametrize("terminal", ["acknowledged", "unknown", "rejected", "stale_claim"])
 async def test_contact_command_dispatches_one_bound_native_write(  # noqa: PLR0914, PLR0915 - physical composition
     physical_note: tuple[object, ...], action: str, terminal: str
 ) -> None:
+    if terminal == "stale_claim" and action != "update":
+        pytest.skip("one update covers the physical claim race")
     gate = cast(TelegramRpcGate, physical_note[0])
     sender = cast(GuardedMTProtoSender, physical_note[1])
     connection = cast(GuardedConnectionTcpFull, physical_note[2])
@@ -67,7 +72,12 @@ async def test_contact_command_dispatches_one_bound_native_write(  # noqa: PLR09
     async def pump() -> None:
         state = await sender._send_queue.next_state()
         await sender._prepare_state(state)
-        assert sender.write_packet(connection._send_queue.get_nowait(), connection._send)
+        packet = connection._send_queue.get_nowait()
+        if terminal == "stale_claim" and isinstance(state.request, functions.contacts.AddContactRequest):
+            invalidate_contact(43)
+            assert not sender.write_packet(packet, connection._send)
+            return
+        assert sender.write_packet(packet, connection._send)
         if isinstance(state.request, functions.users.GetFullUserRequest):
             state.future.set_result(True)
         elif terminal == "unknown":
@@ -107,6 +117,18 @@ async def test_contact_command_dispatches_one_bound_native_write(  # noqa: PLR09
     result = await owner.execute(request)
     await asyncio.gather(*pumps)
     await asyncio.gather(*sender._observing)
+    if terminal == "stale_claim":
+        assert result["error"] == "native_write_claim_invalid"
+        assert len(sink.frames) == 1
+        assert reader.execute(
+            "SELECT outcome, attempt_id IS NOT NULL FROM contact_operation_receipts WHERE operation_key='key'"
+        ).fetchone() == ("rejected", 1)
+        assert gate._wire_fault is None
+        with demand_context(DemandKind.FOREGROUND_ENTITY_FACTS):
+            await call(functions.users.GetFullUserRequest(peer))
+        await asyncio.gather(*pumps)
+        assert len(sink.frames) == 2
+        return
     assert result["outcome"] == terminal
     if terminal == "rejected":
         assert result["telegram_error"] == {"type": "RPCError", "code": 400}

@@ -810,8 +810,10 @@ async def test_sync_main_wires_draft_owner_recovery_and_always_cleans_up(  # noq
 
     def create_task(_ctx: object, coroutine: object, **kwargs: object) -> None:
         cast(Coroutine[object, object, object], coroutine).close()
-        if kwargs["name"] == "sqlite_write_owner":
+        if kwargs["name"] in {"sqlite_write_owner", "reconnect_catch_up_loop"}:
             assert kwargs.get("critical") is True
+        if kwargs["name"] == "reconnect_catch_up_loop":
+            assert kwargs.get("fail_on_cancel") is True
         events.append(f"task:{kwargs['name']}")
 
     async def connect(_ctx: object) -> bool:
@@ -978,6 +980,51 @@ async def test_prime_runtime_waits_for_coordinator_profile_and_offers_folder() -
     assert bound_account_ids == [42]
     assert coordinator.offered == [DemandKind.SELF_PROFILE_MAINTENANCE, DemandKind.FOLDER_SNAPSHOT]
     assert api._ready is True
+
+
+@pytest.mark.asyncio
+async def test_prime_runtime_does_not_restore_readiness_after_reconnect_worker_failure() -> None:
+    startup = StartupIdentityState(100.0, 200.0)
+    startup.advance_profile(SimpleNamespace(id=42))
+    startup.complete(StartupIdentityResult(SimpleNamespace(id=42), 42))
+    api = _ApiStub()
+    api.self_id = 42
+    ctx = _typed_ctx(
+        coordinator=_CoordinatorStub(),
+        demand_runtime=SimpleNamespace(
+            startup_identity=startup,
+            dialog_directory=SimpleNamespace(bind_account_id=AsyncMock()),
+        ),
+        api_server=api,
+    )
+
+    async def fail_reconnect() -> None:
+        raise RuntimeError("reconnect recovery failed")
+
+    async def backfill(_operation: object) -> int:
+        task = daemon._create_tracked_task(ctx, fail_reconnect(), name="reconnect_catch_up_loop", critical=True)
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert ctx.shutdown_event.is_set()
+        return 0
+
+    ctx.writer = SimpleNamespace(run=backfill)  # type: ignore[assignment]
+    await _prime_runtime(ctx)
+
+    assert ctx.shutdown_request.reason_code == "critical_task_failed"
+    assert api._ready is False
+
+
+@pytest.mark.asyncio
+async def test_startup_identity_wait_prioritizes_shutdown_over_completed_identity() -> None:
+    startup = StartupIdentityState(100.0, 200.0)
+    startup.advance_profile(SimpleNamespace(id=42))
+    startup.complete(StartupIdentityResult(SimpleNamespace(id=42), 42))
+    shutdown = asyncio.Event()
+    shutdown.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _wait_for_startup_identity(startup, shutdown)
 
 
 @pytest.mark.asyncio

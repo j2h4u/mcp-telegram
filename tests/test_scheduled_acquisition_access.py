@@ -178,6 +178,234 @@ async def test_unknown_receipt_is_returned_before_access_check_without_replay(tm
         harness.close()
 
 
+async def test_lost_ack_and_failed_recovery_blocks_new_key_after_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "sync.db"
+    harness = _OwnerHarness(path, schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        with write_transaction(harness.conn):
+            upsert_scheduled_message(harness.conn, 200, _message(11, "retained"), now=100)
+        generation = cast(
+            tuple[int],
+            harness.conn.execute(
+                "SELECT dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=200"
+            ).fetchone(),
+        )[0]
+        harness.client.fail_after_dispatch = True
+        harness.fail_recovery = True
+
+        def fail_wake() -> None:
+            raise RuntimeError("wake unavailable")
+
+        harness.owner._wake_recovery = fail_wake
+        request = _owner_create_request(harness, "lost")
+        first = await harness.owner.execute(request)
+        assert first["outcome"] == "unknown"
+        assert tuple(
+            cast(
+                tuple[object, ...],
+                harness.conn.execute(
+                    "SELECT coverage_state,dirty_generation FROM scheduled_reconciliation_state WHERE dialog_id=200"
+                ).fetchone(),
+            )
+        ) == ("unknown", generation + 1)
+        harness.conn.close()
+        harness.conn = sqlite3.connect(path)
+        harness.conn.row_factory = sqlite3.Row
+        client = _OwnerClient(harness)
+        owner = harness.new_owner(client)
+        assert await owner.execute(request) == first
+        blocked = await owner.execute(_owner_create_request(harness, "new"))
+        assert blocked["error"] == "scheduled_state_unknown"
+        assert client.dispatched_count == 0
+        assert tuple(
+            cast(
+                tuple[object, ...],
+                harness.conn.execute(
+                    "SELECT text,message_state FROM scheduled_messages WHERE message_id=11"
+                ).fetchone(),
+            )
+        ) == ("retained", "scheduled")
+        worker = ScheduledMessageReconciler(
+            _ScheduledSnapshotClient({200: [_message(11, "retained")]}),
+            harness.conn,
+            asyncio.Event(),
+            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+            writer=inline_writer(harness.conn),
+        )
+        await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+        assert (await owner.execute(_owner_create_request(harness, "new")))["outcome"] == "acknowledged"
+        assert client.dispatched_count == 1
+    finally:
+        harness.close()
+
+
+async def test_failed_terminal_transaction_keeps_pending_and_blocks_new_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram import scheduled_commands
+
+    path = tmp_path / "sync.db"
+    harness = _OwnerHarness(path, schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    try:
+        harness.client.fail_after_dispatch = True
+        harness.fail_recovery = True
+
+        def fail_invalidation(*_args: object) -> None:
+            raise sqlite3.OperationalError("injected failure")
+
+        monkeypatch.setattr(scheduled_commands, "invalidate_scheduled_continuity", fail_invalidation)
+        request = _owner_create_request(harness, "pending")
+        result = await harness.owner.execute(request)
+        assert result["outcome"] == "unknown" and result["mutation_dispatched"] is True
+        assert result["receipt_persisted"] is False
+        receipt = read_scheduled_operation(harness.conn, 100, "pending")
+        assert receipt is not None and receipt.outcome == "pending"
+        with write_transaction(harness.conn):
+            harness.conn.execute(
+                "INSERT INTO scheduled_reconciliation_state(dialog_id,updated_at,snapshot_observation_order,coverage_state) "
+                "VALUES(201,1,1,'complete')"
+            )
+        assert scheduled_commands._current_state(harness.conn, 100, 201, None) == (None, 1)
+        assert (await harness.owner.execute(_owner_create_request(harness, "other")))[
+            "error"
+        ] == "scheduled_state_unknown"
+        harness.conn.close()
+        harness.conn = sqlite3.connect(path)
+        harness.conn.row_factory = sqlite3.Row
+        client = _OwnerClient(harness)
+        owner = harness.new_owner(client)
+        assert (await owner.execute(request))["outcome"] == "unknown"
+        assert (await owner.execute(_owner_create_request(harness, "other")))["error"] == "scheduled_state_unknown"
+        assert client.dispatched_count == 0
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+async def test_terminal_write_recovers_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failures: int
+) -> None:
+    from mcp_telegram import scheduled_commands
+
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    original = scheduled_commands.invalidate_scheduled_continuity
+    attempts = 0
+
+    def transient_failure(conn: sqlite3.Connection, dialog_id: int, now: int, reason: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= failures:
+            raise sqlite3.OperationalError("temporary failure")
+        original(conn, dialog_id, now, reason)
+
+    monkeypatch.setattr(scheduled_commands, "invalidate_scheduled_continuity", transient_failure)
+    try:
+        with write_transaction(harness.conn):
+            upsert_scheduled_message(harness.conn, 200, _message(11, "retained"), now=100)
+        harness.client.fail_after_dispatch = True
+        harness.fail_recovery = True
+        first = await harness.owner.execute(_owner_create_request(harness, "lost"))
+        assert first["outcome"] == "unknown"
+        assert first["receipt_persisted"] is False
+        fresh = _owner_create_request(harness, "fresh")
+        assert (await harness.owner.execute(fresh))["error"] == "scheduled_state_unknown"
+        if failures == 2:
+            assert (await harness.owner.execute(fresh))["error"] == "scheduled_state_unknown"
+        assert harness.client.dispatched_count == 1
+        receipt = read_scheduled_operation(harness.conn, 100, "lost")
+        assert receipt is not None and receipt.outcome == "unknown"
+        worker = ScheduledMessageReconciler(
+            _ScheduledSnapshotClient({200: [_message(11, "retained")]}),
+            harness.conn,
+            asyncio.Event(),
+            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+            writer=inline_writer(harness.conn),
+        )
+        await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+        harness.client.fail_after_dispatch = False
+        resumed = await harness.owner.execute(fresh)
+        assert resumed.get("outcome") == "acknowledged", resumed
+        assert harness.client.dispatched_count == 2
+    finally:
+        harness.close()
+
+
+async def test_failed_acknowledged_receipt_is_settled_before_new_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram import scheduled_commands
+
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    original = scheduled_commands.finish_scheduled_operation
+
+    def fail_acknowledged(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("temporary failure")
+
+    monkeypatch.setattr(scheduled_commands, "finish_scheduled_operation", fail_acknowledged)
+    try:
+        with write_transaction(harness.conn):
+            upsert_scheduled_message(harness.conn, 200, _message(11, "retained"), now=100)
+        first = await harness.owner.execute(_owner_create_request(harness, "ack"))
+        assert first["outcome"] == "acknowledged" and first["receipt_persisted"] is False
+        receipt = read_scheduled_operation(harness.conn, 100, "ack")
+        assert receipt is not None and receipt.outcome == "pending"
+        fresh = _owner_create_request(harness, "fresh")
+        assert (await harness.owner.execute(fresh))["error"] == "scheduled_state_unknown"
+        receipt = read_scheduled_operation(harness.conn, 100, "ack")
+        assert receipt is not None and receipt.outcome == "unknown"
+        assert harness.client.dispatched_count == 1
+        worker = ScheduledMessageReconciler(
+            _ScheduledSnapshotClient({200: [_message(11, "retained")]}),
+            harness.conn,
+            asyncio.Event(),
+            policy=ScheduledReconciliationPolicy(activity_rpc_timeout_seconds=10),
+            writer=inline_writer(harness.conn),
+        )
+        await worker.run_demand_slice(DemandKind.SCHEDULED_DISCOVERY)
+        monkeypatch.setattr(scheduled_commands, "finish_scheduled_operation", original)
+        assert (await harness.owner.execute(fresh))["outcome"] == "acknowledged"
+        assert harness.client.dispatched_count == 2
+    finally:
+        harness.close()
+
+
+async def test_cancelled_operation_with_failed_settlement_is_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mcp_telegram import scheduled_commands
+
+    harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
+    original = scheduled_commands.invalidate_scheduled_continuity
+
+    class CancelledClient(_OwnerClient):
+        async def __call__(self, request: object) -> object:
+            try:
+                return await super().__call__(request)
+            except TimeoutError as error:
+                raise asyncio.CancelledError from error
+
+    def fail_invalidation(*_args: object) -> None:
+        raise sqlite3.OperationalError("temporary failure")
+
+    try:
+        client = CancelledClient(harness)
+        client.fail_after_dispatch = True
+        harness.fail_recovery = True
+        owner = harness.new_owner(client)
+        monkeypatch.setattr(scheduled_commands, "invalidate_scheduled_continuity", fail_invalidation)
+        with pytest.raises(asyncio.CancelledError):
+            await owner.execute(_owner_create_request(harness, "cancelled"))
+        receipt = read_scheduled_operation(harness.conn, 100, "cancelled")
+        assert receipt is not None and receipt.outcome == "pending"
+        monkeypatch.setattr(scheduled_commands, "invalidate_scheduled_continuity", original)
+        assert (await owner.execute(_owner_create_request(harness, "fresh")))["error"] == "scheduled_state_unknown"
+        receipt = read_scheduled_operation(harness.conn, 100, "cancelled")
+        assert receipt is not None and receipt.outcome == "unknown"
+        assert client.dispatched_count == 1
+    finally:
+        harness.close()
+
+
 async def test_fresh_command_rearms_block_but_only_requests_baseline(tmp_path: Path) -> None:
     harness = _OwnerHarness(tmp_path / "sync.db", schedule_at=int(datetime.now(UTC).timestamp()) + 900)
     try:

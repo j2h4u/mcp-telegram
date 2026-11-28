@@ -21,6 +21,10 @@ from .telegram_rpc_scheduler import RpcAdmissionClosedError
 logger = logging.getLogger(__name__)
 
 
+class ContinuityRecoveryUnavailableError(Exception):
+    """Local continuity recovery can be retried later."""
+
+
 class ReconnectClient(Protocol):
     """Public client surface required for reconnect update recovery."""
 
@@ -103,25 +107,39 @@ async def run_reconnect_catch_up_loop(
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
 
-    recovery_needed = False
     while not shutdown_event.is_set():
-        if not recovery_needed:
-            if not await _wait_for_reconnect_signal(client, shutdown_event):
+        if not await _wait_for_reconnect_signal(client, shutdown_event):
+            break
+        if observe is not None:
+            observe("runtime.connection_observed", "reconnected", None)
+
+        await _recover_continuity(on_reconnect, shutdown_event, interval_seconds)
+
+        while not shutdown_event.is_set():
+            if await _request_catch_up(client, observe):
                 break
-            recovery_needed = True
-            if observe is not None:
-                observe("runtime.connection_observed", "reconnected", None)
+            await _wait_for_retry(shutdown_event, interval_seconds)
+
+
+async def _recover_continuity(
+    on_reconnect: Callable[[], Awaitable[None]] | None, shutdown_event: asyncio.Event, interval_seconds: float
+) -> None:
+    while not shutdown_event.is_set():
+        try:
             if on_reconnect is not None:
                 await on_reconnect()
-
-        if await _request_catch_up(client, observe):
-            recovery_needed = False
-            continue
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
-        except TimeoutError:
-            continue
-        break
+        except ContinuityRecoveryUnavailableError:
+            logger.warning("telegram reconnect continuity recovery failed", exc_info=True)
+        else:
+            break
+        await _wait_for_retry(shutdown_event, interval_seconds)
 
 
-__all__ = ["ReconnectClient", "run_reconnect_catch_up_loop"]
+async def _wait_for_retry(shutdown_event: asyncio.Event, interval_seconds: float) -> None:
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=interval_seconds)
+    except TimeoutError:
+        pass
+
+
+__all__ = ["ContinuityRecoveryUnavailableError", "ReconnectClient", "run_reconnect_catch_up_loop"]

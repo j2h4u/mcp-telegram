@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from mcp_telegram.reconnect import run_reconnect_catch_up_loop
+from mcp_telegram.reconnect import ContinuityRecoveryUnavailableError, run_reconnect_catch_up_loop
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
     UnclassifiedTelegramDemandError,
@@ -126,6 +126,11 @@ async def _stop_after(shutdown: asyncio.Event, delay: float) -> None:
 @pytest.mark.asyncio
 async def test_reconnect_loop_retries_failure_while_connected(caplog: pytest.LogCaptureFixture) -> None:
     shutdown = asyncio.Event()
+    continuity_calls = 0
+
+    async def recover() -> None:
+        nonlocal continuity_calls
+        continuity_calls += 1
 
     class FailingClient:
         def __init__(self) -> None:
@@ -141,10 +146,73 @@ async def test_reconnect_loop_retries_failure_while_connected(caplog: pytest.Log
 
     client = FailingClient()
     with caplog.at_level("WARNING"):
-        await run_reconnect_catch_up_loop(client, shutdown, interval_seconds=0.001)
+        await run_reconnect_catch_up_loop(client, shutdown, interval_seconds=0.001, on_reconnect=recover)
 
     assert client.catch_up_calls == 3
+    assert continuity_calls == 1
     assert any("telegram reconnect catch_up failed" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retries_failed_continuity_before_catch_up() -> None:
+    shutdown = asyncio.Event()
+    actions: list[str] = []
+
+    class Client:
+        reconnect_event = asyncio.Event()
+
+        async def catch_up(self) -> None:
+            actions.append("catch_up")
+            if actions.count("catch_up") == 2:
+                shutdown.set()
+
+    client = Client()
+    client.reconnect_event.set()
+
+    async def recover() -> None:
+        actions.append("continuity")
+        if actions.count("continuity") == 1:
+            client.reconnect_event.set()
+            raise ContinuityRecoveryUnavailableError("continuity failed")
+
+    await asyncio.wait_for(
+        run_reconnect_catch_up_loop(client, shutdown, interval_seconds=0.001, on_reconnect=recover),
+        timeout=1,
+    )
+
+    assert actions == ["continuity", "continuity", "catch_up", "continuity", "catch_up"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_continuity_retry_stops_on_shutdown() -> None:
+    shutdown = asyncio.Event()
+    client = _Client(shutdown)
+    client.reconnect_event.set()
+    failed = asyncio.Event()
+
+    async def recover() -> None:
+        failed.set()
+        raise ContinuityRecoveryUnavailableError("unavailable")
+
+    task = asyncio.create_task(run_reconnect_catch_up_loop(client, shutdown, interval_seconds=60, on_reconnect=recover))
+    await asyncio.wait_for(failed.wait(), timeout=1)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert client.catch_up_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_continuity_unexpected_error_propagates() -> None:
+    shutdown = asyncio.Event()
+    client = _Client(shutdown)
+    client.reconnect_event.set()
+
+    async def recover() -> None:
+        raise ValueError("unexpected")
+
+    with pytest.raises(ValueError, match="unexpected"):
+        await run_reconnect_catch_up_loop(client, shutdown, interval_seconds=0.001, on_reconnect=recover)
+    assert client.catch_up_calls == 0
 
 
 @pytest.mark.asyncio

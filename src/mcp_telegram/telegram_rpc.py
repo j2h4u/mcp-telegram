@@ -65,6 +65,7 @@ from .auth_scope import AUTH_SCOPE_VERSION, TelegramAuthScope
 from .contact_notes.intake import capture_contact_note_intake, invalidate_contact_note_scope
 from .contacts.intake import capture_contact_intake, invalidate_contact_scope
 from .delivered_update import DeliveredUpdate, delivered_update_context, fail_delivered_update
+from .draft_write_fence import DraftWatch, current_draft_write_check, draft_claim
 from .flood import FloodWaitObservation, TelegramRpcThrottled, flood_seconds
 from .folders.intake import capture_folder_intake, has_folder_updates, invalidate_folder_intake
 from .image_authorization import ScopeCell, ScopeToken
@@ -3470,6 +3471,7 @@ class _WireAttempt:
     response_timer: asyncio.Timeout | None = None
     observation_ordinal: int | None = None
     draft_mutation: bool = False
+    draft_write_check: DraftWatch | None = None
     draft_phase: _DraftWirePhase | None = None
     scheduled_check: ScheduledMutationCheck | None = None
     scheduled_mutation: bool = False
@@ -4874,6 +4876,8 @@ class TelegramRpcGate(TelegramClient):
             capability.wire_owner = owner
         owner.self_lookup = self._is_self_lookup(actual)
         owner.draft_mutation = type(actual) is functions.messages.SaveDraftRequest
+        if owner.draft_mutation:
+            owner.draft_write_check = current_draft_write_check()
         owner.draft_phase = self._draft_phase_at_registration(owner)
         owner.scheduled_check = scheduled_check
         owner.scheduled_mutation = scheduled_check is not None
@@ -5156,11 +5160,45 @@ class TelegramRpcGate(TelegramClient):
         ):
             return
         self._require_draft_mutation_root(scope)
+        if mutation:
+            self._validate_draft_watch(actual)
         expected = None if mutation else AcquisitionKind.DRAFT_SNAPSHOT
         if scope.acquisition_kind is not expected:
             raise UnclassifiedTelegramRpcError("draft operation has incompatible acquisition classification")
         if not mutation and type(actual) is not functions.messages.GetAllDraftsRequest:
             raise UnclassifiedTelegramRpcError("draft mutation preflight permits only GetAllDrafts")
+
+    def _validate_draft_watch(self, request: object) -> None:
+        assert isinstance(request, functions.messages.SaveDraftRequest)
+        watch = current_draft_write_check()
+        auth = self.retained_auth_scope()
+        if watch is None or auth is None:
+            raise UnclassifiedTelegramRpcError("SaveDraft requires a draft write watch")
+        peer = request.peer
+        peer_id = self._draft_peer_id(peer, auth.account_id)
+        reply = request.reply_to
+        if not self._draft_reply_supported(reply):
+            raise UnclassifiedTelegramRpcError("SaveDraft target does not match its draft write watch")
+        target = watch.scope
+        if (
+            target.account_id != auth.account_id
+            or target.dialog_id != peer_id
+            or target.subdialog_peer_id is not None
+            or target.top_message_id != getattr(reply, "top_msg_id", None)
+        ):
+            raise UnclassifiedTelegramRpcError("SaveDraft target does not match its draft write watch")
+
+    @staticmethod
+    def _draft_reply_supported(reply: object) -> bool:
+        return reply is None or (isinstance(reply, types.InputReplyToMessage) and reply.monoforum_peer_id is None)
+
+    @staticmethod
+    def _draft_peer_id(peer: object, account_id: int) -> int | None:
+        if isinstance(peer, types.InputPeerSelf):
+            return account_id
+        if isinstance(peer, (types.InputPeerUser, types.InputPeerChat, types.InputPeerChannel)):
+            return int(get_peer_id(peer))
+        return None
 
     def _require_draft_mutation_root(self, scope: TelegramRpcScope) -> None:
         if scope.demand_kind is not DemandKind.DRAFT_MUTATION or scope.source is not TelegramRpcSource.DRAFT_MUTATION:
@@ -5702,10 +5740,11 @@ class TelegramRpcGate(TelegramClient):
             raise RuntimeError("physical Telegram attempt lacks its original budget")
         ledger = self._ensure_safety_ledger()
         self._validate_claim_intent(owner, ledger)
-        if not self._admission_scheduler.record_dispatch(permit.admission):
-            return False
         try:
-            self._record_claim_debit(owner, budget, ledger)
+            with draft_claim(owner.draft_write_check):
+                if not self._admission_scheduler.record_dispatch(permit.admission):
+                    return False
+                self._record_claim_debit(owner, budget, ledger)
         except RpcAttemptBudgetExhaustedError:
             self._observe_budget_rejection(owner.scope, owner, None, boundary=BudgetRejectionBoundary.OWNER_CLAIM)
             raise

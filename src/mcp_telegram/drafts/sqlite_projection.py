@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 from mcp_telegram.access_predicates import not_access_lost_sql
+from mcp_telegram.draft_write_fence import invalidate_draft_watches
 from mcp_telegram.drafts.contracts import (
     DraftApplyResult,
     DraftComposition,
@@ -218,6 +219,7 @@ class SQLiteDraftProjection:
 
     def _mark_scope_uncertain(self, scope: DraftScope, observed_at: int) -> None:
         require_write_transaction(self._conn)
+        invalidate_draft_watches(scope)
         self._conn.execute(
             "INSERT INTO draft_order_uncertainty(account_id,dialog_id,top_message_id,subdialog_peer_id,observed_at) "
             "VALUES (?,?,?,?,?) ON CONFLICT(account_id,dialog_id,top_message_id,subdialog_peer_id) DO UPDATE SET "
@@ -650,6 +652,7 @@ class SQLiteDraftProjection:
 
     def _upsert_current(self, scope: DraftScope, values: dict[str, object], revision: int) -> None:
         require_write_transaction(self._conn)
+        invalidate_draft_watches(scope)
         archive_current_draft(self._conn, scope)
         assignments = ",".join(f"{column}=excluded.{column}" for column in _CURRENT_VALUE_COLUMNS)
         placeholders = ",".join("?" for _ in range(5 + len(_CURRENT_VALUE_COLUMNS)))

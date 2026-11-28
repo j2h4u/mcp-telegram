@@ -28,6 +28,7 @@ from .message_contracts import ExtractedMessage
 from .messages.sqlite_bundle import preserve_rich_observation
 from .messages.telegram_adapter import extract_message_row
 from .observation_order import allocate_observation_order, delivered_observation_order
+from .scheduled_state import invalidate_scheduled_continuity
 from .scheduled_write_fence import ScheduledMutationFence
 from .sqlite_writer import SQLiteWriter
 from .sync_transactions import require_write_transaction, write_transaction
@@ -1041,23 +1042,7 @@ class ScheduledMessageReconciler:
                 elif dialog_id is not None:
                     _invalidate_scheduled_target(self._mutation_fence, self._verified_account_id, dialog_id)
                 for candidate in dialog_ids:
-                    conn.execute(
-                        """
-                        INSERT INTO scheduled_reconciliation_state(
-                            dialog_id,discovery_due_at,dirty_since,dirty_generation,updated_at,
-                            coverage_state,coverage_reason
-                        ) VALUES (?, ?, ?, 1, ?, 'unknown', ?)
-                        ON CONFLICT(dialog_id) DO UPDATE SET
-                            discovery_due_at=CASE WHEN coverage_state='complete' OR discovery_due_at IS NULL
-                                THEN excluded.discovery_due_at ELSE discovery_due_at END,
-                            dirty_since=CASE WHEN coverage_state='complete' OR discovery_due_at IS NULL
-                                THEN excluded.dirty_since ELSE dirty_since END,
-                            dirty_generation=dirty_generation+1,
-                            coverage_state='unknown',coverage_reason=excluded.coverage_reason,
-                            updated_at=excluded.updated_at
-                        """,
-                        (candidate, now, now, now, reason),
-                    )
+                    invalidate_scheduled_continuity(conn, candidate, now, reason)
 
         await self._writer.run(persist)
 

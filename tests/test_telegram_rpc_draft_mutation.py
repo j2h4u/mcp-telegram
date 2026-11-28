@@ -1,6 +1,7 @@
 """Explicit native draft writes cannot escape the root's single-send allowance."""
 
 import asyncio
+import contextvars
 import time
 from dataclasses import replace
 from typing import cast
@@ -10,7 +11,9 @@ from telethon.errors import ServerError
 from telethon.tl import functions, types
 from telethon.tl.tlobject import TLRequest
 
-from mcp_telegram import telegram_rpc
+from mcp_telegram import draft_write_fence, telegram_rpc
+from mcp_telegram.draft_write_fence import draft_write_context
+from mcp_telegram.drafts.contracts import DraftScope
 from mcp_telegram.peer_access import PeerAccessRejectedError
 from mcp_telegram.telegram_demand import (
     AcquisitionKind,
@@ -32,6 +35,22 @@ from mcp_telegram.telegram_transport import _OwnedPacket
 from tests.test_telegram_rpc_safety import Clock
 from tests.test_telegram_rpc_wire_integration import _WireHarness
 from tests.test_telegram_rpc_wire_integration import wire as wire
+
+
+@pytest.fixture(autouse=True)
+def draft_watch():
+    with draft_write_context(DraftScope(42, 42)):
+        yield
+
+
+async def test_save_without_watch_is_rejected(wire: _WireHarness) -> None:
+    token = draft_write_fence._CHECK.set(None)
+    try:
+        with demand_context(DemandKind.DRAFT_MUTATION), rpc_attempt_budget(RpcAttemptBudget(1)):
+            with pytest.raises(UnclassifiedTelegramRpcError, match="draft write watch"):
+                await _prepare(wire, _save(), current_rpc_scope())
+    finally:
+        draft_write_fence._CHECK.reset(token)
 
 
 def _clock(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch) -> Clock:
@@ -354,3 +373,32 @@ async def test_prepared_preflight_retains_phase_after_save(wire: _WireHarness, m
         assert preflight.attempts == 0 and not root.attempt_evidence.draft_postflight_dispatched
         response.cancel()
     assert len(sink.frames) == 1
+
+
+@pytest.mark.parametrize("scope", [DraftScope(43, 42), DraftScope(42, 200), DraftScope(42, 42, 7)])
+async def test_save_rejects_watch_for_other_scope(wire: _WireHarness, scope: DraftScope) -> None:
+    with draft_write_context(scope), demand_context(DemandKind.DRAFT_MUTATION), rpc_attempt_budget(RpcAttemptBudget(1)):
+        with pytest.raises(UnclassifiedTelegramRpcError, match="does not match"):
+            await _prepare(wire, _save(), current_rpc_scope())
+
+
+async def test_revision_change_during_eligibility_rejects_before_debit(
+    wire: _WireHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate, sender, connection, sink = wire
+    original = type(gate)._permit_still_eligible
+
+    def change_before_claim(
+        self: telegram_rpc.TelegramRpcGate, owner: telegram_rpc._WireAttempt, permit: telegram_rpc._WirePermit
+    ) -> bool:
+        result = original(self, owner, permit)
+        contextvars.Context().run(draft_write_fence.invalidate_draft_watches, DraftScope(42, 42))
+        return result
+
+    monkeypatch.setattr(type(gate), "_permit_still_eligible", change_before_claim)
+    with demand_context(DemandKind.DRAFT_MUTATION), rpc_attempt_budget(RpcAttemptBudget(1)) as budget:
+        response, packet = await _prepare(wire, _save(), current_rpc_scope())
+        assert not sender.write_packet(packet, connection._send)
+        with pytest.raises(draft_write_fence.DraftWriteRejectedError):
+            await response
+        assert budget.attempts == 0 and sink.frames == []

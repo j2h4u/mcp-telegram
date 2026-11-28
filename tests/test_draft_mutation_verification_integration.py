@@ -494,3 +494,132 @@ async def test_old_background_snapshot_after_ack_cannot_confirm_write(drafts: _D
             if task is not None and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_committed_update_before_save_claim_rejects_old_version(drafts: _DraftRig) -> None:
+    original = _draft("original")
+    await _execute(
+        drafts, {"action": "create", "dialog_id": 200, "operation_key": "seed", "text": "original"}, None, original
+    )
+    version = read_current_draft(drafts.conn, drafts.scope).expected_version
+    request = {"action": "clear", "dialog_id": 200, "operation_key": "clear-stale", "expected_version": version}
+    task = asyncio.create_task(drafts.commands.execute(request))
+    try:
+        await _answer(drafts, GetAllDraftsRequest, _snapshot(original))
+        gate, sender, connection, sink = drafts.wire
+        state = await asyncio.wait_for(sender._send_queue.next_state(), 3)
+        assert isinstance(state.request, SaveDraftRequest)
+        await sender._prepare_state(state)
+        packet = connection._send_queue.get_nowait()
+        assert original.date is not None
+        newer = types.DraftMessage("newer", datetime.fromtimestamp(original.date.timestamp() + 10, UTC))
+        assert newer.date is not None
+        await drafts.owner.on_raw_draft_update(types.UpdateDraftMessage(types.PeerUser(200), newer))
+        assert read_current_draft(drafts.conn, drafts.scope).text == "newer"
+        frames = len(sink.frames)
+        owner = gate._require_wire_owner(packet.state.owner)
+        assert not sender.write_packet(packet, connection._send)
+        result = await asyncio.wait_for(task, 3)
+        assert result["outcome"] == "conflict" and result["error"] == "version_conflict"
+        assert result["mutation_dispatched"] is False
+        assert owner.scope.attempt_budget is not None and owner.scope.attempt_budget.attempts == 0
+        assert len(sink.frames) == frames
+        assert await drafts.commands.execute(request) == result
+        assert read_current_draft(drafts.conn, drafts.scope).text == "newer"
+        await _execute(
+            drafts,
+            {
+                "action": "update",
+                "dialog_id": 200,
+                "operation_key": "after-conflict",
+                "expected_version": read_current_draft(drafts.conn, drafts.scope).expected_version,
+                "text": "next",
+            },
+            newer,
+            types.DraftMessage("next", datetime.fromtimestamp(newer.date.timestamp() + 10, UTC)),
+        )
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_other_dialog_update_does_not_refuse_save(drafts: _DraftRig) -> None:
+    original = _draft("original")
+    await _execute(
+        drafts,
+        {"action": "create", "dialog_id": 200, "operation_key": "seed-other", "text": "original"},
+        None,
+        original,
+    )
+    request = {
+        "action": "clear",
+        "dialog_id": 200,
+        "operation_key": "clear-other",
+        "expected_version": read_current_draft(drafts.conn, drafts.scope).expected_version,
+    }
+    task = asyncio.create_task(drafts.commands.execute(request))
+    try:
+        await _answer(drafts, GetAllDraftsRequest, _snapshot(original))
+        gate, sender, connection, _ = drafts.wire
+        state = await asyncio.wait_for(sender._send_queue.next_state(), 3)
+        assert isinstance(state.request, SaveDraftRequest)
+        await sender._prepare_state(state)
+        packet = connection._send_queue.get_nowait()
+        assert original.date is not None
+        await drafts.owner.on_raw_draft_update(
+            types.UpdateDraftMessage(
+                types.PeerUser(201),
+                types.DraftMessage("other", datetime.fromtimestamp(original.date.timestamp() + 10, UTC)),
+            )
+        )
+        assert sender.write_packet(packet, connection._send)
+        state.future.set_result(True)
+        drafts.clock.advance(3)
+        gate._admission_scheduler.notify_eligibility_changed()
+        await _answer(drafts, GetAllDraftsRequest, _snapshot(None))
+        result = await asyncio.wait_for(task, 3)
+        assert result["outcome"] == "acknowledged"
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_unchanged_independent_snapshot_does_not_refuse_save(drafts: _DraftRig) -> None:
+    original = _draft("original")
+    await _execute(
+        drafts,
+        {"action": "create", "dialog_id": 200, "operation_key": "seed-snapshot", "text": "original"},
+        None,
+        original,
+    )
+    request = {
+        "action": "clear",
+        "dialog_id": 200,
+        "operation_key": "clear-snapshot",
+        "expected_version": read_current_draft(drafts.conn, drafts.scope).expected_version,
+    }
+    task = asyncio.create_task(drafts.commands.execute(request))
+    refresh = None
+    try:
+        await _answer(drafts, GetAllDraftsRequest, _snapshot(original))
+        gate, sender, connection, _ = drafts.wire
+        state = await asyncio.wait_for(sender._send_queue.next_state(), 3)
+        assert isinstance(state.request, SaveDraftRequest)
+        await sender._prepare_state(state)
+        packet = connection._send_queue.get_nowait()
+        refresh = asyncio.create_task(drafts.owner.refresh_for_mutation())
+        await _answer(drafts, GetAllDraftsRequest, _snapshot(original))
+        assert await asyncio.wait_for(refresh, 3)
+        assert sender.write_packet(packet, connection._send)
+        state.future.set_result(True)
+        drafts.clock.advance(3)
+        gate._admission_scheduler.notify_eligibility_changed()
+        await _answer(drafts, GetAllDraftsRequest, _snapshot(None))
+        assert (await asyncio.wait_for(task, 3))["outcome"] == "acknowledged"
+    finally:
+        for pending in (task, refresh):
+            if pending is not None and not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
