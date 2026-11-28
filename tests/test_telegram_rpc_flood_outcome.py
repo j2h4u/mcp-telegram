@@ -1,11 +1,14 @@
 """Source policy preserves definite server refusal without guessing unknown outcomes."""
 
 import asyncio
+from collections.abc import Iterator
 
 import pytest
 from telethon.errors import FloodPremiumWaitError, FloodTestPhoneWaitError, FloodWaitError
 
 from mcp_telegram import telegram_rpc
+from mcp_telegram.draft_write_fence import draft_write_context
+from mcp_telegram.drafts.contracts import DraftScope
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.telegram_demand import RpcAttemptBudget, demand_context
 from mcp_telegram.telegram_rpc_consumers import DemandKind
@@ -13,6 +16,14 @@ from mcp_telegram.telegram_rpc_scheduler import TelegramRpcScope, rpc_attempt_bu
 from tests.test_telegram_rpc_draft_mutation import _prepare, _save
 from tests.test_telegram_rpc_wire_integration import _WireHarness
 from tests.test_telegram_rpc_wire_integration import wire as wire
+
+
+@pytest.fixture(autouse=True)
+def draft_watch(wire: _WireHarness) -> Iterator[None]:
+    auth = wire[0].retained_auth_scope()
+    assert auth is not None
+    with draft_write_context(DraftScope(auth.account_id, auth.account_id)):
+        yield
 
 
 def _server_response(wire: _WireHarness, monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:

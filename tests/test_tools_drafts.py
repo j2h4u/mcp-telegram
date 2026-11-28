@@ -10,6 +10,7 @@ from telethon.errors import FloodWaitError
 
 from mcp_telegram import server
 from mcp_telegram.daemon_client import DaemonNotRunningError
+from mcp_telegram.drafts.contracts import DraftScope
 from mcp_telegram.flood import TelegramRpcThrottled
 from mcp_telegram.tools import drafts
 from mcp_telegram.tools._base import normalize_output_schema
@@ -205,6 +206,11 @@ async def test_finite_throttle_retains_structured_action_and_receipt_through_mcp
     monkeypatch: pytest.MonkeyPatch, harness: _Harness, wire: _WireHarness, prepared: bool
 ) -> None:
     gate = wire[0]
+    auth = gate.retained_auth_scope()
+    assert auth is not None
+    harness.scope = DraftScope(auth.account_id, 200)
+    harness.repository.bind_account(auth.account_id)
+    harness.publish()
     if prepared:
         _server_response(wire, monkeypatch, FloodWaitError(None, capture=20))
     else:
